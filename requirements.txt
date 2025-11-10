@@ -1,0 +1,17 @@
+awkward
+numpy
+torch
+pytorch-lightning
+tqdm
+uproot
+PyYAML
+scipy
+scikit-learn
+matplotlib
+seaborn
+pandas
+comet-ml
+fastjet
+vector
+pathos
+energyflow
