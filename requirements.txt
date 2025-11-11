@@ -15,3 +15,5 @@ fastjet
 vector
 pathos
 energyflow
+nbformat
+plotly

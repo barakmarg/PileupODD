@@ -8,7 +8,7 @@ def to_eta(theta):
     return eta
 
 
-def convert_to_cartesian_eta_phi(data):
+def convert_to_cartesian_eta_phi(data, mask=None):
     """
     Converts Cartesian coordinates (x, y, z) to pseudorapidity (eta)
     and azimuthal angle (phi).
@@ -34,6 +34,10 @@ def convert_to_cartesian_eta_phi(data):
     y = data['y']
     z = data['z']
 
+    if mask is not None:
+        x = x[mask]
+        y = y[mask]
+        z = z[mask]
     # Ensure inputs are NumPy arrays for vectorized operations.
     # This also handles lists, pandas Series, etc., gracefully.
     x = np.asarray(x)
@@ -65,7 +69,7 @@ def convert_to_cartesian_eta_phi(data):
     return eta, phi
 
 
-def get_points_for_clustering(all_datasets, dataset_name="OpenDataDetector/ColliderML_ttbar_pu0", until_index=1) ->List[np.ndarray]:
+def get_points_for_clustering(all_datasets, dataset_name="OpenDataDetector/ColliderML_ttbar_pu0", energy_threshold=0.001, until_index=1):
 
     dataset = all_datasets[dataset_name]
     calo_hits = dataset['calo_hits']['train'].with_format('numpy')
@@ -73,8 +77,9 @@ def get_points_for_clustering(all_datasets, dataset_name="OpenDataDetector/Colli
     lst_points = []
     for i in range(len(dataset['tracker_hits']['train'])):
         # perform clustering on tracks
-        e_mask = calo_hits[i]['total_energy'] > 3.0  # energy threshold
-        eta_calo, phi_calo = convert_to_cartesian_eta_phi(calo_hits[i])
+        e_mask = calo_hits[i]['total_energy'] > energy_threshold  # energy threshold
+        # apply energy mask
+        eta_calo, phi_calo = convert_to_cartesian_eta_phi(calo_hits[i], mask=e_mask)
         # get tracks cords
         phi_tracks = tracks[i]['phi']
         eta_tracks = to_eta(tracks[i]['theta'])
@@ -85,10 +90,13 @@ def get_points_for_clustering(all_datasets, dataset_name="OpenDataDetector/Colli
         all_eta = np.concatenate([eta_calo, eta_tracks])
         all_phi = np.concatenate([phi_calo, phi_tracks])
 
+        # create a mask for calo without tracks, true * len(eta_calo) + false * len(eta_tracks)
+        mask_calo = np.concatenate([np.ones_like(eta_calo, dtype=bool), np.zeros_like(eta_tracks, dtype=bool)])
+
         eta = np.asarray(all_eta).reshape(-1)
         phi = np.asarray(all_phi ).reshape(-1)
         points = np.column_stack((eta, phi))   # shape (N, 2)
-        lst_points.append(points)
+        lst_points.append({'points': points, 'mask_calo': mask_calo, 'e_mask': e_mask})
     return lst_points
         
     
