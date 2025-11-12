@@ -44,7 +44,7 @@ def plot_calo_clusters_3d_given(event_idx, points_clustring_info_list:list, ms: 
         color=labels.astype(str),
         size=sizes,
         size_max=14,
-        opacity=0.8,
+        opacity=1.0,
         hover_data={
             "cluster": labels,
             "energy": e_sel,
