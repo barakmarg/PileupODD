@@ -74,12 +74,14 @@ def get_points_for_clustering(all_datasets, dataset_name="OpenDataDetector/Colli
     dataset = all_datasets[dataset_name]
     calo_hits = dataset['calo_hits']['train'].with_format('numpy')
     tracks = dataset['tracks']['train'].with_format('numpy')
+    tracks_hits = dataset['tracker_hits']['train'].with_format('numpy')
     lst_points = []
     for i in range(len(dataset['tracker_hits']['train'])):
         # perform clustering on tracks
         e_mask = calo_hits[i]['total_energy'] > energy_threshold  # energy threshold
-        # apply energy mask
         eta_calo, phi_calo = convert_to_cartesian_eta_phi(calo_hits[i], mask=e_mask)
+        eta_tracker_hits, phi_tracker_hits = convert_to_cartesian_eta_phi(tracks_hits[i], mask=None)
+
         # get tracks cords
         phi_tracks = tracks[i]['phi']
         eta_tracks = to_eta(tracks[i]['theta'])
