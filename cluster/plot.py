@@ -291,3 +291,113 @@ def plot_cluster_cardinality_histogram(m: MeanShiftMod, mask=None, show=True, in
         plt.show()
 
     return df
+
+
+import numpy as np
+import matplotlib.pyplot as plt
+from collections import defaultdict
+
+def plot_cluster_energy_purity(ms_model: MeanShiftMod, event_data, show=True, mask_labels=None):
+    """
+    Calculates and plots a histogram of cluster energy purity for a single event.
+
+    This function is designed to work with the specific 'calo_hits' data schema.
+
+    The purity for each cluster is defined as the ratio:
+    Ratio = E_total_cluster / E_total_truth_particles
+
+    Parameters
+    ----------
+    ms_model : object
+        A fitted clustering model (e.g., MeanShiftMod) that has a `.labels_` attribute.
+        `labels_` is an array where the value at index `i` is the cluster ID for cell `i`.
+        Noise points are expected to have a label of -1 and will be ignored.
+
+    event_data : dict-like
+        A single event record from the calo_hits dataset. It must contain the keys
+        as described in the problem context:
+        - 'total_energy': list of total energy per cell.
+        - 'contrib_particle_ids': list of lists of particle IDs for each cell.
+        - 'contrib_energies': list of lists of energies for each contribution.
+        The length of these top-level lists must match len(ms_model.labels_).
+
+    show : bool
+        If True, display the matplotlib plot.
+
+    Returns
+    -------
+    list
+        A list containing the calculated purity ratio for each non-noise cluster.
+    """
+    cluster_labels = ms_model.labels_
+    num_cells = len(event_data['total_energy'])
+    if mask_labels is not None:
+        cluster_labels = np.array(cluster_labels)
+        cluster_labels = cluster_labels[mask_labels]
+    if len(cluster_labels) != num_cells:
+        raise ValueError(
+            f"Mismatch in data size. Model has {len(cluster_labels)} labels, "
+            f"but event data has {num_cells} cells."
+        )
+
+    # STEP 1: Build the ground truth map for the entire event.
+    # Map each particle ID to its total energy deposited across all cells.
+    # This corresponds to your 'x' dictionary.
+    particle_truth_energies = defaultdict(float)
+    for i in range(num_cells):
+        for pid, energy in zip(event_data['contrib_particle_ids'][i], event_data['contrib_energies'][i]):
+            particle_truth_energies[pid] += energy
+
+    # STEP 2: For each cluster, sum its total cell energy and collect all contributing particle IDs.
+    # These two dicts correspond to your 'y' dictionary concept.
+    cluster_summed_energies = defaultdict(float)
+    cluster_contributing_particles = defaultdict(set)
+
+    for i, cluster_id in enumerate(cluster_labels):
+        if cluster_id == -1:  # Ignore noise points
+            continue
+        
+        # Add the cell's energy to its cluster's total
+        cluster_summed_energies[cluster_id] += event_data['total_energy'][i]
+        
+        # Add all contributing particle IDs from this cell to a set for the cluster
+        # Using a set automatically handles uniqueness.
+        cluster_contributing_particles[cluster_id].update(event_data['contrib_particle_ids'][i])
+
+    # STEP 3: Calculate the purity ratio for each cluster.
+    purity_ratios = []
+    for cluster_id, e_cluster in cluster_summed_energies.items():
+        # Get the unique particles that contributed to this cluster
+        pids_in_cluster = cluster_contributing_particles[cluster_id]
+        
+        # Calculate the denominator: sum the total truth energy for each of those particles
+        e_truth_denominator = sum(particle_truth_energies[pid] for pid in pids_in_cluster)
+        
+        if e_cluster == 0:
+            purity_ratios.append(0.0)
+        else:
+            ratio = e_cluster / e_truth_denominator
+            purity_ratios.append(ratio)
+
+    if not purity_ratios:
+        print("Warning: No valid clusters found to calculate ratios.")
+        return []
+
+    # STEP 4: Plot the results in a histogram.
+    plt.figure(figsize=(10, 6))
+    plt.hist(purity_ratios, bins=50, range=(0, 1.2), alpha=0.8, edgecolor='black', color='darkcyan')
+    
+    plt.xlabel("Cluster Energy Purity (E_cluster / E_truth_particles)")
+    plt.ylabel("Number of Clusters")
+    plt.title("Histogram of Cluster Energy Purity")
+    plt.grid(axis='y', linestyle='--', alpha=0.7)
+    
+    # Add a vertical line at 1.0 for a perfect purity reference
+    plt.axvline(1.0, color='red', linestyle='--', linewidth=2, label='Perfect Purity (Ratio = 1.0)')
+    plt.legend()
+    
+    if show:
+        plt.tight_layout()
+        plt.show()
+        
+    return purity_ratios
