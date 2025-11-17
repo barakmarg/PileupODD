@@ -101,4 +101,31 @@ def get_points_for_clustering(all_datasets, dataset_name="OpenDataDetector/Colli
         lst_points.append({'points': points, 'mask_calo': mask_calo, 'e_mask': e_mask})
     return lst_points
         
-    
+
+
+def parrallel_fit(ms_models: List, points_list: List[dict]):
+    """
+    Fit multiple MeanShiftMod models in parallel on provided points.
+    """
+    from joblib import Parallel, delayed
+    import sys
+    total = len(ms_models)
+
+    def fit_model(idx, ms_model, points_dict):
+        points = points_dict['points']
+        print(f"[Parallel] START fit {idx+1}/{total} | points shape={points.shape}", flush=True)
+        ms_model.fit(points)
+        try:
+            n_clusters = len(np.unique(ms_model.labels_))
+        except Exception:
+            n_clusters = 'N/A'
+        print(f"[Parallel] DONE  fit {idx+1}/{total} | clusters={n_clusters}", flush=True)
+        return ms_model, n_clusters
+
+    results = Parallel(n_jobs=-1, backend='threading')(
+        delayed(fit_model)(i, ms_models[i], points_list[i]) for i in range(total)
+    )
+    fitted_models = [r[0] for r in results]
+    cluster_counts = [r[1] for r in results]
+    print(f"[Parallel] All fits completed. Cluster counts per model: {cluster_counts}", flush=True)
+    return fitted_models
