@@ -35,7 +35,7 @@ import plotly.express as px
 from collections import defaultdict
 from typing import Any
 
-def plot_calo_clusters_3d_given(event_idx, points_clustring_info_list:list, ms: MeanShiftMod, all_datasets, dataset_name="OpenDataDetector/ColliderML_ttbar_pu0", show=True):
+def plot_calo_clusters_3d_given(event_idx, points_clustring_info_list:list, ms: MeanShiftMod, all_datasets, dataset_name="OpenDataDetector/ColliderML_ttbar_pu0", show=True, mask_cluster_smaller_than=0):
     calo = all_datasets[dataset_name]["calo_hits"]["train"].with_format("numpy")
     ev = calo[event_idx]
     labels = ms.labels_
@@ -53,6 +53,20 @@ def plot_calo_clusters_3d_given(event_idx, points_clustring_info_list:list, ms: 
     e_sel = e[e_mask]
     labels = labels[mask_calo]
 
+    unique, counts = np.unique(labels, return_counts=True)
+    count_map = dict(zip(unique, counts))
+    cluster_sizes = np.vectorize(count_map.get)(labels)
+
+    mask_c_sizes = cluster_sizes >= mask_cluster_smaller_than
+    x = x[mask_c_sizes]
+    y = y[mask_c_sizes]
+    z = z[mask_c_sizes]
+    eta = eta[mask_c_sizes]
+    phi = phi[mask_c_sizes]
+    e_sel = e_sel[mask_c_sizes]
+    labels = labels[mask_c_sizes]
+    cluster_sizes = cluster_sizes[mask_c_sizes]
+    
     # Robust marker sizing based on energy
     if e_sel.size:
         lo = np.percentile(e_sel, 5)
@@ -69,6 +83,7 @@ def plot_calo_clusters_3d_given(event_idx, points_clustring_info_list:list, ms: 
         opacity=1.0,
         hover_data={
             "cluster": labels,
+            "cluster_size": cluster_sizes,
             "energy": e_sel,
             "eta": eta,
             "phi": phi
@@ -324,7 +339,7 @@ def plot_cluster_cardinality_histogram(
         ax_bar.grid(axis='y', linestyle='--', alpha=0.4)
 
         if include_size_distribution and ax_hist is not None:
-            ax_hist.hist(df['count'], bins='auto', color="#ff7f0e", alpha=0.8, edgecolor='black')
+            ax_hist.hist(df['count'], bins=100, color="#ff7f0e", alpha=0.8, edgecolor='black')
             ax_hist.set_xlabel("Cluster size (cardinality)")
             ax_hist.set_ylabel("#Clusters")
             ax_hist.set_title("Distribution of cluster sizes")
@@ -395,7 +410,7 @@ def plot_cluster_cardinality_histogram(
 
     # Histogram of cluster size distribution across all events
     if include_size_distribution and ax_hist is not None:
-        ax_hist.hist(concat_df['count'], bins='auto', color="#ff7f0e", alpha=0.8, edgecolor='black')
+        ax_hist.hist(concat_df['count'], bins=100, color="#ff7f0e", alpha=0.8, edgecolor='black')
         ax_hist.set_xlabel("Cluster size (cardinality)")
         ax_hist.set_ylabel("#Clusters")
         ax_hist.set_title("Aggregated distribution of cluster sizes")
@@ -500,7 +515,11 @@ def plot_aggregated_particle_completeness(
         print("Warning: No valid particles were found across any of the specified events.")
         return []
     
-    print(f"Calculation complete. Found {len(all_completeness_ratios)} particles in total.")
+    total_particles = len(all_completeness_ratios)
+    perfect_count = int(np.sum(np.isclose(all_completeness_ratios, 1.0, atol=1e-6)))
+    perfect_pct = (perfect_count / total_particles * 100.0) if total_particles else 0.0
+
+    print(f"Calculation complete. Found {total_particles} particles in total.")
 
     # --- Plot the aggregated results ---
     plt.figure(figsize=(10, 6))
@@ -508,7 +527,10 @@ def plot_aggregated_particle_completeness(
     
     plt.xlabel("Particle Energy Completeness (Largest Cluster Dep / Total Particle Energy)")
     plt.ylabel("Total Number of Particles (from all events)")
-    plt.title(f"Aggregated Histogram of Particle Completeness for {len(event_indices)} Events")
+    plt.title(
+        f"Aggregated Histogram of Particle Completeness for {len(event_indices)} Events "
+        f"(perfect={perfect_pct:.1f}% | {perfect_count}/{total_particles} particles)"
+    )
     plt.grid(axis='y', linestyle='--', alpha=0.7)
     #plt.yscale('log')
     
@@ -646,6 +668,7 @@ def plot_cluster_energy_purity_interactive(ms_model: Any, event_data: dict, show
 
 from typing import List, Any
 def plot_aggregated_cluster_purity(
+        
     ms_models: List[Any], 
     full_dataset: Any, 
     event_indices: List[int], 
@@ -752,3 +775,75 @@ def plot_aggregated_cluster_purity(
         plt.show()
         
     return all_purity_ratios
+
+
+
+# ...existing code...
+import numpy as np
+import pandas as pd
+import plotly.express as px
+from collections import defaultdict
+def plot_calo_energy_by_pdg_interactive(all_datasets_loaded, event_idx=7, calo_mask=None):
+    from cluster.pdg_mappings import PDG_ID_TO_NAME
+    event_idx = 7
+    dataset = all_datasets_loaded["OpenDataDetector/ColliderML_ttbar_pu0"]
+    particles_evt = dataset["particles"]["train"].with_format("numpy")[event_idx]
+    calo_evt = dataset["calo_hits"]["train"].with_format("numpy")[event_idx]
+
+    if calo_mask is not None:
+        calo_evt = calo_evt[calo_mask]
+
+    particle_ids = particles_evt["particle_id"]
+    pdg_ids = particles_evt["pdg_id"]
+    particle_counts = dict(zip(*np.unique(pdg_ids, return_counts=True)))
+    particle_id_to_pdg = dict(zip(particle_ids, pdg_ids))
+
+    per_particle_energy = defaultdict(float)
+    for contrib_ids, contrib_E in zip(calo_evt["contrib_particle_ids"], calo_evt["contrib_energies"]):
+        if contrib_ids is None:
+            continue
+        for pid, e in zip(contrib_ids, contrib_E):
+            if pid in particle_id_to_pdg:
+                per_particle_energy[int(pid)] += float(e)
+
+    energy_per_pdg = defaultdict(float)
+    top_particle_per_pdg = {}
+    for pid, energy in per_particle_energy.items():
+        pdg = int(particle_id_to_pdg[pid])
+        energy_per_pdg[pdg] += energy
+        if pdg not in top_particle_per_pdg or energy > top_particle_per_pdg[pdg][1]:
+            top_particle_per_pdg[pdg] = (pid, energy)
+
+    records = []
+    for pdg, total_E in sorted(energy_per_pdg.items(), key=lambda kv: kv[1], reverse=True):
+        top_pid, top_E = top_particle_per_pdg[pdg]
+        records.append(
+            {
+                "pdg_name": PDG_ID_TO_NAME.get(str(pdg), "Unknown"),
+                "pdg_id": str(pdg),
+                "total_energy_GeV": total_E,
+                "n_particles": int(particle_counts.get(pdg, 0)),
+                "top_particle_id": top_pid,
+                "top_particle_energy_GeV": top_E,
+            }
+        )
+
+    df = pd.DataFrame(records)
+    fig = px.bar(
+        df,
+        x="pdg_name",
+        y="total_energy_GeV",
+        log_y=True,
+        labels={"pdg_name": "Particle Name", "total_energy_GeV": "Total calo energy (GeV)"},
+        hover_data={
+            "pdg_id": True,
+            "total_energy_GeV": ":.3f",
+            "n_particles": True,
+            "top_particle_id": True,
+            "top_particle_energy_GeV": ":.3f",
+        },
+        title=f"Event {event_idx} calorimeter energy by Particle Name",
+    )
+    fig.update_layout(hoverlabel=dict(bgcolor="white"))
+    fig.show()
+    # ...existing code...

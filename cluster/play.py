@@ -69,7 +69,19 @@ def convert_to_cartesian_eta_phi(data, mask=None):
     return eta, phi
 
 
-def get_points_for_clustering(all_datasets, dataset_name="OpenDataDetector/ColliderML_ttbar_pu0", energy_threshold=0.001, until_index=1):
+def calc_percentile_threshold_mask(energies: np.ndarray, percentile: float) -> np.ndarray:
+    if energies.size:
+        order = np.argsort(energies)[::-1]
+        top_count = max(1, int(np.ceil(percentile*0.01 * energies.size)))
+        top_high_idx = order[:top_count]
+        top_high_mask = np.zeros_like(energies, dtype=bool)
+        top_high_mask[top_high_idx] = True
+    else:
+        top_high_mask = np.zeros_like(energies, dtype=bool)
+
+    return top_high_mask
+
+def get_points_for_clustering(all_datasets, dataset_name="OpenDataDetector/ColliderML_ttbar_pu0", energy_threshold=0.001, high_energy_threshold_perc=0.1, until_index=1):
 
     dataset = all_datasets[dataset_name]
     calo_hits = dataset['calo_hits']['train'].with_format('numpy')
@@ -79,6 +91,11 @@ def get_points_for_clustering(all_datasets, dataset_name="OpenDataDetector/Colli
     for i in range(len(dataset['tracker_hits']['train'])):
         # perform clustering on tracks
         e_mask = calo_hits[i]['total_energy'] > energy_threshold  # energy threshold
+        # mask out <%95 of energy calo hits
+        energies = np.asarray(calo_hits[i]['total_energy'], dtype=float)
+        top_high_mask = calc_percentile_threshold_mask(energies[e_mask], high_energy_threshold_perc)
+
+        high_mask = top_high_mask & e_mask
         eta_calo, phi_calo = convert_to_cartesian_eta_phi(calo_hits[i], mask=e_mask)
         eta_tracker_hits, phi_tracker_hits = convert_to_cartesian_eta_phi(tracks_hits[i], mask=None)
 
@@ -94,16 +111,32 @@ def get_points_for_clustering(all_datasets, dataset_name="OpenDataDetector/Colli
 
         # create a mask for calo without tracks, true * len(eta_calo) + false * len(eta_tracks)
         mask_calo = np.concatenate([np.ones_like(eta_calo, dtype=bool), np.zeros_like(eta_tracks, dtype=bool)])
-
+        high_mask = np.concatenate([high_mask, np.zeros_like(eta_tracks, dtype=bool)])
         eta = np.asarray(all_eta).reshape(-1)
         phi = np.asarray(all_phi ).reshape(-1)
         points = np.column_stack((eta, phi))   # shape (N, 2)
-        lst_points.append({'points': points, 'mask_calo': mask_calo, 'e_mask': e_mask})
+        energies = np.concatenate([calo_hits[i]['total_energy'][e_mask], np.zeros_like(eta_tracks, dtype=float)])
+        lst_points.append({'points': points, 'mask_calo': mask_calo, 'e_mask': e_mask, 'high_mask': high_mask, 'energies': energies})
     return lst_points
-        
 
 
-def parrallel_fit(ms_models: List, points_list: List[dict]):
+def get_points_for_calo_cells(all_datasets, dataset_name="OpenDataDetector/ColliderML_ttbar_pu0", energy_threshold=0.00001, high_energy_threshold_perc=0.1, until_index=1):
+    dataset = all_datasets[dataset_name]
+    calo_hits = dataset['calo_hits']['train'].with_format('numpy') 
+    lst_points = []
+    for i in range(until_index):
+        # perform clustering on tracks
+        e_mask = calo_hits[i]['total_energy'] > energy_threshold  # energy threshold
+        # mask out <%95 of energy calo hits
+        energies = np.asarray(calo_hits[i]['total_energy'], dtype=float)
+        top_high_mask = calc_percentile_threshold_mask(energies[e_mask], high_energy_threshold_perc)
+        points = np.column_stack((calo_hits[i]['x'][e_mask], calo_hits[i]['y'][e_mask], calo_hits[i]['z'][e_mask]))   # shape (N, 3)
+        high_mask = top_high_mask & e_mask
+        mask_calo = np.ones_like(energies[e_mask], dtype=bool)
+        lst_points.append({'points': points, 'mask_calo': mask_calo, 'e_mask': e_mask, 'high_mask': high_mask, 'energies': energies})
+    return lst_points
+
+def parrallel_fit(ms_models: List, points_list: List[dict], do_weights: bool = True) :
     """
     Fit multiple MeanShiftMod models in parallel on provided points.
     """
@@ -114,7 +147,10 @@ def parrallel_fit(ms_models: List, points_list: List[dict]):
     def fit_model(idx, ms_model, points_dict):
         points = points_dict['points']
         print(f"[Parallel] START fit {idx+1}/{total} | points shape={points.shape}", flush=True)
-        ms_model.fit(points)
+        if do_weights:
+            ms_model.fit(points,wt=points_dict['energies'])
+        else:
+            ms_model.fit(points)
         try:
             n_clusters = len(np.unique(ms_model.labels_))
         except Exception:
