@@ -35,13 +35,13 @@ import plotly.express as px
 from collections import defaultdict
 from typing import Any
 
-def plot_calo_clusters_3d_given(event_idx, points_clustring_info_list:list, ms: MeanShiftMod, all_datasets, dataset_name="OpenDataDetector/ColliderML_ttbar_pu0", show=True, mask_cluster_smaller_than=0):
+def plot_calo_clusters_3d_given(event_idx, points_clustring_info:dict, ms: MeanShiftMod, all_datasets, dataset_name="OpenDataDetector/ColliderML_ttbar_pu0", show=True, mask_cluster_smaller_than=0):
     calo = all_datasets[dataset_name]["calo_hits"]["train"].with_format("numpy")
     ev = calo[event_idx]
     labels = ms.labels_
-    data = points_clustring_info_list[event_idx]['points']
-    mask_calo = points_clustring_info_list[event_idx]['mask_calo']
-    e_mask = points_clustring_info_list[event_idx]['e_mask']
+    data = points_clustring_info['points']
+    mask_calo = points_clustring_info['mask_calo']
+    e_mask = points_clustring_info['e_mask']
     e = np.asarray(ev["total_energy"], dtype=float)
 
     x = ev["x"][e_mask]
@@ -105,7 +105,7 @@ def plot_calo_clusters_3d(all_datasets, dataset_name="OpenDataDetector/ColliderM
     data = points_list[event_idx]['points']
 
     ms = MeanShiftMod(bandwidth=bandwidth, bin_seeding=True).fit(data)
-    return plot_calo_clusters_3d_given(event_idx, points_list, ms, all_datasets, dataset_name=dataset_name, show=show)
+    return plot_calo_clusters_3d_given(event_idx, points_list[event_idx], ms, all_datasets, dataset_name=dataset_name, show=show)
 
 
 def plot_2d_meanshift_results( points, m: MeanShiftMod, mask=None):
@@ -778,20 +778,27 @@ def plot_aggregated_cluster_purity(
 
 
 
-# ...existing code...
 import numpy as np
 import pandas as pd
 import plotly.express as px
+import plotly.graph_objects as go
+import ipywidgets as widgets
 from collections import defaultdict
+
 def plot_calo_energy_by_pdg_interactive(all_datasets_loaded, event_idx=7, calo_mask=None):
     from cluster.pdg_mappings import PDG_ID_TO_NAME
-    event_idx = 7
+    
     dataset = all_datasets_loaded["OpenDataDetector/ColliderML_ttbar_pu0"]
     particles_evt = dataset["particles"]["train"].with_format("numpy")[event_idx]
     calo_evt = dataset["calo_hits"]["train"].with_format("numpy")[event_idx]
 
+    # Apply mask to contribution arrays if provided
     if calo_mask is not None:
-        calo_evt = calo_evt[calo_mask]
+        contrib_ids = calo_evt["contrib_particle_ids"][calo_mask]
+        contrib_energies = calo_evt["contrib_energies"][calo_mask]
+    else:
+        contrib_ids = calo_evt["contrib_particle_ids"]
+        contrib_energies = calo_evt["contrib_energies"]
 
     particle_ids = particles_evt["particle_id"]
     pdg_ids = particles_evt["pdg_id"]
@@ -799,20 +806,31 @@ def plot_calo_energy_by_pdg_interactive(all_datasets_loaded, event_idx=7, calo_m
     particle_id_to_pdg = dict(zip(particle_ids, pdg_ids))
 
     per_particle_energy = defaultdict(float)
-    for contrib_ids, contrib_E in zip(calo_evt["contrib_particle_ids"], calo_evt["contrib_energies"]):
-        if contrib_ids is None:
+    
+    # Aggregate energy per particle
+    for c_ids, c_Es in zip(contrib_ids, contrib_energies):
+        if c_ids is None:
             continue
-        for pid, e in zip(contrib_ids, contrib_E):
+        for pid, e in zip(c_ids, c_Es):
             if pid in particle_id_to_pdg:
                 per_particle_energy[int(pid)] += float(e)
 
-    energy_per_pdg = defaultdict(float)
-    top_particle_per_pdg = {}
+    # Group particles by PDG for the drill-down
+    particles_by_pdg = defaultdict(list)
     for pid, energy in per_particle_energy.items():
         pdg = int(particle_id_to_pdg[pid])
-        energy_per_pdg[pdg] += energy
-        if pdg not in top_particle_per_pdg or energy > top_particle_per_pdg[pdg][1]:
-            top_particle_per_pdg[pdg] = (pid, energy)
+        particles_by_pdg[pdg].append({'pid': pid, 'energy': energy})
+
+    energy_per_pdg = defaultdict(float)
+    top_particle_per_pdg = {}
+    
+    for pdg, p_list in particles_by_pdg.items():
+        # Sort particles by energy descending
+        p_list.sort(key=lambda x: x['energy'], reverse=True)
+        
+        total_E = sum(p['energy'] for p in p_list)
+        energy_per_pdg[pdg] = total_E
+        top_particle_per_pdg[pdg] = (p_list[0]['pid'], p_list[0]['energy'])
 
     records = []
     for pdg, total_E in sorted(energy_per_pdg.items(), key=lambda kv: kv[1], reverse=True):
@@ -829,6 +847,8 @@ def plot_calo_energy_by_pdg_interactive(all_datasets_loaded, event_idx=7, calo_m
         )
 
     df = pd.DataFrame(records)
+    
+    # --- Main Figure (Summary) ---
     fig = px.bar(
         df,
         x="pdg_name",
@@ -842,8 +862,61 @@ def plot_calo_energy_by_pdg_interactive(all_datasets_loaded, event_idx=7, calo_m
             "top_particle_id": True,
             "top_particle_energy_GeV": ":.3f",
         },
-        title=f"Event {event_idx} calorimeter energy by Particle Name",
+        title=f"Event {event_idx} calorimeter energy by Particle Name (Click bar to drill down)",
     )
-    fig.update_layout(hoverlabel=dict(bgcolor="white"))
-    fig.show()
-    # ...existing code...
+    fig.update_layout(hoverlabel=dict(bgcolor="white"), clickmode='event+select')
+    
+    # Convert to FigureWidget for callbacks
+    main_widget = go.FigureWidget(fig)
+    
+    # --- Detail Figure (Drill-down) ---
+    detail_widget = go.FigureWidget(
+        layout=go.Layout(
+            title="Particle Energy Distribution (Click a bar above)",
+            xaxis_title="Energy Contributed (GeV)",
+            yaxis_title="Count of Particles",
+            yaxis_type="log", # Often useful for particle counts
+            height=400
+        )
+    )
+    
+    # Callback function
+    def update_detail(trace, points, selector):
+        if not points.point_inds:
+            return
+            
+        ind = points.point_inds[0]
+        row = df.iloc[ind]
+        pdg_id = int(row['pdg_id'])
+        pdg_name = row['pdg_name']
+        
+        # Get particles for this PDG
+        p_list = particles_by_pdg.get(pdg_id, [])
+        
+        if p_list:
+            energies = [p['energy'] for p in p_list]
+            
+            # Create histogram trace
+            new_trace = go.Histogram(
+                x=energies,
+                name=pdg_name,
+                marker_color='#EF553B',
+                nbinsx=50 # Adjust binning as needed
+            )
+            
+            detail_widget.data = []
+            detail_widget.add_trace(new_trace)
+            detail_widget.layout.title = f"Energy Distribution for {pdg_name} (PDG: {pdg_id}, Total Particles: {len(p_list)})"
+            # Reset axis types if needed, though log y is usually good
+            detail_widget.layout.xaxis.type = 'linear' 
+            detail_widget.layout.xaxis.title = "Energy Contributed (GeV)"
+        else:
+            detail_widget.data = []
+            detail_widget.layout.title = f"No particles found for {pdg_name}"
+
+    # Register callback
+    main_widget.data[0].on_click(update_detail)
+    
+    # Return VBox containing both widgets
+    return widgets.VBox([main_widget, detail_widget])
+# ...existing code...

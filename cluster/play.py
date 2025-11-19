@@ -120,18 +120,20 @@ def get_points_for_clustering(all_datasets, dataset_name="OpenDataDetector/Colli
     return lst_points
 
 
-def get_points_for_calo_cells(all_datasets, dataset_name="OpenDataDetector/ColliderML_ttbar_pu0", energy_threshold=0.00001, high_energy_threshold_perc=0.1, until_index=1):
+def get_points_for_calo_cells(all_datasets, dataset_name="OpenDataDetector/ColliderML_ttbar_pu0", energy_threshold=None, high_energy_threshold_perc=0.1, until_index=1):
     dataset = all_datasets[dataset_name]
     calo_hits = dataset['calo_hits']['train'].with_format('numpy') 
     lst_points = []
     for i in range(until_index):
         # perform clustering on tracks
-        e_mask = calo_hits[i]['total_energy'] > energy_threshold  # energy threshold
+        if  energy_threshold is None:
+            e_mask = np.ones_like(calo_hits[i]['total_energy'], dtype=bool)
+        else:
+            e_mask = calo_hits[i]['total_energy'] > energy_threshold  # energy threshold
         # mask out <%95 of energy calo hits
         energies = np.asarray(calo_hits[i]['total_energy'], dtype=float)
-        top_high_mask = calc_percentile_threshold_mask(energies[e_mask], high_energy_threshold_perc)
         points = np.column_stack((calo_hits[i]['x'][e_mask], calo_hits[i]['y'][e_mask], calo_hits[i]['z'][e_mask]))   # shape (N, 3)
-        high_mask = top_high_mask & e_mask
+        high_mask = e_mask
         mask_calo = np.ones_like(energies[e_mask], dtype=bool)
         lst_points.append({'points': points, 'mask_calo': mask_calo, 'e_mask': e_mask, 'high_mask': high_mask, 'energies': energies})
     return lst_points
