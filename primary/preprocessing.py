@@ -12,6 +12,9 @@ def cast_parent_id_to_int64(df: pl.DataFrame) -> pl.DataFrame:
         pl.col("parent_id").cast(pl.List(pl.Int64))
     ) 
 
+
+def apply_mask_to_all_events(df: pl.DataFrame, mask: pl.Series) -> pl.DataFrame:
+    pass
 def add_orphan_mask(df: pl.DataFrame) -> pl.DataFrame:
     print("Computing parent existence mask...")
 
@@ -64,3 +67,85 @@ def add_orphan_mask(df: pl.DataFrame) -> pl.DataFrame:
         .join(result_mask, on="tmp_event_idx", how="left")
         .drop("tmp_event_idx")
     )
+
+
+
+import polars as pl
+
+def map_to_ultimate_ancestor(df: pl.DataFrame) -> pl.DataFrame:
+    """
+    Optimized lineage tracer (Pointer Jumping) that handles NULL parents.
+    If parent_id is NULL, the particle maps to itself.
+    """
+    print("Mapping lineage (Pointer Jumping with Self-Loops)...")
+
+    # 1. FLATTEN & PREPARE
+    lineage_map = (
+        df.lazy()
+        .with_row_index("event_idx")
+        .select([
+            pl.col("event_idx"),
+            pl.col("particle_id").cast(pl.List(pl.Int64)),
+            pl.col("parent_id").cast(pl.List(pl.Int64))
+        ])
+        .explode(["particle_id", "parent_id"])
+        .select([
+            pl.col("event_idx"),
+            pl.col("particle_id").alias("node"),
+            # FIX 1: Handle NULL parents immediately.
+            # If parent is null, the target becomes the node itself (Self-Loop)
+            pl.coalesce([
+                pl.col("parent_id"), 
+                pl.col("particle_id")
+            ]).alias("target")
+        ])
+        .unique()
+        .collect()
+    )
+
+    iteration = 0
+    while True:
+        iteration += 1
+        
+        # 2. SELF JOIN (Look up the grandparent)
+        next_step = lineage_map.join(
+            lineage_map,
+            left_on=["event_idx", "target"], 
+            right_on=["event_idx", "node"],
+            how="left",
+            suffix="_jump"
+        )
+        
+        # 3. CHECK CONVERGENCE (Crucial Logic Update)
+        # We only care if we found a NEW ancestor.
+        # Logic: 
+        # 1. target_jump must exist (is_not_null)
+        # 2. target_jump must be DIFFERENT from current target (to avoid infinite self-loops)
+        
+        updates = next_step.filter(
+            pl.col("target_jump").is_not_null() & 
+            (pl.col("target_jump") != pl.col("target"))
+        )
+        
+        if updates.height == 0:
+            print(f"Converged after {iteration} iterations.")
+            break
+            
+        # 4. APPLY UPDATES
+        # If we found a valid, different ancestor, take it. Otherwise keep current.
+        lineage_map = next_step.select([
+            pl.col("event_idx"),
+            pl.col("node"),
+            pl.coalesce([
+                # Only take the jump if it's different (conceptually)
+                # but technically coalesce is fine here because if they are equal,
+                # taking the new one changes nothing.
+                pl.col("target_jump"), 
+                pl.col("target")
+            ]).alias("target")
+        ])
+
+    return lineage_map.rename({
+        "node": "particle_id", 
+        "target": "ultimate_ancestor_id"
+    })
