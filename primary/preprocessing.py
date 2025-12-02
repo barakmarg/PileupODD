@@ -174,8 +174,157 @@ def cluster_purity(calo_hits_with_clusters:pl.DataFrame, ancestors:pl.DataFrame)
 
     return final
 
-
 import polars as pl
+
+def particle_purity(
+    calo_hits: pl.DataFrame, 
+    ancestors: pl.DataFrame, 
+    particles: pl.DataFrame
+) -> pl.DataFrame:
+    """
+    Computes purity using Lazy execution and Streaming.
+    
+    Optimizations:
+    1. No intermediate .collect(): Data flows through without holding huge tables in RAM.
+    2. Streaming=True: Processes data in chunks (batch-wise).
+    3. Composite Joins: Joins on [event_id, particle_id] to ensure correctness.
+    4. Early Aggregation: Sums energies immediately after mapping to ancestors.
+    """
+    
+    # 1. PREPARE HITS (Lazy)
+    # We flatten the nested structure but DO NOT materialize it.
+    hits_lazy = (
+        calo_hits.lazy()
+        .select(['event_id', 'contrib_energies', 'contrib_particle_ids'])
+        # Double explode implies list[list] structure. 
+        # Polars optimizes sequential explodes in lazy mode.
+        .explode(['contrib_energies', 'contrib_particle_ids'])
+        .explode(['contrib_energies', 'contrib_particle_ids'])
+        .rename({
+            'contrib_particle_ids': 'particle_id',
+            'contrib_energies': 'energy'
+        })
+    )
+
+    # 2. PREPARE ANCESTORS (Lazy)
+    # Ensure we have the mapping keys ready
+    ancestors_lazy = ancestors.lazy().select(['event_id', 'particle_id', 'ultimate_ancestor_id'])
+
+    # 3. PREPARE DENOMINATOR (Total Particle Energy)
+    # Flatten particles to get the reference energy for the denominator
+    particles_lazy = (
+        particles.lazy()
+        .select(['event_id', 'particle_id', 'energy'])
+        .explode(['particle_id', 'energy'])
+        .rename({'energy': 'total_particle_energy'})
+    )
+
+    # 4. EXECUTE PIPELINE
+    # This entire block is a single query plan.
+    final_query = (
+        hits_lazy
+        # Step A: Map Hit-Particles to their Ultimate Ancestors
+        # We join on event_id AND particle_id to avoid cross-event collisions
+        .join(
+            ancestors_lazy,
+            on=['event_id', 'particle_id'],
+            how='left'
+        )
+        # Optimization: Drop rows where ancestor lookup failed (optional, but saves RAM)
+        .filter(pl.col("ultimate_ancestor_id").is_not_null())
+        
+        # Step B: Aggregate Numerator (Energy in Calo per Ancestor)
+        # This reduces the row count massively (from #hits to #ancestors)
+        .group_by(['event_id', 'ultimate_ancestor_id'])
+        .agg(
+            pl.col('energy').sum().alias('total_energy_in_calo')
+        )
+        
+        # Step C: Join with Denominator (Total Energy of that Ancestor)
+        # Note: We join ancestor_id (from hits) to particle_id (from particles table)
+        .join(
+            particles_lazy,
+            left_on=['event_id', 'ultimate_ancestor_id'],
+            right_on=['event_id', 'particle_id'],
+            how='left'
+        )
+        
+        # Step D: Calculate Purity
+        .with_columns(
+            (pl.col('total_energy_in_calo') / pl.col('total_particle_energy')).alias('purity')
+        )
+    )
+
+    # 5. COLLECT WITH STREAMING
+    # This is the only time RAM is heavily used, but streaming manages it in batches.
+    return final_query.collect(streaming=True)
+
+
+def get_mask_confusion_matrix(df: pl.DataFrame, mask_a: str, mask_b: str):
+    """
+    Calculates the confusion matrix between two boolean list columns.
+    Memory efficient: Projects and explodes only the relevant columns.
+    """
+    print(f"Comparing '{mask_a}' vs '{mask_b}'...")
+
+    stats = (
+        df.lazy()
+        # 1. Select only the two columns to compare (saves RAM)
+        .select([pl.col(mask_a), pl.col(mask_b)])
+        # 2. Explode to flat boolean arrays
+        .explode([mask_a, mask_b])
+        .select([
+            (pl.col(mask_a) & pl.col(mask_b)).alias("both_true"),
+            (pl.col(mask_a) & ~pl.col(mask_b)).alias("a_only"),
+            (~pl.col(mask_a) & pl.col(mask_b)).alias("b_only"),
+            (~pl.col(mask_a) & ~pl.col(mask_b)).alias("both_false")
+        ])
+        .sum() # Sum boolean columns (True=1, False=0)
+        .collect()
+    )
+
+    # Extract values
+    both_true = stats["both_true"][0]
+    a_only = stats["a_only"][0]
+    b_only = stats["b_only"][0]
+    both_false = stats["both_false"][0]
+
+    # Print Report
+    print(f"\n--- Comparison Report: {mask_a} vs {mask_b} ---")
+    print(f"Intersection (Both True): {both_true:,}")
+    print(f"Only in {mask_a}:       {a_only:,}")
+    print(f"Only in {mask_b}:       {b_only:,}")
+    print(f"Both False:             {both_false:,}")
+    print(f"Both equal (True+False),   {both_true + both_false:,},percentage: {(both_true + both_false) / (both_true + a_only + b_only + both_false) * 100:.2f}%")
+    print("-" * 30)
+    
+
+    return stats
+
+
+def child_is_primary_and_parent_exist(particles: pl.DataFrame, head=20) -> pl.DataFrame:
+    return (
+    particles.lazy()
+    .select('primary','event_id', 'is_parent_missing', 'pdg_id', 'parent_id') # this is A
+    .explode(['primary', 'is_parent_missing', 'pdg_id', 'parent_id'])
+    .filter((pl.col('primary') & ~pl.col('is_parent_missing')))
+    .select('pdg_id','event_id', 'parent_id')
+    .join(
+            (
+                particles.lazy()
+                .select('particle_id', 'pdg_id', 'event_id')
+                .rename({'particle_id': 'particle_id', 'pdg_id': 'parent_pdg_id', 'event_id': 'event_id'})
+                .explode('particle_id', 'parent_pdg_id')),
+        left_on=['parent_id', 'event_id'],
+        right_on=['particle_id', 'event_id'],
+        how='left',
+    )
+
+    .group_by('pdg_id', 'parent_pdg_id')
+    .len()
+    .sort('len', descending=True)
+    .head(head)
+    .collect() ) 
 
 def map_to_ultimate_ancestor_with_inherited_mask(df: pl.DataFrame) -> pl.DataFrame:
     """
@@ -195,9 +344,8 @@ def map_to_ultimate_ancestor_with_inherited_mask(df: pl.DataFrame) -> pl.DataFra
     # -------------------------------------------------------------------------
     base_state = (
         df.lazy()
-        .with_row_index("event_idx")
         .select([
-            pl.col("event_idx"),
+            pl.col("event_id"),
             pl.col("particle_id").cast(pl.List(pl.Int64)),
             pl.col("parent_id").cast(pl.List(pl.Int64)),
             # Project coordinates only for calculation, then drop them
@@ -205,7 +353,7 @@ def map_to_ultimate_ancestor_with_inherited_mask(df: pl.DataFrame) -> pl.DataFra
         ])
         .explode(["particle_id", "parent_id", "vx", "vy", "vz", "is_parent_missing"])
         .select([
-            pl.col("event_idx"),
+            pl.col("event_id"),
             pl.col("particle_id"),
             
             # Logic: If parent is null, it maps to self
@@ -220,7 +368,7 @@ def map_to_ultimate_ancestor_with_inherited_mask(df: pl.DataFrame) -> pl.DataFra
                 (pl.col("vz").abs() > Z_LIMIT)
             ).alias("geometry_mask")
         ])
-        .unique(subset=["event_idx", "particle_id"])
+        .unique(subset=["event_id", "particle_id"])
         .collect() # Materialize lightweight table (Int64 + Bool only)
     )
 
@@ -230,12 +378,12 @@ def map_to_ultimate_ancestor_with_inherited_mask(df: pl.DataFrame) -> pl.DataFra
     
     # Table A: The Reference for Masks [event, particle_id, mask]
     # We park this in memory and don't touch it until the end.
-    mask_lookup = base_state.select(["event_idx", "particle_id", "geometry_mask"])
+    mask_lookup = base_state.select(["event_id", "particle_id", "geometry_mask"])
 
     # Table B: The Active Lineage Map [event, node, target]
     # We only iterate on IDs. We do NOT carry the mask in the loop (saves RAM).
     lineage_map = base_state.select([
-        pl.col("event_idx"), 
+        pl.col("event_id"), 
         pl.col("particle_id").alias("node"), 
         pl.col("target")
     ])
@@ -250,8 +398,8 @@ def map_to_ultimate_ancestor_with_inherited_mask(df: pl.DataFrame) -> pl.DataFra
         # Self-Join to find the next parent
         next_step = lineage_map.join(
             lineage_map,
-            left_on=["event_idx", "target"], 
-            right_on=["event_idx", "node"],
+            left_on=["event_id", "target"], 
+            right_on=["event_id", "node"],
             how="left",
             suffix="_jump"
         )
@@ -268,7 +416,7 @@ def map_to_ultimate_ancestor_with_inherited_mask(df: pl.DataFrame) -> pl.DataFra
             
         # Apply updates
         lineage_map = next_step.select([
-            pl.col("event_idx"),
+            pl.col("event_id"),
             pl.col("node"),
             pl.coalesce([pl.col("target_jump"), pl.col("target")]).alias("target")
         ])
@@ -280,11 +428,11 @@ def map_to_ultimate_ancestor_with_inherited_mask(df: pl.DataFrame) -> pl.DataFra
     
     result = lineage_map.join(
         mask_lookup,
-        left_on=["event_idx", "target"],       # target is the ultimate ancestor
-        right_on=["event_idx", "particle_id"], # lookup mask by ID
+        left_on=["event_id", "target"],       # target is the ultimate ancestor
+        right_on=["event_id", "particle_id"], # lookup mask by ID
         how="left"
     ).select([
-        pl.col("event_idx"),
+        pl.col("event_id"),
         pl.col("node").alias("particle_id"),
         pl.col("target").alias("ultimate_ancestor_id"),
         pl.col("geometry_mask").alias("ancestor_created_inside_calo")

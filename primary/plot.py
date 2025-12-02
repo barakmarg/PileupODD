@@ -1,6 +1,6 @@
 import polars as pl
 import matplotlib.pyplot as plt
-from primary.preprocessing import cluster_purity
+from primary.preprocessing import cluster_purity, particle_purity
 import plotly.express as px
 import numpy as np
 
@@ -92,7 +92,7 @@ def plot_cluster_cardinallity(calo_hits_with_clusters:pl.DataFrame)->None:
     plt.grid(axis='y', alpha=0.5)
     plt.show()
 
-def plot_purity(calo_hits_with_clusters:pl.DataFrame, ancestors:pl.DataFrame)->None:
+def plot_clusters_purity(calo_hits_with_clusters:pl.DataFrame, ancestors:pl.DataFrame)->None:
     purity_df = cluster_purity(calo_hits_with_clusters, ancestors)
     # just group by 
     purity_df =(
@@ -115,6 +115,21 @@ def plot_purity(calo_hits_with_clusters:pl.DataFrame, ancestors:pl.DataFrame)->N
     plt.grid(axis='y', alpha=0.5)
     plt.show()
 
+def plot_particle_purity(   calo_hits: pl.DataFrame, 
+    ancestors: pl.DataFrame, 
+    particles: pl.DataFrame)->None:
+    purity_df = particle_purity(calo_hits, ancestors, particles)
+    # just group by 
+    purity_df =(
+    purity_df.select([ "purity"]    )
+)
+    plt.figure(figsize=(10,6))
+    plt.hist(purity_df['purity'].to_numpy(), bins=50, color='seagreen', edgecolor='black', alpha=0.7)
+    plt.title("Cluster Purity Distribution")
+    plt.xlabel("Purity")
+    plt.ylabel("Number of particles")
+    plt.grid(axis='y', alpha=0.5)
+    plt.show()
 
 import polars as pl
 import matplotlib.pyplot as plt
