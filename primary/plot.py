@@ -2,6 +2,8 @@ import polars as pl
 import matplotlib.pyplot as plt
 from primary.preprocessing import cluster_purity, particle_purity
 import plotly.express as px
+from primary.preprocessing import particle_purity_by_class
+
 import numpy as np
 from primary.pdg_mappings import PDG_ID_TO_NAME
 
@@ -131,11 +133,119 @@ def plot_particle_purity(   calo_hits: pl.DataFrame,
 )
     plt.figure(figsize=(10,6))
     plt.hist(purity_df['purity'].to_numpy(), bins=50, color='seagreen', edgecolor='black', alpha=0.7)
-    plt.title("Cluster Purity Distribution")
-    plt.xlabel("Purity")
+    plt.title("Particle calo deps ratio Distribution")
+    plt.xlabel("E_particle decendants deposited in calo / E_particle")
     plt.ylabel("Number of particles")
+    # log scale
+    plt.yscale('log')
     plt.grid(axis='y', alpha=0.5)
     plt.show()
+
+def plot_particle_purity_by_class(
+    calo_hits: pl.DataFrame, 
+    ancestors: pl.DataFrame, 
+    particles: pl.DataFrame,
+    pdg_classes: list
+) -> None:
+    
+    # 1. Calculate Purity
+    purity_df = particle_purity_by_class(calo_hits, ancestors, particles, pdg_classes)
+
+    # 2. Select columns (ensure total_particle_energy is kept)
+    purity_df = purity_df.select([
+        "class_id", 
+        "purity", 
+        "total_particle_energy",
+        "pdg_id"
+    ])
+
+    # 3. Define the intervals: (Low, High)
+    # The last tuple (50, None) represents 50 -> Infinity
+    energy_intervals = [(-0.1, 0.001), (0.001, 5), (5, 10), (10, 20), (20, 50), (50, 100), (100, None)]
+    
+    # 4. Partition by class_id (Efficient separation)
+    class_partitions = purity_df.partition_by("class_id", as_dict=True)
+
+    
+
+    # 5. Iterate over classes
+    for class_id, df_class in class_partitions.items():
+        
+        plt.figure(figsize=(10, 6))
+        
+        # --- DYNAMIC RANGE CALCULATION ---
+        # Since purity variance is huge, we calculate the range for THIS class
+        # to ensure the histogram covers the data properly.
+        min_p = df_class["purity"].min()
+        max_p = df_class["purity"].max()
+        
+        # Create 50 shared bins for this class so all energy lines align on x-axis
+        # If max_p is huge (outliers), consider using percentile (e.g., 98th) to clip
+        bins = np.linspace(min_p, max_p, 50)
+
+        # Colors for the 4 intervals
+        colors = plt.cm.turbo(np.linspace(0, 1, len(energy_intervals)))
+        
+        has_data = False
+
+        for i, (low_e, high_e) in enumerate(energy_intervals):
+            
+            # Construct the filter
+            if high_e is not None:
+                # Normal range: low <= E < high
+                condition = (pl.col("total_particle_energy") >= low_e) & \
+                            (pl.col("total_particle_energy") < high_e)
+                label = f"{low_e} < E < {high_e}"
+            else:
+                # Overflow range: E >= 50
+                condition = (pl.col("total_particle_energy") >= low_e)
+                label = f"E >{low_e}"
+                
+            subset = df_class.filter(condition)
+            if not subset.is_empty():
+                x=3
+                particles_with_counts = subset.select(['pdg_id']).group_by('pdg_id').count().sort('count', descending=True).head(10)
+                particles = particles_with_counts['pdg_id'].to_list()
+                counts = particles_with_counts['count'].to_list()
+                particle_names = [PDG_ID_TO_NAME.get(str(pdg), str(pdg)) for pdg in particles]
+                particles_count_str = [f"{name} ({count})" for name, count in zip(particle_names, counts)]
+                label +=  " Particles found: " + ", ".join(particles_count_str)
+
+
+            if not subset.is_empty():
+                has_data = True
+                plt.hist(
+                    subset["purity"], 
+                    bins=bins,           # Use shared bins!
+                    histtype='step',     # Step ensures we see overlapping lines
+                    linewidth=2,
+                    label=label,
+                    color=colors[i]
+                )
+
+        if not has_data:
+            plt.close()
+            continue
+
+        plt.title(f"Distribution for Class {class_id}")
+        plt.xlabel(" (Calo deps by descendants Energy / Particle Energy)")
+        plt.ylabel("Amount of particles")
+        
+        # Log scale helps if the tail is very long
+        plt.grid(axis='y', alpha=0.3, which='both')
+        plt.legend(
+            title="Particle Energy [GeV]",
+            loc='upper center',
+            bbox_to_anchor=(0.5, -0.18),
+            ncol=2,
+            frameon=False,
+        )
+        # log scale for y-axis
+        plt.yscale('log')
+        # Optional: Limit x-axis if variance is TOO huge (e.g., max purity is 1000 but 99% data is < 2)
+        # plt.xlim(min_p, np.percentile(df_class["purity"], 99)) 
+        
+        plt.show()
 
 import polars as pl
 import matplotlib.pyplot as plt
