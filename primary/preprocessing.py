@@ -564,15 +564,18 @@ def particle_purity_by_class(
 
 
 
-def get_mask_confusion_matrix(df: pl.DataFrame, mask_a: str, mask_b: str):
+def get_mask_confusion_matrix(df: pl.DataFrame, mask_a: str, mask_b: str, is_lazy: bool = False) -> pl.DataFrame:
     """
     Calculates the confusion matrix between two boolean list columns.
     Memory efficient: Projects and explodes only the relevant columns.
     """
     print(f"Comparing '{mask_a}' vs '{mask_b}'...")
-
+    if not is_lazy:
+        df2 = df.lazy()
+    else:
+        df2 = df
     stats = (
-        df.lazy()
+        df2
         # 1. Select only the two columns to compare (saves RAM)
         .select([pl.col(mask_a), pl.col(mask_b)])
         # 2. Explode to flat boolean arrays
@@ -584,7 +587,7 @@ def get_mask_confusion_matrix(df: pl.DataFrame, mask_a: str, mask_b: str):
             (~pl.col(mask_a) & ~pl.col(mask_b)).alias("both_false")
         ])
         .sum() # Sum boolean columns (True=1, False=0)
-        .collect()
+        .collect(streaming=True)
     )
 
     # Extract values
@@ -600,6 +603,7 @@ def get_mask_confusion_matrix(df: pl.DataFrame, mask_a: str, mask_b: str):
     print(f"Only in {mask_b}:       {b_only:,}")
     print(f"Both False:             {both_false:,}")
     print(f"Both equal (True+False),   {both_true + both_false:,},percentage: {(both_true + both_false) / (both_true + a_only + b_only + both_false) * 100:.2f}%")
+    print(f"Both true matchinf=g (without both False, both_true / (both_true + a_only + b_only) ,   {both_true:,},percentage: {both_true / (both_true + a_only + b_only) * 100:.2f}%")
     print("-" * 30)
     
 
@@ -628,7 +632,7 @@ def child_is_primary_and_parent_exist(particles: pl.DataFrame, head=20) -> pl.Da
     .len()
     .sort('len', descending=True)
     .head(head)
-    .collect() ) 
+    .collect(streaming=True) ) 
 
 def map_to_ultimate_ancestor_with_inherited_mask(df: pl.DataFrame) -> pl.DataFrame:
     """
@@ -743,3 +747,126 @@ def map_to_ultimate_ancestor_with_inherited_mask(df: pl.DataFrame) -> pl.DataFra
     ])
 
     return result
+
+
+
+def map_to_nearest_ancestor_with_track(particles: pl.DataFrame) -> pl.DataFrame:
+    print("Preparing lineage map...")
+
+    # -------------------------------------------------------------------------
+    # STEP 1: Flatten and Initialize (The "Hop 0" State)
+    # -------------------------------------------------------------------------
+    # 1. Select the relevant list columns.
+    # 2. Explode them together to unnest the event structure.
+    # 3. Cast types to Int64 to ensure matching (parent is i64, particle is u64).
+    
+    flat_particles = (
+        particles.lazy()
+        .select([
+            pl.col("event_id"),
+            pl.col("particle_id"),
+            pl.col("parent_id"),
+            pl.col("has_track"),
+            pl.col("is_parent_missing")
+        ])
+        .explode(["particle_id", "parent_id", "has_track", "is_parent_missing"])
+        .with_columns([
+            pl.col("particle_id").cast(pl.Int64),
+            pl.col("parent_id").cast(pl.Int64)
+        ])
+    )
+
+    # Define the initial targets:
+    # - If has_track: Point to SELF (I am the ancestor).
+    # - Else: Point to PARENT.
+    # - If parent is missing: Point to NULL.
+    lineage_map = (
+        flat_particles
+        .select([
+            pl.col("event_id"),
+            pl.col("particle_id").alias("node"), # Current Node
+            
+            pl.when(pl.col("has_track"))
+            .then(pl.col("particle_id"))
+            .when(pl.col("is_parent_missing"))
+            .then(None)
+            .otherwise(pl.col("parent_id"))
+            .alias("target")                     # Where I'm looking
+        ])
+        .collect(streaming=True)
+    )
+
+    # We iterate on this map.
+    current_state = lineage_map.clone()
+
+    # -------------------------------------------------------------------------
+    # STEP 2: Pointer Jumping Loop
+    # -------------------------------------------------------------------------
+    iteration = 0
+    while True:
+        iteration += 1
+        
+        # Self-Join: "If I point to Target, where does Target point?"
+        next_step = current_state.join(
+            current_state,
+            left_on=["event_id", "target"], 
+            right_on=["event_id", "node"],
+            how="left",
+            suffix="_jump"
+        )
+        
+        # LOGIC UPDATE:
+        # 1. new_target comes from the join ('target_jump').
+        # 2. If 'target_jump' is Null, it means my 'target' (parent) does not exist 
+        #    in the table (dead end). I should stop looking and become Null.
+        # 3. If I was already pointing to myself (track found), the join succeeds 
+        #    (I find myself), so I stay pointing to myself.
+        
+        next_step = next_step.select([
+            pl.col("event_id"),
+            pl.col("node"),
+            pl.col("target_jump").alias("new_target"),
+            pl.col("target").alias("old_target")
+        ])
+
+        # Check Convergence:
+        # We continue if any valid path is still updating.
+        # (new_target != old_target)
+        
+        # Note on Nulls:
+        # If old_target was 100, and 100 is missing, new_target becomes Null.
+        # 100 != Null is Null (filtered out). We need to handle this explicitly 
+        # if we want to detect the change from "Dangling ID" to "Null".
+        # However, for simple convergence, we usually just check if we found a NEW valid ID.
+        
+        changes = next_step.filter(
+            pl.col("new_target").is_not_null() & 
+            (pl.col("new_target") != pl.col("old_target"))
+        )
+        
+        if changes.height == 0:
+            print(f"Converged after {iteration} iterations.")
+            # Final update to ensure dead-ends are Null
+            current_state = next_step.select([
+                pl.col("event_id"), 
+                pl.col("node"), 
+                pl.col("new_target").alias("target")
+            ])
+            break
+            
+        # Apply updates
+        current_state = next_step.select([
+            pl.col("event_id"),
+            pl.col("node"),
+            # If the jump failed (Null), it means dead end -> propagate Null.
+            # If jump succeeded, take the new target.
+            pl.col("new_target").alias("target")
+        ])
+
+    # -------------------------------------------------------------------------
+    # STEP 3: Final Formatting
+    # -------------------------------------------------------------------------
+    return current_state.rename({
+        "node": "particle_id", 
+        "target": "ancestor_with_track_id"
+    })
