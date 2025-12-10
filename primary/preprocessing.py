@@ -218,7 +218,7 @@ def get_particles_id_parent_of_inside_calo_particles_mask(particles: pl.DataFram
     )
     .select(['parent_id', 'event_id']).unique()
     .rename({'parent_id':'particle_id'})
-    .with_columns(pl.lit(True).alias('reco'))
+    .with_columns(pl.lit(True).alias('enter_calo'))
 )
     return (
         particles.lazy()
@@ -230,9 +230,9 @@ def get_particles_id_parent_of_inside_calo_particles_mask(particles: pl.DataFram
             right_on=["event_id", "particle_id"],
             how="left"
         )
-        .with_columns(pl.col("reco").fill_null(False))
+        .with_columns(pl.col("enter_calo").fill_null(False))
         .group_by("event_id", maintain_order=True)
-        .agg(pl.col("reco"))
+        .agg(pl.col("enter_calo"))
         .join(
             particles.lazy(),
             on="event_id",
@@ -869,4 +869,57 @@ def map_to_nearest_ancestor_with_track(particles: pl.DataFrame) -> pl.DataFrame:
     return current_state.rename({
         "node": "particle_id", 
         "target": "ancestor_with_track_id"
-    })
+    }).filter(pl.col("ancestor_with_track_id").is_not_null())
+
+
+def set_target_particles_mask(
+    particles: pl.DataFrame, 
+    ) -> pl.DataFrame:
+    """
+    Adds a boolean mask 'is_target_particle' to the particles DataFrame.
+    A particle is a target if:
+    1. It has a track OR it enters the calorimeter.
+    2. AND it does not have an ancestor with a track (unless it is the track itself).
+    """
+    particles_with_track_linage = map_to_nearest_ancestor_with_track(particles)
+    
+    # 1. Identify Target Particles (Flat List)
+    target_particles = (
+        particles.lazy()
+        .select(["event_id", "particle_id", "enter_calo", "has_track"])
+        .explode(["particle_id", "enter_calo", "has_track"])
+        # Condition 1: enter_calo OR has_track
+        .filter(pl.col("enter_calo") | pl.col("has_track"))
+        .join(
+            particles_with_track_linage.lazy(),
+            left_on=["event_id", "particle_id"],
+            right_on=["event_id", "particle_id"],
+            how="left"
+        )
+        # Condition 2: No ancestor with track OR is the track itself
+        .filter(pl.col("ancestor_with_track_id").is_null() | pl.col('has_track'))
+        .select(['event_id', 'particle_id'])
+        .unique()
+        .with_columns(pl.lit(True).alias('is_target_particle'))
+    )
+
+    # 2. Join back to original data efficiently
+    return (
+        particles.lazy()
+        .select(["event_id", "particle_id"])
+        .explode("particle_id")
+        .join(
+            target_particles,
+            on=["event_id", "particle_id"],
+            how="left"
+        )
+        .with_columns(pl.col("is_target_particle").fill_null(False))
+        .group_by("event_id", maintain_order=True)
+        .agg(pl.col("is_target_particle"))
+        .join(
+            particles.lazy(),
+            on="event_id",
+            how="inner"
+        )
+        .collect(streaming=True)
+    )
