@@ -311,12 +311,13 @@ def plot_target_vs_truth_energy_sum(particles: pl.DataFrame, eta_cut: float = 3.
     """
     # Filter target particles
     target_energy_sum = (particles.lazy()
-                        .select(['event_id', 'energy', 'is_target_particle', 'eta', 'pt',])
-                        .explode(['energy', 'is_target_particle', 'eta', 'pt'])
+                        .select(['event_id', 'energy', 'is_target_particle', 'eta', 'pt','charge'])
+                        .explode(['energy', 'is_target_particle', 'eta', 'pt', 'charge'])
                         .filter(
                             (pl.col('is_target_particle')) &
                             (pl.col('eta').abs() < eta_cut) &
-                            (pl.col('pt') > pt_cut)
+                            (pl.col('pt') > pt_cut) &
+                            (pl.col('charge').abs() > 0)
                         )
                         .group_by('event_id').agg(pl.col('energy').sum().alias('target_energy_sum'))
                         )
@@ -325,12 +326,13 @@ def plot_target_vs_truth_energy_sum(particles: pl.DataFrame, eta_cut: float = 3.
     # Sum energies per event for truth particles
     truth_energy_sum = (
         particles.lazy()
-       .select(['event_id', 'energy', 'is_parent_missing', 'eta', 'pt'])
-          .explode(['energy', 'is_parent_missing', 'eta', 'pt'])
+       .select(['event_id', 'energy', 'is_parent_missing', 'eta', 'pt', 'charge'])
+          .explode(['energy', 'is_parent_missing', 'eta', 'pt', 'charge'])
         .filter(
             (pl.col('is_parent_missing')) &
             (pl.col('eta').abs() < eta_cut) &
-            (pl.col('pt') > pt_cut)
+            (pl.col('pt') > pt_cut) &
+            (pl.col('charge').abs() > 0)
         )
         .group_by('event_id')
         .agg(pl.col('energy').sum().alias('truth_energy_sum'))
@@ -347,7 +349,7 @@ def plot_target_vs_truth_energy_sum(particles: pl.DataFrame, eta_cut: float = 3.
     ratio = y / x
 
     plt.figure(figsize=(10, 6))
-    plt.hist(ratio, bins=100, color='purple', edgecolor='black', alpha=0.7)
+    plt.hist(ratio, bins=50, color='purple', edgecolor='black', alpha=0.7)
     plt.title(f"Ratio of Target Energy / Truth Energy (eta_cut={eta_cut}, pt_cut={pt_cut})")
     plt.xlabel("Energy Ratio (Target / Truth)")
     plt.ylabel("Count")

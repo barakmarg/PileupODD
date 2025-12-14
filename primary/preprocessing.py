@@ -371,6 +371,33 @@ def map_calo_depositors_to_first_outside_ancestor(
     # -------------------------------------------------------------------------
     return active_paths.rename({"target": "ancestor_outside_calo_id"})
 
+def get_particles_id_parent_of_inside_calo_particles_maskv3(particles: pl.DataFrame, calo_hits: pl.DataFrame) -> pl.DataFrame:
+    combined_flags = (map_calo_depositors_to_first_outside_ancestor(particles, calo_hits)
+                .select(['event_id', 'ancestor_outside_calo_id'])
+                .unique()
+                .rename({'ancestor_outside_calo_id':'particle_id'})
+                .with_columns(pl.lit(True).alias('enter_calo'))
+                )
+    return (
+        particles.lazy()
+        .select(["event_id", "particle_id"])
+        .explode("particle_id")
+        .join(
+            combined_flags.lazy(),
+            on=["event_id", "particle_id"],
+            how="left"
+        )
+        .with_columns(pl.col("enter_calo").fill_null(False))
+        .group_by("event_id", maintain_order=True)
+        .agg(pl.col("enter_calo"))
+        .join(
+            particles.lazy(),
+            on="event_id",
+            how="inner"
+        )
+        .collect(streaming=True)
+    )
+
 def get_particles_id_parent_of_inside_calo_particles_maskv2(particles: pl.DataFrame, calo_hits: pl.DataFrame) -> pl.DataFrame:
     # Define "Outside Particles" query once
     # We need event_id and particle_id for particles where created_inside_calo is False
@@ -1071,9 +1098,6 @@ def map_to_nearest_ancestor_with_track(particles: pl.DataFrame) -> pl.DataFrame:
     }).filter(pl.col("ancestor_with_track_id").is_not_null())
 
 
-
-
-
 def set_target_particles_mask(
     particles: pl.DataFrame, 
     ) -> pl.DataFrame:
@@ -1125,3 +1149,160 @@ def set_target_particles_mask(
         )
         .collect(streaming=True)
     )
+
+
+def backtrack_to_target(
+    particles: pl.DataFrame, 
+    src_df: pl.DataFrame, 
+    target_df: pl.DataFrame
+) -> pl.DataFrame:
+    """
+    Backtracks from src_df particles until it finds an ancestor present in target_df.
+    
+    Args:
+        particles: The full lineage info (event_id, particle_id, parent_id).
+        src_df: Where to start (event_id, particle_id).
+        target_df: Where to stop (event_id, particle_id).
+    
+    Returns:
+        DataFrame: [event_id, src_particle_id, target_particle_id]
+    """
+    
+    print("Step 1: Preparing the Lookup Map (The World + Stop Signs)...")
+    
+    # 1. Flatten the world (particles)
+    # We need to know everyone's parent.
+    flat_particles = (
+        particles.lazy()
+        .select([
+            pl.col("event_id"),
+            pl.col("particle_id"),
+            pl.col("parent_id"),
+            pl.col("is_parent_missing")
+        ])
+        .explode(["particle_id", "parent_id", "is_parent_missing"])
+        .with_columns([
+            pl.col("particle_id").cast(pl.Int64),
+            pl.col("parent_id").cast(pl.Int64)
+        ])
+    )
+
+    # 2. Identify Stop Signs (Targets)
+    # We need to know which particles are "Targets".
+    # We do a semi-join or simple join to mark them.
+    targets_marked = (
+        target_df.lazy()
+        .select([
+            pl.col("event_id"), 
+            pl.col("particle_id").cast(pl.Int64)
+        ])
+        .with_columns(pl.lit(True).alias("is_target"))
+    )
+
+    # 3. Create the Lookup Table
+    # Node -> Next Hop
+    lookup_table = (
+        flat_particles
+        .join(
+            targets_marked, 
+            on=["event_id", "particle_id"], 
+            how="left"
+        )
+        .select([
+            pl.col("event_id"),
+            pl.col("particle_id").alias("node"),
+            
+            # --- THE NAVIGATION LOGIC ---
+            pl.when(pl.col("is_target"))
+                # If I am a target, I am the destination. Point to Self.
+                .then(pl.col("particle_id"))
+            .when(pl.col("is_parent_missing"))
+                # Dead end
+                .then(None)
+            .otherwise(
+                # Keep searching backwards
+                pl.col("parent_id")
+            ).alias("next_hop")
+        ])
+        .collect(streaming=True)
+    )
+
+    print("Step 2: Initializing Active Paths from Source...")
+    
+    # Prepare the walkers starting at src_df
+    active_paths = (
+        src_df.lazy()
+        .select([
+            pl.col("event_id"),
+            pl.col("particle_id").cast(pl.Int64).alias("src_particle_id"),
+            # Initial pointer is the particle itself
+            pl.col("particle_id").cast(pl.Int64).alias("current_ptr")
+        ])
+        .collect(streaming=True)
+    )
+
+    print("Step 3: Backtracking Loop...")
+    
+    iteration = 0
+    while True:
+        iteration += 1
+        
+        # Look up the next hop for the current pointer
+        next_step = active_paths.join(
+            lookup_table,
+            left_on=["event_id", "current_ptr"],
+            right_on=["event_id", "node"],
+            how="left",
+            suffix="_jump"
+        )
+        
+        # Check Convergence:
+        # We stop if no particle changes its pointer.
+        # (Meaning everyone is either pointing to themselves (Target) or Null (Dead End))
+        updates = next_step.filter(
+            pl.col("next_hop").is_not_null() & 
+            (pl.col("next_hop") != pl.col("current_ptr"))
+        )
+        
+        if updates.height == 0:
+            print(f"Converged after {iteration} iterations.")
+            # Final state update
+            active_paths = next_step.select([
+                pl.col("event_id"),
+                pl.col("src_particle_id"),
+                pl.col("next_hop").alias("current_ptr")
+            ])
+            break
+            
+        # Apply the jump
+        active_paths = next_step.select([
+            pl.col("event_id"),
+            pl.col("src_particle_id"),
+            pl.col("next_hop").alias("current_ptr")
+        ])
+
+    print("Step 4: Final validation...")
+    
+    # It is possible the loop ended because we hit a "Dead End" (Null),
+    # NOT a target. We must filter out those cases.
+    # We do this by ensuring the result actually exists in the target_df.
+    
+    # We can rely on the fact that targets point to themselves. 
+    # But explicitly checking against target_df is safer/cleaner API.
+    
+    result = (
+        active_paths.lazy()
+        .rename({"current_ptr": "target_particle_id"})
+        # Inner join with target_df ensures the ID we found is valid
+        .join(
+            target_df.lazy().select(
+                pl.col("event_id"), 
+                pl.col("particle_id").cast(pl.Int64).alias("target_particle_id")
+            ),
+            on=["event_id", "target_particle_id"],
+            how="inner"
+        )
+        .collect(streaming=True)
+    )
+
+    return result
