@@ -316,8 +316,8 @@ def plot_target_vs_truth_energy_sum(particles: pl.DataFrame, eta_cut: float = 3.
                         .filter(
                             (pl.col('is_target_particle')) &
                             (pl.col('eta').abs() < eta_cut) &
-                            (pl.col('pt') > pt_cut) &
-                            (pl.col('charge').abs() > 0)
+                            (pl.col('pt') > pt_cut) #&
+                        #(pl.col('charge').abs() > 0)
                         )
                         .group_by('event_id').agg(pl.col('energy').sum().alias('target_energy_sum'))
                         )
@@ -326,13 +326,15 @@ def plot_target_vs_truth_energy_sum(particles: pl.DataFrame, eta_cut: float = 3.
     # Sum energies per event for truth particles
     truth_energy_sum = (
         particles.lazy()
-       .select(['event_id', 'energy', 'is_parent_missing', 'eta', 'pt', 'charge'])
-          .explode(['energy', 'is_parent_missing', 'eta', 'pt', 'charge'])
+       .select(['event_id', 'energy', 'is_parent_missing', 'eta', 'pt', 'charge', 'pdg_id'])
+          .explode(['energy', 'is_parent_missing', 'eta', 'pt', 'charge', 'pdg_id'])
         .filter(
             (pl.col('is_parent_missing')) &
             (pl.col('eta').abs() < eta_cut) &
             (pl.col('pt') > pt_cut) &
-            (pl.col('charge').abs() > 0)
+            ((pl.col('pdg_id').abs() != 12) & (pl.col('pdg_id').abs() != 14) & (pl.col('pdg_id').abs() != 16) )
+              #&
+            #(pl.col('charge').abs() > 0)
         )
         .group_by('event_id')
         .agg(pl.col('energy').sum().alias('truth_energy_sum'))

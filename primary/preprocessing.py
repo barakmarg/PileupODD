@@ -137,7 +137,7 @@ def add_created_inside_calo_mask(particles: pl.DataFrame) -> pl.DataFrame:
         .select([
             pl.col("event_id"),
             (
-                # Logic: (vx^2 + vy^2) > 1250^2  OR  |vz| > 3000
+                # Logic: (vx^2 + vy^2) > 1250^2  OR  
                 ((pl.col("vx").pow(2) + pl.col("vy").pow(2)) > r_xy_sq_threshold)
                 | 
                 ((pl.col("vz").abs() > z_threshold) & ((pl.col("vx").pow(2) + pl.col("vy").pow(2)) > r_min_barrel))
@@ -371,8 +371,149 @@ def map_calo_depositors_to_first_outside_ancestor(
     # -------------------------------------------------------------------------
     return active_paths.rename({"target": "ancestor_outside_calo_id"})
 
+
+def map_calo_depositors_to_first_outside_ancestorv2(
+    particles: pl.DataFrame, 
+    calo_hits: pl.DataFrame
+) -> pl.DataFrame:
+    print("Step 1: Building the Static Lookup Table (The Census)...")
+    
+    # -------------------------------------------------------------------------
+    # 1. The Lookup Table (Static)
+    # -------------------------------------------------------------------------
+    # We must flatten the full particle list once to allow looking up parents.
+    # We define the "Next Step" for every particle here.
+    
+    lookup_table = (
+        particles.lazy()
+        .select([
+            pl.col("event_id"),
+            pl.col("particle_id"),
+            pl.col("parent_id"),
+            pl.col("is_parent_missing"),
+            pl.col("created_inside_calo")
+        ])
+        .explode(["particle_id", "parent_id", "is_parent_missing", "created_inside_calo"])
+        .with_columns([
+            pl.col("particle_id").cast(pl.Int64),
+            pl.col("parent_id").cast(pl.Int64)
+        ])
+        .select([
+            pl.col("event_id"),
+            pl.col("particle_id").alias("node"), # Key
+            
+            # THE NAVIGATION LOGIC:
+            # 1. If I am OUTSIDE, I point to Myself (Anchor/Stop).
+            # 2. If I am INSIDE, I point to my Parent.
+            # 3. If Parent missing, I point to Null.
+            pl.when(pl.col("created_inside_calo").not_())
+              .then(pl.col("particle_id"))
+              .when(pl.col("is_parent_missing"))
+              .then(None)
+              .otherwise(pl.col("parent_id"))
+              .alias("next_hop")                 # Value
+        ])
+        # Materialize this once. It acts as a hash map in the join.
+        .collect(streaming=True)
+    )
+
+    print("Step 2: initializing Active Paths for Depositors only...")
+
+    # -------------------------------------------------------------------------
+    # 2. The Active Paths (Dynamic)
+    # -------------------------------------------------------------------------
+    # We extract the depositors and immediately find their first hop.
+    # This reduces the dataframe size from ~Millions (all particles) 
+    # to ~Thousands (only depositors).
+    
+    depositors_list = (
+        calo_hits.lazy()
+        .select(['event_id', 'contrib_particle_ids'])
+        .explode('contrib_particle_ids')
+        .explode('contrib_particle_ids') # Double explode if list[list]
+        .rename({'contrib_particle_ids': 'particle_id'})
+        .unique(subset=['event_id', 'particle_id'])
+        .select([
+            pl.col('event_id'),
+            pl.col('particle_id').cast(pl.Int64)
+        ])
+    )
+
+    # particles created in calo also
+    dep2 = (
+        particles.lazy()
+        .select(['event_id', 'particle_id', 'created_inside_calo'])
+        .explode(['particle_id', 'created_inside_calo'])
+        .filter(pl.col('created_inside_calo'))
+        .select([
+            pl.col('event_id'),
+            pl.col('particle_id').cast(pl.Int64)
+        ])
+    )
+    depositors_list = pl.concat([depositors_list, dep2]).unique(subset=['event_id', 'particle_id'])
+    # Initialize the active trace by joining depositors with the lookup table
+    active_paths = (
+        depositors_list.join(
+            lookup_table.lazy(), 
+            left_on=["event_id", "particle_id"], 
+            right_on=["event_id", "node"],
+            how="left"
+        )
+        .rename({"next_hop": "target"}) # 'target' is the current ancestor candidate
+        .collect(streaming=True)
+    )
+    
+    # -------------------------------------------------------------------------
+    # 3. Pointer Jumping Loop (on Small Data)
+    # -------------------------------------------------------------------------
+    # We iterate only on 'active_paths' (small), 
+    # looking up against 'lookup_table' (large, but static).
+    
+    iteration = 0
+    while True:
+        iteration += 1
+        
+        # Check: Where does my current target point to?
+        next_step = active_paths.join(
+            lookup_table,
+            left_on=["event_id", "target"], 
+            right_on=["event_id", "node"],
+            how="left",
+            suffix="_jump"
+        )
+        
+        # Calculate changes
+        # Logic: If 'target' points to 'next_hop' and they are different, we advance.
+        # If 'target' points to itself (it's Outside), we stop updating.
+        
+        # Filter for rows that actually need moving
+        updates = next_step.filter(
+            pl.col("next_hop").is_not_null() & 
+            (pl.col("next_hop") != pl.col("target"))
+        )
+        
+        if updates.height == 0:
+            print(f"Converged after {iteration} iterations on {active_paths.height} depositors.")
+            break
+            
+        # Update the active paths
+        # We take next_step (which has the jumped values) as the new state
+        active_paths = next_step.select([
+            pl.col("event_id"),
+            pl.col("particle_id"),
+            # If the jump returns null (dead end), keep the old target or become null?
+            # Based on logic: If next_hop is null, parent is missing.
+            # If next_hop is valid, take it.
+            pl.col("next_hop").alias("target")
+        ])
+
+    # -------------------------------------------------------------------------
+    # 4. Result
+    # -------------------------------------------------------------------------
+    return active_paths.rename({"target": "ancestor_outside_calo_id"})
+
 def get_particles_id_parent_of_inside_calo_particles_maskv3(particles: pl.DataFrame, calo_hits: pl.DataFrame) -> pl.DataFrame:
-    combined_flags = (map_calo_depositors_to_first_outside_ancestor(particles, calo_hits)
+    combined_flags = (map_calo_depositors_to_first_outside_ancestorv2(particles, calo_hits)
                 .select(['event_id', 'ancestor_outside_calo_id'])
                 .unique()
                 .rename({'ancestor_outside_calo_id':'particle_id'})
@@ -1123,7 +1264,9 @@ def set_target_particles_mask(
             how="left"
         )
         # Condition 2: No ancestor with track OR is the track itself
-        .filter(pl.col("ancestor_with_track_id").is_null() | pl.col('has_track'))
+        .filter(
+            True#pl.col("ancestor_with_track_id").is_null()
+              | pl.col('has_track'))
         .select(['event_id', 'particle_id'])
         .unique()
         .with_columns(pl.lit(True).alias('is_target_particle'))
@@ -1300,7 +1443,7 @@ def backtrack_to_target(
                 pl.col("particle_id").cast(pl.Int64).alias("target_particle_id")
             ),
             on=["event_id", "target_particle_id"],
-            how="inner"
+            how="left"
         )
         .collect(streaming=True)
     )
