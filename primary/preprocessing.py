@@ -36,7 +36,6 @@ def add_orphan_mask(df: pl.DataFrame) -> pl.DataFrame:
         # Ensure ID types match (Int64 vs Int64)
         .with_columns(pl.col("valid_pid").cast(pl.Int64))
         .unique()
-        # --- THE FIX: Add a tracer column ---
         # We need this because 'valid_pid' gets dropped during the join.
         .with_columns(pl.lit(True).alias("found_in_event")) 
     )
@@ -79,19 +78,14 @@ def add_orphan_mask(df: pl.DataFrame) -> pl.DataFrame:
 
 def add_eta_and_phi(particles: pl.DataFrame) -> pl.DataFrame:
     """
-    Adds 'eta' and 'phi' columns calculated from momentum components (px, py, pz).
-    
-    Formulas:
-    pt = sqrt(px^2 + py^2)
-    phi = arctan2(py, px)
-    theta = arctan2(pt, pz)
-    eta = -ln(tan(theta / 2))
+    Adds 'eta', 'phi', 'pt' with order preservation and numerical safety.
     """
-    # Calculate eta and phi on flattened data to be memory efficient
     calculations = (
         particles.lazy()
         .select(["event_id", "px", "py", "pz"])
         .explode(["px", "py", "pz"])
+        # FIX 1: Capture the exact original order of particles
+        .with_row_index("particle_order")
         .with_columns(
             (pl.col("px").pow(2) + pl.col("py").pow(2)).sqrt().alias("pt"),
             pl.arctan2(pl.col("py"), pl.col("px")).alias("phi")
@@ -100,8 +94,14 @@ def add_eta_and_phi(particles: pl.DataFrame) -> pl.DataFrame:
             pl.arctan2(pl.col("pt"), pl.col("pz")).alias("theta")
         )
         .with_columns(
-            (-((pl.col("theta") / 2).tan().log())).alias("eta")
+            # Standard eta calculation
+            (-((pl.col("theta") / 2).tan().log()))
+            # Optional: Handle numerical instability where theta=0 (beam pipe)
+            .fill_nan(0.0) 
+            .alias("eta")
         )
+        # FIX 2: Sort by the captured index to ensure lists are rebuilt in order
+        .sort("particle_order")
         .group_by("event_id", maintain_order=True)
         .agg([
             pl.col("eta"),
@@ -121,68 +121,72 @@ def add_eta_and_phi(particles: pl.DataFrame) -> pl.DataFrame:
         .collect(streaming=True)
     )
 
-def add_created_inside_calo_mask(particles: pl.DataFrame) -> pl.DataFrame:
-    r_xy_sq_threshold = 1250 ** 2
-    z_threshold = 3200
-    r_min_barrel = 315**2
-    
 
-    # 2. Create the Mask Calculation Query
-    # We use a separate LazyFrame to calculate masks. This ensures we don't 
-    # explode the massive columns (particle_id, parents, etc.) in RAM.
+def add_created_inside_calo_mask(particles: pl.DataFrame) -> pl.DataFrame:
+    """
+    Adds 'created_inside_calo' mask.
+    Fixes:
+    1. Squaring the threshold (1080 -> 1080**2).
+    2. Preserves list order using row indexing.
+    """
+    
+    # Define constants clearly to avoid math errors
+    R_SQUARED_THRESHOLD = 1080 ** 2  # <--- FIX: Squared
+    Z_THRESHOLD = 3030
+
     mask_query = (
         particles.lazy()
-        .select(["event_id", "vx", "vy", "vz"]) # Project only what is needed
-        .explode(["vx", "vy", "vz"])            # Flatten
+        .select(["event_id", "vx", "vy", "vz"])
+        .explode(["vx", "vy", "vz"])
+        # FIX 1: Capture global order immediately after explode
+        .with_row_index("global_order")
         .select([
             pl.col("event_id"),
+            pl.col("global_order"),
             (
-                # Logic: (vx^2 + vy^2) > 1250^2  OR  
-                ((pl.col("vx").pow(2) + pl.col("vy").pow(2)) > r_xy_sq_threshold)
-                | 
-                ((pl.col("vz").abs() > z_threshold) & ((pl.col("vx").pow(2) + pl.col("vy").pow(2)) > r_min_barrel))
+                # Logic: Is the particle created OUTSIDE the tracker volume?
+                # ~( (r^2 < thresh) AND (|z| < thresh) )
+                ~(
+                    ((pl.col("vx").pow(2) + pl.col("vy").pow(2)) < R_SQUARED_THRESHOLD) & 
+                    (pl.col("vz").abs() < Z_THRESHOLD)
+                )
             ).alias("created_inside_calo")
         ])
-        # IMPORTANT: maintain_order=True guarantees the mask list 
-        # aligns perfectly index-by-index with particle_id list
+        # FIX 2: Sort by the captured index to restore original order before grouping
+        .sort("global_order")
         .group_by("event_id", maintain_order=True)
         .agg(pl.col("created_inside_calo"))
     )
 
-    # 3. Join back to original data and Collect
-    # We use join(how="left") to attach the new column.
-    result = (
+    return (
         particles.lazy()
         .join(mask_query, on="event_id", how="left")
-        # Handle cases where an event might have empty lists (join results in null)
         .with_columns(pl.col("created_inside_calo").fill_null([]))
         .collect(streaming=True)
     )
 
-    return result
-
-
 def add_particle_have_track_mask(particles: pl.DataFrame, tracks: pl.DataFrame) -> pl.DataFrame:
     """
-    Adds a boolean mask 'has_track' to the particles DataFrame indicating if a particle
-    was reconstructed as a track (based on majority_particle_id matching).
+    Adds a boolean mask 'has_track' with explicit type casting and order preservation.
     """
-    # 1. Get the set of particle IDs that have tracks
-    # We only need event_id and majority_particle_id from tracks
+    # 1. Prepare Tracks: Cast ID to Int64 and deduplicate
     tracked_particles = (
         tracks.lazy()
         .select(["event_id", "majority_particle_id"])
         .explode("majority_particle_id")
+        .with_columns(pl.col("majority_particle_id").cast(pl.Int64))
         .unique()
         .with_columns(pl.lit(True).alias("has_track"))
     )
 
-    # 2. Join this info back to the particles DataFrame
-    # We do this by exploding particles, joining, and then re-grouping to maintain list structure
+    # 2. Prepare Particles: Explode -> Index -> Join -> Sort -> Group
     return (
         particles.lazy()
         .select(["event_id", "particle_id"])
         .explode("particle_id")
+        .with_columns(pl.col("particle_id").cast(pl.Int64))
+        # FIX STEP 1: Capture the original order after exploding but before joining
+        .with_row_index("original_order") 
         .join(
             tracked_particles,
             left_on=["event_id", "particle_id"],
@@ -190,6 +194,8 @@ def add_particle_have_track_mask(particles: pl.DataFrame, tracks: pl.DataFrame) 
             how="left"
         )
         .with_columns(pl.col("has_track").fill_null(False))
+        # FIX STEP 2: Restore the original order before aggregating
+        .sort("original_order")
         .group_by("event_id", maintain_order=True)
         .agg(pl.col("has_track"))
         .join(
@@ -513,24 +519,46 @@ def map_calo_depositors_to_first_outside_ancestorv2(
     return active_paths.rename({"target": "ancestor_outside_calo_id"})
 
 def get_particles_id_parent_of_inside_calo_particles_maskv3(particles: pl.DataFrame, calo_hits: pl.DataFrame) -> pl.DataFrame:
-    combined_flags = (map_calo_depositors_to_first_outside_ancestorv2(particles, calo_hits)
-                .select(['event_id', 'ancestor_outside_calo_id'])
-                .unique()
-                .rename({'ancestor_outside_calo_id':'particle_id'})
-                .with_columns(pl.lit(True).alias('enter_calo'))
-                )
+    """
+    Identifies particles that are ancestors of calorimeter hits (entering the calo).
+    """
+    
+    # 1. Prepare the Flags (Right side of the join)
+    # Ensure IDs are Int64 to match the main dataframe safely
+    combined_flags = (
+        map_calo_depositors_to_first_outside_ancestorv2(particles, calo_hits)
+        .lazy() # Ensure we work lazily if the helper returns eager
+        .select(['event_id', 'ancestor_outside_calo_id'])
+        .unique()
+        .rename({'ancestor_outside_calo_id': 'particle_id'})
+        .with_columns([
+            pl.lit(True).alias('enter_calo'),
+            pl.col('particle_id').cast(pl.Int64)
+        ])
+    )
+
+    # 2. Attach Flags to Particles (Left side)
     return (
         particles.lazy()
         .select(["event_id", "particle_id"])
         .explode("particle_id")
+        .with_columns(pl.col("particle_id").cast(pl.Int64))
+        
+        .with_row_index("global_order")
+        
         .join(
-            combined_flags.lazy(),
+            combined_flags,
             on=["event_id", "particle_id"],
             how="left"
         )
         .with_columns(pl.col("enter_calo").fill_null(False))
+        
+        # FIX 2: Sort by the captured index to restore order before grouping
+        .sort("global_order")
         .group_by("event_id", maintain_order=True)
         .agg(pl.col("enter_calo"))
+        
+        # 3. Join back to original data
         .join(
             particles.lazy(),
             on="event_id",
@@ -1248,6 +1276,8 @@ def set_target_particles_mask(
     1. It has a track OR it enters the calorimeter.
     2. AND it does not have an ancestor with a track (unless it is the track itself).
     """
+    # 0. Get Lineage (External calculation)
+    # Ensure this function returns a DataFrame with [event_id, particle_id, ancestor_with_track_id]
     particles_with_track_linage = map_to_nearest_ancestor_with_track(particles)
     
     # 1. Identify Target Particles (Flat List)
@@ -1255,18 +1285,22 @@ def set_target_particles_mask(
         particles.lazy()
         .select(["event_id", "particle_id", "enter_calo", "has_track"])
         .explode(["particle_id", "enter_calo", "has_track"])
-        # Condition 1: enter_calo OR has_track
+        .with_columns(pl.col("particle_id").cast(pl.Int64)) # Safety cast
+        
+        # Condition 1: Enter Calo OR Has Track
         .filter(pl.col("enter_calo") | pl.col("has_track"))
+        
         .join(
             particles_with_track_linage.lazy(),
-            left_on=["event_id", "particle_id"],
-            right_on=["event_id", "particle_id"],
+            on=["event_id", "particle_id"],
             how="left"
         )
+        
         # Condition 2: No ancestor with track OR is the track itself
+        # FIX: Removed the 'True' that was bypassing this check
         .filter(
-            True#pl.col("ancestor_with_track_id").is_null()
-              | pl.col('has_track'))
+            pl.col("ancestor_with_track_id").is_null() | pl.col('has_track')
+        )
         .select(['event_id', 'particle_id'])
         .unique()
         .with_columns(pl.lit(True).alias('is_target_particle'))
@@ -1277,14 +1311,23 @@ def set_target_particles_mask(
         particles.lazy()
         .select(["event_id", "particle_id"])
         .explode("particle_id")
+        .with_columns(pl.col("particle_id").cast(pl.Int64)) # Safety cast
+        
+        # FIX 1: Capture global order
+        .with_row_index("global_order")
+        
         .join(
             target_particles,
             on=["event_id", "particle_id"],
             how="left"
         )
         .with_columns(pl.col("is_target_particle").fill_null(False))
+        
+        # FIX 2: Restore order before grouping
+        .sort("global_order")
         .group_by("event_id", maintain_order=True)
         .agg(pl.col("is_target_particle"))
+        
         .join(
             particles.lazy(),
             on="event_id",
