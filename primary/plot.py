@@ -1,6 +1,6 @@
 import polars as pl
 import matplotlib.pyplot as plt
-from primary.preprocessing import cluster_purity, particle_purity
+from primary.preprocessing import cluster_purity, particle_energy_calo_deposits_ratio
 import plotly.express as px
 from primary.preprocessing import particle_purity_by_class
 
@@ -100,33 +100,36 @@ def plot_cluster_cardinallity(calo_hits_with_clusters:pl.DataFrame)->None:
     plt.grid(axis='y', alpha=0.5)
     plt.show()
 
-def plot_clusters_purity(calo_hits_with_clusters:pl.DataFrame, ancestors:pl.DataFrame)->None:
+def plot_clusters_purity(calo_hits_with_clusters: pl.DataFrame, ancestors: pl.DataFrame) -> pl.DataFrame:
     purity_df = cluster_purity(calo_hits_with_clusters, ancestors)
-    # just group by 
-    purity_df =(
-    purity_df
-    # 1. Sort by purity descending. 
-    # (Optional: Add 'cluster_id' ascending to break ties deterministically)
-    .sort(["purity", "cluster_id"], descending=[True, False])
-    
-    # 2. Keep only the first row (highest purity) for every event/ancestor combo
-    .unique(subset=["event_id", "ultimate_ancestor_id"], keep="first")
-    
-    # 3. Select only the requested columns
-    .select(["event_id", "cluster_id", "purity", "ultimate_ancestor_id"])
-)
-    plt.figure(figsize=(10,6))
-    plt.hist(purity_df['purity'].to_numpy(), bins=50, color='seagreen', edgecolor='black', alpha=0.7)
-    plt.title("Cluster Purity Distribution")
+    purity_df = (
+        purity_df
+        .sort(["purity", "cluster_id"], descending=[True, False])
+        .unique(subset=["event_id", "ultimate_ancestor_id"], keep="first")
+        .select(["event_id", "cluster_id", "purity", "ultimate_ancestor_id"])
+    )
+
+    purity_np = purity_df["purity"].to_numpy()
+    counts, bin_edges = np.histogram(purity_np, bins=50)
+    total = counts.sum()
+    tail_eff = (counts[-1] + counts[-2]) / total if total else 0.0
+    tail_lower_edge = bin_edges[-2] if len(bin_edges) >= 2 else 0.0
+
+    plt.figure(figsize=(10, 6))
+    plt.hist(purity_np, bins=50, color="seagreen", edgecolor="black", alpha=0.7)
+    plt.title(f"Event Partitionning Purity (tail ≥ {tail_lower_edge:.2f}: {tail_eff:.2%})")
     plt.xlabel("Purity")
     plt.ylabel("Number of particles")
-    plt.grid(axis='y', alpha=0.5)
+    plt.yscale('log')
+    plt.grid(axis="y", alpha=0.5)
     plt.show()
+
+    return purity_df
 
 def plot_particle_purity(   calo_hits: pl.DataFrame, 
     ancestors: pl.DataFrame, 
     particles: pl.DataFrame)->None:
-    purity_df = particle_purity(calo_hits, ancestors, particles)
+    purity_df = particle_energy_calo_deposits_ratio(calo_hits, ancestors, particles)
     # just group by 
     purity_df =(
     purity_df.select([ "purity"]    )

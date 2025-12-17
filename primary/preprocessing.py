@@ -3,10 +3,144 @@ import polars as pl
 from sklearn.cluster import MeanShift
 import numpy as np
 from primary.calibration import CALIBRATION
+import awkward as ak
+import fastjet
 
 
+import polars as pl
+import numpy as np
+import fastjet
+from primary.calibration import CALIBRATION
 
+def add_cluster_labels(calo_hits: pl.DataFrame, R: float = 0.4) -> pl.DataFrame:
+    """
+    Robust version of clustering.
+    Uses 'global_index' to guarantee that FastJet results merge back 
+    to the correct Polars rows, regardless of sorting or shuffling.
+    """
+ 
+    # -------------------------------------------------------------------------
+    # 1. Explode & Prepare Flat Data (with Global Index)
+    # -------------------------------------------------------------------------
+    # We only select the columns needed for clustering to keep memory usage low.
+    flat_hits = (
+        calo_hits.lazy()
+        .select(['event_id', 'x', 'y', 'z', 'total_energy', 'detector'])
+        # Explode the parallel lists to get 1 row per cell
+        .explode(['x', 'y', 'z', 'total_energy', 'detector'])
+        
+        # CRITICAL: Create a stable Global ID immediately after exploding.
+        # This records the exact order of cells as they appeared in the lists.
+        .with_row_index("global_id")
+        
+        # Apply Calibration
+        .join(CALIBRATION.lazy(), on='detector', how="left")
+        .with_columns((pl.col('total_energy') * pl.col('calib_factor').fill_null(1.0)).alias('E'))
+        
+        # Calculate Geometry (Massless assumption)
+        .with_columns([
+            (pl.col('E') * pl.col('x') / (pl.col('x').pow(2) + pl.col('y').pow(2) + pl.col('z').pow(2)).sqrt()).alias('px'),
+            (pl.col('E') * pl.col('y') / (pl.col('x').pow(2) + pl.col('y').pow(2) + pl.col('z').pow(2)).sqrt()).alias('py'),
+            (pl.col('E') * pl.col('z') / (pl.col('x').pow(2) + pl.col('y').pow(2) + pl.col('z').pow(2)).sqrt()).alias('pz')
+        ])
+        .collect()
+    )
 
+    # -------------------------------------------------------------------------
+    # 2. Extract Numpy Arrays for Fast C++ Processing
+    # -------------------------------------------------------------------------
+    # We sort by event_id locally to make the clustering loop efficient,
+    # but we rely strictly on 'global_id' to store results.
+    
+    df_numpy = flat_hits.sort("event_id").select(["event_id", "global_id", "px", "py", "pz", "E"])
+    
+    event_ids = df_numpy["event_id"].to_numpy()
+    global_ids = df_numpy["global_id"].to_numpy()
+    px = df_numpy["px"].to_numpy()
+    py = df_numpy["py"].to_numpy()
+    pz = df_numpy["pz"].to_numpy()
+    E  = df_numpy["E"].to_numpy()
+
+    # The result container, indexed by global_id
+    num_total_cells = len(flat_hits)
+    result_array = np.full(num_total_cells, -1, dtype=np.int64)
+
+    # -------------------------------------------------------------------------
+    # 3. FastJet Loop (Event by Event)
+    # -------------------------------------------------------------------------
+    unique_events, split_indices = np.unique(event_ids, return_index=True)
+    split_indices = split_indices[1:] # remove 0
+    
+    # Create views for each event
+    events_px = np.split(px, split_indices)
+    events_py = np.split(py, split_indices)
+    events_pz = np.split(pz, split_indices)
+    events_E  = np.split(E,  split_indices)
+    events_gid = np.split(global_ids, split_indices)
+
+    jet_def = fastjet.JetDefinition(fastjet.kt_algorithm, R)
+    
+    print(f"Clustering {len(unique_events)} events...")
+
+    for i, event in enumerate(unique_events):
+        local_px = events_px[i]
+        local_py = events_py[i]
+        local_pz = events_pz[i]
+        local_E  = events_E[i]
+        local_gid = events_gid[i]
+
+        # Convert to PseudoJets with User Index
+        particles_pj = []
+        for j in range(len(local_px)):
+            pj = fastjet.PseudoJet(local_px[j], local_py[j], local_pz[j], local_E[j])
+            pj.set_user_index(int(local_gid[j])) # Embed Global ID
+            particles_pj.append(pj)
+
+        # Run Clustering
+        # inclusive_jets with ptmin=0.0 ensures EVERY cell gets a cluster ID
+        cs = fastjet.ClusterSequence(particles_pj, jet_def)
+        partitions = cs.inclusive_jets(ptmin=0.0)
+
+        # Map results back to the master array
+        for cluster_id, partition in enumerate(partitions):
+            for c in partition.constituents():
+                gid = c.user_index()
+                result_array[gid] = cluster_id
+
+    # -------------------------------------------------------------------------
+    # 4. Re-Assemble Nested Lists
+    # -------------------------------------------------------------------------
+    
+    # Create a small DF with the computed labels
+    labels_df = pl.DataFrame({
+        "event_id": event_ids,
+        "global_id": global_ids,
+        "cluster_id": result_array
+    })
+
+    # Aggregation Step:
+    # 1. Sort by global_id. This effectively undoes the event sorting done for the loop
+    #    and restores the EXACT order the cells had inside the lists originally.
+    # 2. Group by event_id.
+    # 3. Aggregate cluster_ids into a list.
+    
+    cluster_lists = (
+        labels_df.lazy()
+        .sort("global_id") 
+        .group_by("event_id", maintain_order=True) # maintain_order ensures stability
+        .agg(pl.col("cluster_id")) # This creates list[i64]
+        .collect()
+    )
+
+    # -------------------------------------------------------------------------
+    # 5. Join Back to Original Data
+    # -------------------------------------------------------------------------
+    # We simply attach the new column to the original DataFrame
+    return calo_hits.join(
+        cluster_lists,
+        on="event_id",
+        how="left"
+    )
 def cast_parent_id_to_int64(df: pl.DataFrame) -> pl.DataFrame:
     """
     Casts the 'parent_id' column from List<Float> to List<Int64>.
@@ -667,14 +801,22 @@ def cluster_purity(calo_hits_with_clusters:pl.DataFrame, ancestors:pl.DataFrame)
     Computes the purity of each cluster based on ultimate ancestors of contributing particles.
     """
     # Explode to align hits with clusters
-    exploded = (calo_hits_with_clusters.select(['event_id','contrib_energies', 'contrib_particle_ids', 'cluster_id'])
- .explode(['contrib_energies', 'contrib_particle_ids', 'cluster_id'])
- .explode(['contrib_energies', 'contrib_particle_ids']).rename({'contrib_particle_ids':'particle_id','contrib_energies':'energy'})
+    exploded = (
+                calo_hits_with_clusters.lazy().select(['event_id','contrib_energies', 'contrib_particle_ids', 'cluster_id', 'detector'])
+        .explode(['contrib_energies', 'contrib_particle_ids', 'cluster_id', 'detector'])
+        .explode(['contrib_energies', 'contrib_particle_ids']).rename({'contrib_particle_ids':'particle_id','contrib_energies':'energy'})
+        .join(
+                CALIBRATION.select(['detector', 'calib_factor']),
+                on='detector',
+        )
+        .with_columns((pl.col('energy') * pl.col('calib_factor')).alias('energy'))
+        .drop('calib_factor')
+        .drop('detector')
  )
 
     # Join with ancestors to get ultimate ancestor IDs
     exploded = exploded.join(
-        ancestors,
+        ancestors.lazy(),
         left_on="particle_id",
         right_on="particle_id",
         how="left"
@@ -701,14 +843,12 @@ def cluster_purity(calo_hits_with_clusters:pl.DataFrame, ancestors:pl.DataFrame)
         .with_columns(
             (pl.col('total_energy_deps_in_cluster') / pl.col('total_energy_deps')).alias('purity')
         )
-    )
-    del energy_gruped_by_cluster
+    ).collect(streaming=True)
 
     return final
 
-import polars as pl
 
-def particle_purity(
+def particle_energy_calo_deposits_ratio(
     calo_hits: pl.DataFrame, 
     ancestors: pl.DataFrame, 
     particles: pl.DataFrame
@@ -801,50 +941,178 @@ def particle_purity(
     # This is the only time RAM is heavily used, but streaming manages it in batches.
     return final_query.collect(streaming=True)
 
-
-def cluster_purity(calo_hits_with_clusters:pl.DataFrame, ancestors:pl.DataFrame) -> pl.DataFrame:
+def cluster_purity(calo_hits_with_clusters: pl.DataFrame, ancestors: pl.DataFrame) -> pl.DataFrame:
     """
-    Computes the purity of each cluster based on ultimate ancestors of contributing particles.
+    Computes the purity/efficiency of each cluster based on ultimate ancestors.
+    Optimized for memory using lazy execution, strict column selection, and window functions.
     """
-    # Explode to align hits with clusters
-    exploded = (calo_hits_with_clusters.select(['event_id','contrib_energies', 'contrib_particle_ids', 'cluster_id'])
- .explode(['contrib_energies', 'contrib_particle_ids', 'cluster_id'])
- .explode(['contrib_energies', 'contrib_particle_ids']).rename({'contrib_particle_ids':'particle_id','contrib_energies':'energy'})
- )
-
-    # Join with ancestors to get ultimate ancestor IDs
-    exploded = exploded.join(
-        ancestors,
-        left_on="particle_id",
-        right_on="particle_id",
-        how="left"
-    )
-
-    energy_gruped_by_cluster =(exploded.group_by('event_id','cluster_id', 'ultimate_ancestor_id')
-                               .agg(pl.col('energy').sum().alias('total_energy_in_cluster'))
-                               
-                               )
-    del exploded
-    energy_by_ancestor = (
-        energy_gruped_by_cluster.group_by('event_id', 'ultimate_ancestor_id')
-        .agg(pl.col('total_energy_in_cluster').sum().alias('energy_by_ancestor'))
     
+    ancestors_lazy = (
+        ancestors.lazy()
+        .select(['event_id', 'src_particle_id', 'target_particle_id'])
+        .rename({
+            'src_particle_id': 'particle_id', 
+            'target_particle_id': 'ultimate_ancestor_id'
+        })
+        .with_columns(pl.col("particle_id").cast(pl.Int64))
     )
-    final = (energy_gruped_by_cluster.join(
-        energy_by_ancestor,
-        on=['event_id', 'ultimate_ancestor_id'],
-        how='left')
-        .rename({'ultimate_ancestor_id':'ultimate_ancestor_id', 
-                 'cluster_id':'cluster_id',
-                 'total_energy_in_cluster':'total_energy_deps_in_cluster',
-                 'energy_by_ancestor':'total_energy_deps'})
-        .with_columns(
-            (pl.col('total_energy_deps_in_cluster') / pl.col('total_energy_deps')).alias('purity')
-        )
-    )
-    del energy_gruped_by_cluster
 
-    return final
+    # 2. Prepare Calibration (Lazy)
+    calib_lazy = (
+        CALIBRATION.lazy()
+        .select(['detector', 'calib_factor'])
+        # Handle cases where a detector might be missing from the map (default to 1.0)
+    )
+
+    return (
+        calo_hits_with_clusters.lazy()
+        # A. Select required columns (Include 'detector' for calibration)
+        .select(['event_id', 'contrib_energies', 'contrib_particle_ids', 'cluster_id', 'detector'])
+        
+        # B. Explode Level 1: Cells
+        # We need to align detector ID with the lists of energies
+        .explode(['contrib_energies', 'contrib_particle_ids', 'cluster_id', 'detector'])
+        
+        # C. Join Calibration (Cell Level)
+        # This is more efficient than joining after the second explode
+        .join(
+            calib_lazy,
+            on="detector",
+            how="left"
+        )
+
+        # D. Explode Level 2: Contributors
+        .explode(['contrib_energies', 'contrib_particle_ids'])
+        
+        # E. Apply Calibration & Type Cast
+        .with_columns([
+            (pl.col('contrib_energies') * pl.col('calib_factor')).alias('energy'),
+            pl.col('contrib_particle_ids').cast(pl.Int64).alias('particle_id')
+        ])
+        
+        # F. Drop heavy columns immediately
+        .select(['event_id', 'cluster_id', 'particle_id', 'energy'])
+        
+        # G. Join with Ancestors (Strict on Event + Particle)
+        .join(
+            ancestors_lazy,
+            on=["event_id", "particle_id"],
+            how="left"
+        )
+
+        # H. Aggregation (Sum Energies)
+        .group_by(['event_id', 'cluster_id', 'ultimate_ancestor_id'])
+        .agg(
+            pl.col('energy').sum().alias('total_energy_deps_in_cluster')
+        )
+
+        # I. Window Function for Denominator (Efficiency)
+        # Calculates: "Total Calibrated Energy of this Ancestor in the Event"
+        .with_columns(
+            pl.col('total_energy_deps_in_cluster')
+            .sum()
+            .over(['event_id', 'ultimate_ancestor_id'])
+            .alias('total_energy_deps')
+        )
+        
+        # J. Purity Calculation
+        .select([
+            pl.col('event_id'),
+            pl.col('cluster_id'),
+            pl.col('ultimate_ancestor_id'),
+            pl.col('total_energy_deps_in_cluster'),
+            pl.col('total_energy_deps'),
+            (pl.col('total_energy_deps_in_cluster') / pl.col('total_energy_deps')).alias('purity')
+        ])
+        .collect(streaming=True)
+    )
+
+def number_of_particles_per_cluster(calo_hits_with_clusters: pl.DataFrame, ancestors: pl.DataFrame, cut_off_percent: float = 0.05) -> pl.DataFrame:
+    """
+    #particles / cluster
+    Computes the purity/efficiency of each cluster based on ultimate ancestors.
+    Optimized for memory using lazy execution, strict column selection, and window functions.
+    """
+    
+    ancestors_lazy = (
+        ancestors.lazy()
+        .select(['event_id', 'src_particle_id', 'target_particle_id'])
+        .rename({
+            'src_particle_id': 'particle_id', 
+            'target_particle_id': 'ultimate_ancestor_id'
+        })
+        .with_columns(pl.col("particle_id").cast(pl.Int64))
+    )
+
+    # 2. Prepare Calibration (Lazy)
+    calib_lazy = (
+        CALIBRATION.lazy()
+        .select(['detector', 'calib_factor'])
+        # Handle cases where a detector might be missing from the map (default to 1.0)
+    )
+
+    return (
+        calo_hits_with_clusters.lazy()
+        # A. Select required columns (Include 'detector' for calibration)
+        .select(['event_id', 'contrib_energies', 'contrib_particle_ids', 'cluster_id', 'detector'])
+        
+        # B. Explode Level 1: Cells
+        # We need to align detector ID with the lists of energies
+        .explode(['contrib_energies', 'contrib_particle_ids', 'cluster_id', 'detector'])
+        
+        # C. Join Calibration (Cell Level)
+        # This is more efficient than joining after the second explode
+        .join(
+            calib_lazy,
+            on="detector",
+            how="left"
+        )
+
+        # D. Explode Level 2: Contributors
+        .explode(['contrib_energies', 'contrib_particle_ids'])
+        
+        # E. Apply Calibration & Type Cast
+        .with_columns([
+            (pl.col('contrib_energies') * pl.col('calib_factor')).alias('energy'),
+            pl.col('contrib_particle_ids').cast(pl.Int64).alias('particle_id')
+        ])
+        
+        # F. Drop heavy columns immediately
+        .select(['event_id', 'cluster_id', 'particle_id', 'energy'])
+        
+        # G. Join with Ancestors (Strict on Event + Particle)
+        .join(
+            ancestors_lazy,
+            on=["event_id", "particle_id"],
+            how="left"
+        )
+
+        # H. Aggregation (Sum Energies)
+        .group_by(['event_id', 'cluster_id', 'ultimate_ancestor_id'])
+        .agg(
+            pl.col('energy').sum().alias('total_particle_energy_deps_in_cluster')
+        )
+
+        .with_columns(
+            pl.col('total_particle_energy_deps_in_cluster').sum().over(['event_id', 'cluster_id']).alias('cluster_total_energy')
+            
+        )
+        .filter(pl.col('total_particle_energy_deps_in_cluster') / pl.col('cluster_total_energy') > cut_off_percent)
+        .group_by(['event_id', 'cluster_id'])
+        .agg(
+            pl.col('ultimate_ancestor_id').count().alias('num_contributing_ancestors'),
+            pl.col('total_particle_energy_deps_in_cluster').max().alias('max_ancestor_energy_deps_in_cluster'),
+            pl.col('cluster_total_energy').max().alias('cluster_total_energy')
+        )
+        # J. Purity Calculation
+        .select([
+            pl.col('event_id'),
+            pl.col('cluster_id'),
+            pl.col('num_contributing_ancestors'),
+            pl.col('max_ancestor_energy_deps_in_cluster'),
+            pl.col('cluster_total_energy')        ])
+        .collect(streaming=True)
+    )
 
 import polars as pl
 
