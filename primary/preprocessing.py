@@ -799,28 +799,170 @@ def get_particles_id_parent_of_inside_calo_particles_maskv2(particles: pl.DataFr
         .collect(streaming=True)
     )
 
-def run_meanshift(event_idx:int, calo_hits:pl.DataFrame, bandwidth:int =100)->pl.DataFrame:
+def _meanshift_worker_extended(payload):
     """
-    x,y,z
+    Runs MeanShift and extracts labels AND cluster centers.
+    Returns flat arrays for: gids, cluster_id, cx, cy, cz.
     """
-    calo_event = calo_hits[event_idx]
-    coords = calo_event.select(["x", "y", "z"]).explode(['x','y','z']).to_numpy()
-    ms = MeanShift(bandwidth=bandwidth, bin_seeding=True)
-    ms.fit(coords)
+    chunk_x, chunk_y, chunk_z, chunk_gids, bandwidth = payload
+    
+    out_gids = []
+    out_cids = []
+    out_cx = []
+    out_cy = []
+    out_cz = []
+    
+    # n_jobs=1 because we parallelize over events (outer layer)
+    ms = MeanShift(bandwidth=bandwidth, bin_seeding=True, cluster_all=True, n_jobs=1)
+    
+    for i in range(len(chunk_x)):
+        # Skip empty events
+        if len(chunk_x[i]) == 0:
+            continue
+            
+        # 1. Prepare Data
+        # Shape: (N_cells, 3)
+        X = np.column_stack((chunk_x[i], chunk_y[i], chunk_z[i])).astype(np.float32)
+        
+        # 2. Run MeanShift
+        ms.fit(X)
+        labels = ms.labels_          # Shape: (N_cells,)
+        centers = ms.cluster_centers_ # Shape: (N_clusters, 3)
+        
+        # 3. Broadcast Centers to Points
+        # If point P has label 0, we want centers[0].
+        # Numpy advanced indexing makes this instantaneous.
+        assigned_centers = centers[labels] # Shape: (N_cells, 3)
+        
+        # 4. Collect Results
+        out_gids.extend(chunk_gids[i])
+        out_cids.extend(labels)
+        out_cx.extend(assigned_centers[:, 0])
+        out_cy.extend(assigned_centers[:, 1])
+        out_cz.extend(assigned_centers[:, 2])
 
-    labels = ms.labels_.astype(np.int32)
-    centers = ms.cluster_centers_
-    cluster_sizes = np.bincount(labels)
-
-    cluster_info = pl.DataFrame(
-        {
-            "cluster_id": [labels],
-            "cluster_cx": [centers[labels, 0]],
-            "cluster_cy": [centers[labels, 1]],
-            "cluster_cz": [centers[labels, 2]],
-        }
+    return (
+        np.array(out_gids, dtype=np.int64),
+        np.array(out_cids, dtype=np.int32),
+        np.array(out_cx, dtype=np.float32),
+        np.array(out_cy, dtype=np.float32),
+        np.array(out_cz, dtype=np.float32)
     )
-    return calo_event.with_columns(cluster_info)
+
+# -------------------------------------------------------------------------
+# 2. Main Driver Function
+# -------------------------------------------------------------------------
+def add_ms_cluster_labels(calo_hits: pl.DataFrame, bandwidth: float = 60.0) -> pl.DataFrame:
+    """
+    Performs 3D MeanShift clustering using all cores.
+    Returns the DataFrame with new list columns: 
+    - cluster_id
+    - cluster_cx (center x)
+    - cluster_cy (center y)
+    - cluster_cz (center z)
+    """
+    
+    print(f"--- Starting 3D Clustering (MeanShift, bandwidth={bandwidth}) ---")
+
+    # -------------------------------------------------------------------------
+    # A. Flatten Data & Assign Global IDs
+    # -------------------------------------------------------------------------
+    print("Flattening data...")
+    flat_hits = (
+        calo_hits.lazy()
+        .select(['event_id', 'x', 'y', 'z'])
+        .explode(['x', 'y', 'z'])
+        .with_row_index("global_id") # Unique stable ID
+        .collect()
+    )
+
+    # -------------------------------------------------------------------------
+    # B. Prepare Numpy Arrays
+    # -------------------------------------------------------------------------
+    df_numpy = flat_hits.sort("event_id")
+    
+    event_ids_arr = df_numpy["event_id"].to_numpy()
+    unique_events, split_indices = np.unique(event_ids_arr, return_index=True)
+    split_indices = split_indices[1:]
+    
+    print(f"Preparing {len(unique_events)} events...")
+
+    events_x   = np.split(df_numpy["x"].to_numpy(), split_indices)
+    events_y   = np.split(df_numpy["y"].to_numpy(), split_indices)
+    events_z   = np.split(df_numpy["z"].to_numpy(), split_indices)
+    events_gid = np.split(df_numpy["global_id"].to_numpy(), split_indices)
+
+    # -------------------------------------------------------------------------
+    # C. Distribute Workloads
+    # -------------------------------------------------------------------------
+    num_cores = os.cpu_count()
+    print(f"Distributing across {num_cores} cores...")
+
+    chunk_indices = np.array_split(np.arange(len(unique_events)), num_cores)
+    payloads = []
+    
+    for idx_arr in chunk_indices:
+        if len(idx_arr) == 0: continue
+        start, end = idx_arr[0], idx_arr[-1] + 1
+        
+        payloads.append((
+            events_x[start:end],
+            events_y[start:end],
+            events_z[start:end],
+            events_gid[start:end],
+            bandwidth
+        ))
+
+    # -------------------------------------------------------------------------
+    # D. Parallel Execution
+    # -------------------------------------------------------------------------
+    res_gids, res_cids, res_cx, res_cy, res_cz = [], [], [], [], []
+
+    with ProcessPoolExecutor(max_workers=num_cores) as executor:
+        for r_gid, r_cid, r_cx, r_cy, r_cz in executor.map(_meanshift_worker_extended, payloads):
+            res_gids.append(r_gid)
+            res_cids.append(r_cid)
+            res_cx.append(r_cx)
+            res_cy.append(r_cy)
+            res_cz.append(r_cz)
+
+    # -------------------------------------------------------------------------
+    # E. Re-Assemble
+    # -------------------------------------------------------------------------
+    print("Aggregating results...")
+    
+    # Combine all chunks
+    labels_df = pl.DataFrame({
+        "global_id": np.concatenate(res_gids),
+        "cluster_id": np.concatenate(res_cids),
+        "cluster_cx": np.concatenate(res_cx),
+        "cluster_cy": np.concatenate(res_cy),
+        "cluster_cz": np.concatenate(res_cz),
+    })
+
+    # Join back to structure and implode into lists
+    cluster_lists = (
+        flat_hits.lazy()
+        .select(["event_id", "global_id"])
+        .join(labels_df.lazy(), on="global_id", how="left")
+        
+        # Sort by global_id to ensure the order inside the list matches the original x,y,z order
+        .sort("global_id")
+        
+        .group_by("event_id", maintain_order=True)
+        .agg([
+            pl.col("cluster_id"),
+            pl.col("cluster_cx"),
+            pl.col("cluster_cy"),
+            pl.col("cluster_cz")
+        ])
+        .collect()
+    )
+    
+    # -------------------------------------------------------------------------
+    # F. Final Join
+    # -------------------------------------------------------------------------
+    return calo_hits.join(cluster_lists, on="event_id", how="left")
 
 def cluster_purity(calo_hits_with_clusters:pl.DataFrame, ancestors:pl.DataFrame) -> pl.DataFrame:
     """
