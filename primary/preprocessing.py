@@ -4,6 +4,12 @@ from sklearn.cluster import MeanShift
 import numpy as np
 from primary.calibration import CALIBRATION
 import awkward as ak
+import numpy as np
+import polars as pl
+from sklearn.cluster import MeanShift
+from concurrent.futures import ProcessPoolExecutor
+import os
+import time
 import fastjet
 import os
 from concurrent.futures import ProcessPoolExecutor
@@ -799,12 +805,13 @@ def get_particles_id_parent_of_inside_calo_particles_maskv2(particles: pl.DataFr
         .collect(streaming=True)
     )
 
-def _meanshift_worker_extended(payload):
+def _meanshift_worker_optimized(payload):
     """
-    Runs MeanShift and extracts labels AND cluster centers.
-    Returns flat arrays for: gids, cluster_id, cx, cy, cz.
+    Worker function.
+    Payload contains a LIST of events (arrays). 
+    This allows processing 1 huge event or 50 small events in one call.
     """
-    chunk_x, chunk_y, chunk_z, chunk_gids, bandwidth = payload
+    event_xs, event_ys, event_zs, event_gids, bandwidth = payload
     
     out_gids = []
     out_cids = []
@@ -812,30 +819,28 @@ def _meanshift_worker_extended(payload):
     out_cy = []
     out_cz = []
     
-    # n_jobs=1 because we parallelize over events (outer layer)
+    # We use n_jobs=1 here because we are parallelizing OVER events.
+    # Using n_jobs=-1 inside a process pool usually causes oversubscription/deadlocks.
     ms = MeanShift(bandwidth=bandwidth, bin_seeding=True, cluster_all=True, n_jobs=1)
     
-    for i in range(len(chunk_x)):
-        # Skip empty events
-        if len(chunk_x[i]) == 0:
+    for i in range(len(event_xs)):
+        # Skip empty
+        if len(event_xs[i]) == 0:
             continue
             
         # 1. Prepare Data
-        # Shape: (N_cells, 3)
-        X = np.column_stack((chunk_x[i], chunk_y[i], chunk_z[i])).astype(np.float32)
+        X = np.column_stack((event_xs[i], event_ys[i], event_zs[i])).astype(np.float32)
         
         # 2. Run MeanShift
         ms.fit(X)
-        labels = ms.labels_          # Shape: (N_cells,)
-        centers = ms.cluster_centers_ # Shape: (N_clusters, 3)
+        labels = ms.labels_
+        centers = ms.cluster_centers_
         
-        # 3. Broadcast Centers to Points
-        # If point P has label 0, we want centers[0].
-        # Numpy advanced indexing makes this instantaneous.
-        assigned_centers = centers[labels] # Shape: (N_cells, 3)
+        # 3. Broadcast Centers
+        assigned_centers = centers[labels]
         
-        # 4. Collect Results
-        out_gids.extend(chunk_gids[i])
+        # 4. Collect
+        out_gids.extend(event_gids[i])
         out_cids.extend(labels)
         out_cx.extend(assigned_centers[:, 0])
         out_cy.extend(assigned_centers[:, 1])
@@ -849,77 +854,121 @@ def _meanshift_worker_extended(payload):
         np.array(out_cz, dtype=np.float32)
     )
 
-# -------------------------------------------------------------------------
-# 2. Main Driver Function
-# -------------------------------------------------------------------------
 def add_ms_cluster_labels(calo_hits: pl.DataFrame, bandwidth: float = 60.0) -> pl.DataFrame:
-    """
-    Performs 3D MeanShift clustering using all cores.
-    Returns the DataFrame with new list columns: 
-    - cluster_id
-    - cluster_cx (center x)
-    - cluster_cy (center y)
-    - cluster_cz (center z)
-    """
-    
-    print(f"--- Starting 3D Clustering (MeanShift, bandwidth={bandwidth}) ---")
+    print(f"--- Starting Optimized 3D Clustering (MeanShift, bw={bandwidth}) ---")
+    t0 = time.time()
 
     # -------------------------------------------------------------------------
     # A. Flatten Data & Assign Global IDs
     # -------------------------------------------------------------------------
-    print("Flattening data...")
+    # We keep track of event_id to sort/group later
     flat_hits = (
         calo_hits.lazy()
         .select(['event_id', 'x', 'y', 'z'])
         .explode(['x', 'y', 'z'])
-        .with_row_index("global_id") # Unique stable ID
+        .with_row_index("global_id")
         .collect()
     )
 
-    # -------------------------------------------------------------------------
-    # B. Prepare Numpy Arrays
-    # -------------------------------------------------------------------------
+    # Convert to Numpy for efficient splitting
+    # Sort by event_id ensures we can use np.split efficiently
     df_numpy = flat_hits.sort("event_id")
     
-    event_ids_arr = df_numpy["event_id"].to_numpy()
-    unique_events, split_indices = np.unique(event_ids_arr, return_index=True)
-    split_indices = split_indices[1:]
+    all_x = df_numpy["x"].to_numpy()
+    all_y = df_numpy["y"].to_numpy()
+    all_z = df_numpy["z"].to_numpy()
+    all_gid = df_numpy["global_id"].to_numpy()
+    all_eid = df_numpy["event_id"].to_numpy()
+
+    # Find boundaries of events
+    unique_events, split_indices = np.unique(all_eid, return_index=True)
+    split_indices = split_indices[1:] # remove 0
+
+    # Split into list of arrays per event
+    events_x = np.split(all_x, split_indices)
+    events_y = np.split(all_y, split_indices)
+    events_z = np.split(all_z, split_indices)
+    events_gid = np.split(all_gid, split_indices)
     
-    print(f"Preparing {len(unique_events)} events...")
-
-    events_x   = np.split(df_numpy["x"].to_numpy(), split_indices)
-    events_y   = np.split(df_numpy["y"].to_numpy(), split_indices)
-    events_z   = np.split(df_numpy["z"].to_numpy(), split_indices)
-    events_gid = np.split(df_numpy["global_id"].to_numpy(), split_indices)
+    num_events = len(events_x)
+    print(f"Data prepared: {num_events} events. Time: {time.time()-t0:.2f}s")
 
     # -------------------------------------------------------------------------
-    # C. Distribute Workloads
+    # B. Intelligent Scheduling (LPT - Longest Processing Time First)
     # -------------------------------------------------------------------------
-    num_cores = os.cpu_count()
-    print(f"Distributing across {num_cores} cores...")
-
-    chunk_indices = np.array_split(np.arange(len(unique_events)), num_cores)
+    # 1. Calculate weights (number of points). MeanShift is roughly O(N^2) or O(N log N)
+    # We sort by length descending. This solves the "tail" problem.
+    lengths = np.array([len(x) for x in events_x])
+    
+    # Get indices that would sort the array from Largest -> Smallest
+    sorted_indices = np.argsort(lengths)[::-1]
+    
+    # -------------------------------------------------------------------------
+    # C. Dynamic Batching
+    # -------------------------------------------------------------------------
+    # Goal: Huge events get their own task. Tiny events are batched to reduce overhead.
+    # Target batch size (in number of points)
+    TARGET_BATCH_POINTS = 2000 
+    
     payloads = []
+    current_batch_indices = []
+    current_batch_size = 0
     
-    for idx_arr in chunk_indices:
-        if len(idx_arr) == 0: continue
-        start, end = idx_arr[0], idx_arr[-1] + 1
+    for idx in sorted_indices:
+        n_points = lengths[idx]
         
-        payloads.append((
-            events_x[start:end],
-            events_y[start:end],
-            events_z[start:end],
-            events_gid[start:end],
-            bandwidth
-        ))
+        # If adding this event exceeds target, push current batch first
+        # (Unless current batch is empty, then we must take the big one)
+        if current_batch_indices and (current_batch_size + n_points > TARGET_BATCH_POINTS):
+            # Finalize previous batch
+            batch_x = [events_x[i] for i in current_batch_indices]
+            batch_y = [events_y[i] for i in current_batch_indices]
+            batch_z = [events_z[i] for i in current_batch_indices]
+            batch_g = [events_gid[i] for i in current_batch_indices]
+            payloads.append((batch_x, batch_y, batch_z, batch_g, bandwidth))
+            
+            # Reset
+            current_batch_indices = []
+            current_batch_size = 0
+
+        # Add current event to batch
+        current_batch_indices.append(idx)
+        current_batch_size += n_points
+        
+        # If this single event is huge (larger than target), push immediately
+        # This ensures specific cores work on this one massive event
+        if current_batch_size >= TARGET_BATCH_POINTS:
+            batch_x = [events_x[i] for i in current_batch_indices]
+            batch_y = [events_y[i] for i in current_batch_indices]
+            batch_z = [events_z[i] for i in current_batch_indices]
+            batch_g = [events_gid[i] for i in current_batch_indices]
+            payloads.append((batch_x, batch_y, batch_z, batch_g, bandwidth))
+            
+            current_batch_indices = []
+            current_batch_size = 0
+
+    # Flush remaining
+    if current_batch_indices:
+        batch_x = [events_x[i] for i in current_batch_indices]
+        batch_y = [events_y[i] for i in current_batch_indices]
+        batch_z = [events_z[i] for i in current_batch_indices]
+        batch_g = [events_gid[i] for i in current_batch_indices]
+        payloads.append((batch_x, batch_y, batch_z, batch_g, bandwidth))
+
+    print(f"Workload optimized: {num_events} events merged into {len(payloads)} tasks.")
+    print(f"Largest batch processing first (LPT scheduling).")
 
     # -------------------------------------------------------------------------
     # D. Parallel Execution
     # -------------------------------------------------------------------------
+    num_cores = os.cpu_count()
     res_gids, res_cids, res_cx, res_cy, res_cz = [], [], [], [], []
 
+    # ProcessPoolExecutor naturally handles load balancing if tasks are granular enough
     with ProcessPoolExecutor(max_workers=num_cores) as executor:
-        for r_gid, r_cid, r_cx, r_cy, r_cz in executor.map(_meanshift_worker_extended, payloads):
+        # We simply map over the payloads. Since payloads are sorted Large->Small,
+        # the pool starts with the heavy lifting immediately.
+        for r_gid, r_cid, r_cx, r_cy, r_cz in executor.map(_meanshift_worker_optimized, payloads):
             res_gids.append(r_gid)
             res_cids.append(r_cid)
             res_cx.append(r_cx)
@@ -931,7 +980,8 @@ def add_ms_cluster_labels(calo_hits: pl.DataFrame, bandwidth: float = 60.0) -> p
     # -------------------------------------------------------------------------
     print("Aggregating results...")
     
-    # Combine all chunks
+    # Concatenate all results (order will be scrambled due to sorting/batching)
+    # But global_id is preserved, which is our key.
     labels_df = pl.DataFrame({
         "global_id": np.concatenate(res_gids),
         "cluster_id": np.concatenate(res_cids),
@@ -940,15 +990,12 @@ def add_ms_cluster_labels(calo_hits: pl.DataFrame, bandwidth: float = 60.0) -> p
         "cluster_cz": np.concatenate(res_cz),
     })
 
-    # Join back to structure and implode into lists
+    # Join back using global_id
     cluster_lists = (
         flat_hits.lazy()
         .select(["event_id", "global_id"])
         .join(labels_df.lazy(), on="global_id", how="left")
-        
-        # Sort by global_id to ensure the order inside the list matches the original x,y,z order
-        .sort("global_id")
-        
+        .sort("global_id") # Critical to maintain list order matching original x,y,z
         .group_by("event_id", maintain_order=True)
         .agg([
             pl.col("cluster_id"),
@@ -959,10 +1006,10 @@ def add_ms_cluster_labels(calo_hits: pl.DataFrame, bandwidth: float = 60.0) -> p
         .collect()
     )
     
-    # -------------------------------------------------------------------------
-    # F. Final Join
-    # -------------------------------------------------------------------------
-    return calo_hits.join(cluster_lists, on="event_id", how="left")
+    final_df = calo_hits.join(cluster_lists, on="event_id", how="left")
+    
+    print(f"Done. Total time: {time.time()-t0:.2f}s")
+    return final_df
 
 def cluster_purity(calo_hits_with_clusters:pl.DataFrame, ancestors:pl.DataFrame) -> pl.DataFrame:
     """
