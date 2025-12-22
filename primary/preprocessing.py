@@ -59,7 +59,7 @@ def _fastjet_worker(payload):
 # -------------------------------------------------------------------------
 # Main Function
 # -------------------------------------------------------------------------
-def add_cluster_labels(calo_hits: pl.DataFrame, R: float = 0.4) -> pl.DataFrame:
+def add_cluster_labels_fastjet(calo_hits: pl.DataFrame, R: float = 0.4) -> pl.DataFrame:
     """
     Parallelized Robust Clustering using all available cores.
     """

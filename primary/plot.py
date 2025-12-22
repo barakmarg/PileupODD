@@ -117,7 +117,7 @@ def plot_clusters_purity(calo_hits_with_clusters: pl.DataFrame, ancestors: pl.Da
 
     plt.figure(figsize=(10, 6))
     plt.hist(purity_np, bins=50, color="seagreen", edgecolor="black", alpha=0.7)
-    plt.title(f"Event Partitionning Purity (tail ≥ {tail_lower_edge:.2f}: {tail_eff:.2%})")
+    plt.title(f"Event Partitionning , Particle Purity- energy wise. E_largest_partition/E_total_deposited (tail ≥ {tail_lower_edge:.2f}: {tail_eff:.2%})")
     plt.xlabel("Purity")
     plt.ylabel("Number of particles")
     plt.yscale('log')
