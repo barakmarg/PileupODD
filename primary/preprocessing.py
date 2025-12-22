@@ -1,4 +1,4 @@
-from typing import List
+from typing import Dict, List
 import polars as pl
 from sklearn.cluster import MeanShift
 import numpy as np
@@ -2060,3 +2060,103 @@ def backtrack_to_target(
     )
 
     return result
+
+
+def preprocess_for_model(particles: pl.DataFrame, tracks: pl.DataFrame, calo_hits: pl.DataFrame, num_of_events: int=-1) -> Dict[str,pl.DataFrame]:
+    """
+    Aggregates the number of cells per cluster.
+    """
+    if num_of_events >= 0:
+        particles = particles.filter(pl.col("event_id") <num_of_events)
+        tracks = tracks.filter(pl.col("event_id") <num_of_events)
+        calo_hits = calo_hits.filter(pl.col("event_id") <num_of_events)
+
+    particles = add_orphan_mask(particles)
+    particles = add_created_inside_calo_mask(particles)
+    particles = add_particle_have_track_mask(particles, tracks)
+    particles = add_eta_and_phi(particles)
+    particles = get_particles_id_parent_of_inside_calo_particles_maskv3(particles, calo_hits)
+    particles = set_target_particles_mask(particles)
+
+    calo_hits = add_ms_cluster_labels(calo_hits, bandwidth=120.0)
+
+    # Merge Calo Hits with Cluster Labels, Calibrate Energies
+    calo_clusters = (
+        calo_hits.lazy()
+        .select([
+            pl.col("event_id"),
+            pl.col("cluster_id"),
+            pl.col("detector"),
+            pl.col("total_energy"),
+            pl.col("cluster_cx"),
+            pl.col("cluster_cy"),
+            pl.col("cluster_cz"),
+
+        ])
+        .explode(['cluster_id', 'detector', 'total_energy', 'cluster_cx', 'cluster_cy', 'cluster_cz'])
+        .join(
+            CALIBRATION.lazy().select(['detector', 'calib_factor']),
+            on='detector',
+            how='left'
+        )
+        .with_columns((pl.col('total_energy') * pl.col('calib_factor')).alias('calibrated_energy'))
+        .drop('calib_factor')
+        .drop('detector')
+        .drop('total_energy')
+        .group_by(['event_id', 'cluster_id'])
+
+        .agg([
+            pl.col('calibrated_energy').sum().alias('total_cluster_energy'),
+            pl.col('cluster_cx').first().alias('cluster_cx'),
+            pl.col('cluster_cy').first().alias('cluster_cy'),
+            pl.col('cluster_cz').first().alias('cluster_cz'),
+        ])
+        .sort(['event_id', 'cluster_id'])
+        .with_row_index("global_order")
+        .sort('global_order')
+        .drop('global_order')
+        .group_by('event_id', maintain_order=True)
+        .agg('*')
+        .collect(streaming=True)
+    )
+    target_particles = (
+        particles.lazy()
+        .select(['event_id', 'particle_id', 'is_target_particle', 'pdg_id',
+                  'energy', 'eta', 'phi', 'px', 'py', 'pz',
+                  'charge','mass', 'has_track'])
+        .explode( 'particle_id', 'is_target_particle', 'pdg_id',
+                  'energy', 'eta', 'phi', 'px', 'py', 'pz',
+                  'charge','mass', 'has_track')
+        .filter(pl.col('is_target_particle'))
+        .sort('event_id')
+        .with_row_index("global_order")
+        .sort('global_order')
+        .drop('is_target_particle', 'global_order')
+        .group_by('event_id', maintain_order=True)
+        .agg('*')
+        .collect(streaming=True)
+    )
+    truth_particles = (
+        particles.lazy()
+        .select(['event_id', 'particle_id', 'is_parent_missing', 'pdg_id',
+                  'energy', 'eta', 'phi', 'px', 'py', 'pz',
+                  'charge','mass', 'has_track'])
+        .explode( 'particle_id', 'is_parent_missing', 'pdg_id',
+                  'energy', 'eta', 'phi', 'px', 'py', 'pz',
+                  'charge','mass', 'has_track')
+        .filter(pl.col('is_parent_missing'))
+        .sort('event_id')
+        .with_row_index("global_order")
+        .sort('global_order')
+        .drop('is_parent_missing', 'global_order')
+        .group_by('event_id', maintain_order=True)
+        .agg('*')
+        .collect(streaming=True)
+    )
+    return {
+        "target_particles": target_particles,
+        "truth_particles": truth_particles,
+        "calo_clusters": calo_clusters,
+        "tracks": tracks,
+    }
+
