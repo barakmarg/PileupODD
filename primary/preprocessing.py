@@ -30,7 +30,7 @@ def _fastjet_worker(payload):
     out_gids = []
     out_cids = []
     
-    jet_def = fastjet.JetDefinition(fastjet.kt_algorithm, R)
+    jet_def = fastjet.JetDefinition(fastjet.antikt_algorithm, R)
     
     # Loop over the subset of events assigned to this worker
     for i in range(len(chunk_px)):
@@ -692,7 +692,7 @@ def get_particles_id_parent_of_inside_calo_particles_maskv3(particles: pl.DataFr
     # 1. Prepare the Flags (Right side of the join)
     # Ensure IDs are Int64 to match the main dataframe safely
     combined_flags = (
-        map_calo_depositors_to_first_outside_ancestorv2(particles, calo_hits)
+        map_calo_depositors_to_first_outside_ancestor(particles, calo_hits)
         .lazy() # Ensure we work lazily if the helper returns eager
         .select(['event_id', 'ancestor_outside_calo_id'])
         .unique()
@@ -1242,11 +1242,19 @@ def cluster_purity(calo_hits_with_clusters: pl.DataFrame, ancestors: pl.DataFram
         .collect(streaming=True)
     )
 
-def number_of_particles_per_cluster(calo_hits_with_clusters: pl.DataFrame, ancestors: pl.DataFrame, cut_off_percent: float = 0.05) -> pl.DataFrame:
+def number_of_particles_per_cluster(calo_hits_with_clusters: pl.DataFrame, ancestors: pl.DataFrame, particles: pl.DataFrame, cut_off_percent: float = 0.05, pt_cut: float = 1.0, eta_cut: float = 3.0) -> pl.DataFrame:
     """
     #particles / cluster
-    Computes the purity/efficiency of each cluster based on ultimate ancestors.
+    Computes the number of contributing particles per cluster based on ultimate ancestors.
     Optimized for memory using lazy execution, strict column selection, and window functions.
+    
+    Args:
+        calo_hits_with_clusters: DataFrame with calorimeter hits and cluster information.
+        ancestors: DataFrame with particle ancestry information.
+        particles: DataFrame with particle properties (pt, eta).
+        cut_off_percent: Cutoff percentage for particle contribution filtering (default: 0.05).
+        pt_cut: Transverse momentum cut in GeV (default: 1.0).
+        eta_cut: Pseudorapidity cut (default: 3.0).
     """
     
     ancestors_lazy = (
@@ -1259,11 +1267,21 @@ def number_of_particles_per_cluster(calo_hits_with_clusters: pl.DataFrame, ances
         .with_columns(pl.col("particle_id").cast(pl.Int64))
     )
 
-    # 2. Prepare Calibration (Lazy)
+    # Prepare Calibration (Lazy)
     calib_lazy = (
         CALIBRATION.lazy()
         .select(['detector', 'calib_factor'])
         # Handle cases where a detector might be missing from the map (default to 1.0)
+    )
+
+    # Prepare particles with cuts (Lazy)
+    particles_filtered = (
+        particles.lazy()
+        .select(['event_id', 'particle_id', 'pt', 'eta', 'is_target_particle'])
+        .explode(['particle_id', 'pt', 'eta', 'is_target_particle'])
+        .with_columns(pl.col('particle_id').cast(pl.Int64))
+        .filter((pl.col('pt') > pt_cut) & (pl.col('eta').abs() < eta_cut) & pl.col('is_target_particle') )
+        .select(['event_id', 'particle_id'])
     )
 
     return (
@@ -1295,14 +1313,23 @@ def number_of_particles_per_cluster(calo_hits_with_clusters: pl.DataFrame, ances
         # F. Drop heavy columns immediately
         .select(['event_id', 'cluster_id', 'particle_id', 'energy'])
         
+
+        
         # G. Join with Ancestors (Strict on Event + Particle)
         .join(
             ancestors_lazy,
             on=["event_id", "particle_id"],
             how="left"
         )
+        # G. Filter by pt and eta cuts
+        .join(
+            particles_filtered,
+            left_on=['event_id', 'ultimate_ancestor_id'],
+            right_on=["event_id", "particle_id"],
+            how='inner'
+        )
 
-        # H. Aggregation (Sum Energies)
+        # I. Aggregation (Sum Energies)
         .group_by(['event_id', 'cluster_id', 'ultimate_ancestor_id'])
         .agg(
             pl.col('energy').sum().alias('total_particle_energy_deps_in_cluster')
@@ -1319,7 +1346,7 @@ def number_of_particles_per_cluster(calo_hits_with_clusters: pl.DataFrame, ances
             pl.col('total_particle_energy_deps_in_cluster').max().alias('max_ancestor_energy_deps_in_cluster'),
             pl.col('cluster_total_energy').max().alias('cluster_total_energy')
         )
-        # J. Purity Calculation
+        # J. Final selection
         .select([
             pl.col('event_id'),
             pl.col('cluster_id'),
@@ -1330,7 +1357,7 @@ def number_of_particles_per_cluster(calo_hits_with_clusters: pl.DataFrame, ances
     )
 
 
-def number_of_clusters_per_particle(calo_hits_with_clusters: pl.DataFrame, ancestors: pl.DataFrame, cut_off_percent: float = 0.05) -> pl.DataFrame:
+def number_of_clusters_per_particle(calo_hits_with_clusters: pl.DataFrame, ancestors: pl.DataFrame, particles: pl.DataFrame, cut_off_percent: float = 0.05, pt_cut:float = 1, eta_cut: float=3) -> pl.DataFrame:
     """
     #cluster / particles 
     Computes the purity/efficiency of each cluster based on ultimate ancestors.
@@ -1354,7 +1381,7 @@ def number_of_clusters_per_particle(calo_hits_with_clusters: pl.DataFrame, ances
         # Handle cases where a detector might be missing from the map (default to 1.0)
     )
 
-    return (
+    particles_with_clusters = (
         calo_hits_with_clusters.lazy()
         # A. Select required columns (Include 'detector' for calibration)
         .select(['event_id', 'contrib_energies', 'contrib_particle_ids', 'cluster_id', 'detector'])
@@ -1400,7 +1427,7 @@ def number_of_clusters_per_particle(calo_hits_with_clusters: pl.DataFrame, ances
             pl.col('total_particle_energy_deps_in_cluster').sum().over(['event_id', 'cluster_id']).alias('cluster_total_energy')
             
         )
-        .filter(pl.col('total_particle_energy_deps_in_cluster') / pl.col('cluster_total_energy') > cut_off_percent)
+        .filter((pl.col('total_particle_energy_deps_in_cluster') / pl.col('cluster_total_energy')) > cut_off_percent)
         .group_by(['event_id', 'ultimate_ancestor_id'])
         .agg(
             pl.col('cluster_id').count().alias('num_contributing_clusters'),
@@ -1411,8 +1438,24 @@ def number_of_clusters_per_particle(calo_hits_with_clusters: pl.DataFrame, ances
             pl.col('ultimate_ancestor_id'),
             pl.col('num_contributing_clusters'),
             pl.col('max_ancestor_energy_deps_in_cluster')       ])
-        .collect(streaming=True)
+        
     )
+
+    return (
+        particles.lazy()
+        .select(['event_id', 'particle_id', 'is_target_particle', 'pt', 'eta'])
+        .explode(['particle_id', 'is_target_particle', 'pt', 'eta'])
+        .filter((pl.col('is_target_particle'))
+                & (pl.col('pt') > pt_cut)
+                & (pl.col('eta').abs() < eta_cut))
+        .with_columns(pl.col('particle_id').cast(pl.Int64).alias('ultimate_ancestor_id'))
+        .join(
+            particles_with_clusters,
+            on=['event_id', 'ultimate_ancestor_id'],
+            how='left'
+        )
+        .fill_null(0)
+    ).collect(streaming=True)
 
 import polars as pl
 

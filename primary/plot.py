@@ -371,8 +371,8 @@ def plot_3d_particle_hierarchy(particles: pl.DataFrame, calo_hits: pl.DataFrame,
     """
     
     # --- 1. Data Loading ---
-    p_data = particles[event_idx]
-    c_data = calo_hits[event_idx]
+    p_data = particles.filter(pl.col('event_id')==event_idx)
+    c_data = calo_hits.filter(pl.col('event_id')==event_idx)
 
     # Particle Data
     all_pids = p_data["particle_id"].explode().to_numpy()
@@ -727,3 +727,157 @@ def plot_3d_particle_hierarchy(particles: pl.DataFrame, calo_hits: pl.DataFrame,
         fig, 
         info_box
     ])
+
+
+def plot_num_contributing_clusters(
+    calo: pl.DataFrame,
+    result: pl.DataFrame,
+    particles: pl.DataFrame,
+    cut_off_percent: float = 0.05,
+    pt_cut: float = 1.0,
+    eta_cut: float = 3.0,
+    log_scale: bool = True,
+    figsize: tuple = (12, 5),
+) -> pl.DataFrame:
+    """
+    Histogram of number of contributing clusters per particle with customizable cuts.
+    
+    Args:
+        calo: DataFrame with calorimeter hits and cluster information.
+        result: DataFrame with backtracked particle-cluster associations.
+        particles: DataFrame with particle properties (pt, eta).
+        cut_off_percent: Cutoff percentage for cluster contribution filtering (default: 0.05).
+        pt_cut: Transverse momentum cut in GeV (default: 1.0).
+        eta_cut: Pseudorapidity cut (default: 3.0).
+        log_scale: Whether to use log scale for y-axis (default: True).
+        figsize: Figure size as (width, height) tuple (default: (12, 5)).
+    """
+    from primary.preprocessing import number_of_clusters_per_particle
+    
+    # Compute cluster statistics per particle with the specified cuts
+    ancestor_stats = number_of_clusters_per_particle(
+        calo,
+        result,
+        particles=particles.filter(pl.col('event_id').is_in(calo['event_id'].unique().implode())),
+        cut_off_percent=cut_off_percent,
+        pt_cut=pt_cut,
+        eta_cut=eta_cut
+    )
+    
+    # 1. Get the data
+    data = ancestor_stats["num_contributing_clusters"].to_numpy()
+    
+    # 2. Calculate min/max to define discrete integer bins
+    min_val = int(data.min())
+    max_val = int(data.max())
+    
+    # Create bins centered on integers: [min-0.5, min+0.5, min+1.5, ..., max+0.5]
+    # This ensures each integer gets its own bar
+    discrete_bins = np.arange(min_val - 0.5, max_val + 1.5, 1)
+    
+    # 3. Plot
+    fig, ax = plt.subplots(figsize=figsize)
+    counts, bins, patches = ax.hist(data, bins=discrete_bins, color="steelblue", edgecolor="black", alpha=0.75)
+    
+    # Calculate percentage of first bin
+    first_bin_count = counts[0]
+    total_count = sum(counts)
+    first_bin_percentage = (first_bin_count / total_count) * 100
+    
+    second_bin_count = counts[1]
+    second_bin_percentage = (second_bin_count / total_count) * 100
+    # Set labels and title with cuts information
+    ax.set_xlabel("Number of contributing clusters")
+    ax.set_ylabel("Count")
+    title = f"#cluster/particle distribution (First bin(0): {first_bin_percentage:.1f}%, Second bin(1): {second_bin_percentage:.1f}%)"
+    title += f"\nCuts: pt>{pt_cut} GeV, |η|<{eta_cut}, particle_contrib_cut_off={cut_off_percent*100:.1f}%"
+    ax.set_title(title)
+    
+    # Grid settings
+    ax.grid(axis="y", alpha=0.3)
+    ax.grid(axis="x", alpha=0.15)  # Add faint vertical grid lines for clarity
+    
+    # Log scale
+    if log_scale:
+        ax.set_yscale("log")
+    
+    plt.tight_layout()
+    plt.show()
+    return ancestor_stats
+
+
+def plot_num_contributing_ancestors(
+    calo: pl.DataFrame,
+    result: pl.DataFrame,
+    particles: pl.DataFrame,
+    cut_off_percent: float = 0.05,
+    pt_cut: float = 1.0,
+    eta_cut: float = 3.0,
+    log_scale: bool = True,
+    figsize: tuple = (12, 5),
+) -> pl.DataFrame:
+    """
+    Histogram of number of particles per cluster with customizable cuts.
+    
+    Args:
+        calo: DataFrame with calorimeter hits and cluster information.
+        result: DataFrame with backtracked particle-cluster associations.
+        particles: DataFrame with particle properties (pt, eta).
+        cut_off_percent: Cutoff percentage for cluster contribution filtering (default: 0.05).
+        pt_cut: Transverse momentum cut in GeV (default: 1.0).
+        eta_cut: Pseudorapidity cut (default: 3.0).
+        log_scale: Whether to use log scale for y-axis (default: True).
+        figsize: Figure size as (width, height) tuple (default: (12, 5)).
+    """
+    from primary.preprocessing import number_of_particles_per_cluster
+    
+    # Compute particle statistics per cluster with the specified cuts
+    cluster_stats = number_of_particles_per_cluster(
+        calo,
+        result,
+        particles=particles.filter(pl.col('event_id').is_in(calo['event_id'].unique().implode())),
+        cut_off_percent=cut_off_percent,
+        pt_cut=pt_cut,
+        eta_cut=eta_cut
+    )
+    
+    # 1. Get the data
+    data = cluster_stats["num_contributing_ancestors"].to_numpy()
+    
+    # 2. Calculate min/max to define discrete integer bins
+    min_val = int(data.min())
+    max_val = int(data.max())
+    
+    # Create bins centered on integers: [min-0.5, min+0.5, min+1.5, ..., max+0.5]
+    # This ensures each integer gets its own bar
+    discrete_bins = np.arange(min_val - 0.5, max_val + 1.5, 1)
+    
+    # 3. Plot
+    fig, ax = plt.subplots(figsize=figsize)
+    counts, bins, patches = ax.hist(data, bins=discrete_bins, color="steelblue", edgecolor="black", alpha=0.75)
+    
+    # Calculate percentage of first bin
+    first_bin_count = counts[0]
+    total_count = sum(counts)
+    first_bin_percentage = (first_bin_count / total_count) * 100
+    
+    # Set labels and title with cuts information
+    ax.set_xlabel("Number of particles per cluster")
+    ax.set_ylabel("Count")
+    title = f"#particles/cluster distribution (First bin: {first_bin_percentage:.1f}%)"
+    title += f"\nCuts: pt>{pt_cut} GeV, |η|<{eta_cut}, cluster_contrib_cut_off={cut_off_percent*100:.1f}%"
+    ax.set_title(title)
+    
+    # Grid settings
+    ax.grid(axis="y", alpha=0.3)
+    ax.grid(axis="x", alpha=0.15)  # Add faint vertical grid lines for clarity
+    
+    # Log scale
+    if log_scale:
+        ax.set_yscale("log")
+    
+    plt.tight_layout()
+    plt.show()
+    return cluster_stats
+
+
