@@ -360,7 +360,6 @@ def plot_target_vs_truth_energy_sum(particles: pl.DataFrame, eta_cut: float = 3.
     plt.ylabel("Count")
     plt.grid(axis='y', alpha=0.5)
     plt.show()
-
 def plot_3d_particle_hierarchy(particles: pl.DataFrame, calo_hits: pl.DataFrame, event_idx=0):
     """
     3D Particle Hierarchy Explorer (X, Y, Z).
@@ -368,12 +367,44 @@ def plot_3d_particle_hierarchy(particles: pl.DataFrame, calo_hits: pl.DataFrame,
     - Lineage tracing with generation coloring.
     - Search by PID.
     - Hover info includes self-energy and deposited energy.
+    - Generation Filtering (Low < Gen < High).
     """
     
     # --- 1. Data Loading ---
     p_data = particles.filter(pl.col('event_id')==event_idx)
     c_data = calo_hits.filter(pl.col('event_id')==event_idx)
-
+    
+    # Check if CALIBRATION is available, else mock or handle import
+    try:
+        from primary.calibration import CALIBRATION
+        has_calib = True
+    except ImportError:
+        # Fallback if calibration module is missing in this context
+        has_calib = False
+        
+    if has_calib:
+        c_data = (
+            c_data.lazy()
+            .select(['event_id', 'x', 'y', 'z', 'contrib_energies', 'contrib_particle_ids', 'detector'])
+            .explode(['x', 'y', 'z', 'contrib_energies', 'contrib_particle_ids', 'detector'])
+            .with_row_index('global_idx')
+            .join(CALIBRATION.lazy(), on="detector", how="left")
+            .explode(['contrib_energies', 'contrib_particle_ids'])
+            .with_columns([
+                (pl.col('contrib_energies') * pl.col('calib_factor').fill_null(1.0)).alias('energy'),
+                pl.col('contrib_particle_ids').cast(pl.Int64).alias('particle_id')
+            ])
+            .sort('global_idx')
+            .group_by(['event_id','x', 'y', 'z', 'detector'], maintain_order=True)
+            .agg([
+                pl.col('particle_id').alias('contrib_particle_ids'),
+                pl.col('energy').alias('contrib_energies')
+            ])
+            .group_by(['event_id'], maintain_order=True)  
+            .agg('*')
+            .collect()
+        )
+    
     # Particle Data
     all_pids = p_data["particle_id"].explode().to_numpy()
     all_pdg_ids = p_data["pdg_id"].explode().to_numpy()
@@ -382,11 +413,10 @@ def plot_3d_particle_hierarchy(particles: pl.DataFrame, calo_hits: pl.DataFrame,
     particle_energies = p_data["energy"].explode().to_numpy()
 
     pid_to_pdg = dict(zip(all_pids, all_pdg_ids))
-    # Create fast lookup for self energy and existence check
     pid_to_self_energy = {pid: float(en) for pid, en in zip(all_pids, particle_energies)}
-    pid_set = set(all_pids) # Fast lookup for search
+    pid_set = set(all_pids) 
     
-    # Handle Parents (clean NaNs)
+    # Handle Parents 
     raw_parents = p_data["parent_id"].explode().to_numpy()
     raw_parents = np.nan_to_num(raw_parents, nan=0.0)
     all_parent_ids = raw_parents.astype(np.int64)
@@ -418,7 +448,7 @@ def plot_3d_particle_hierarchy(particles: pl.DataFrame, calo_hits: pl.DataFrame,
         else:
             parent_map[pid] = None
 
-    # Energy Calculation (Deposited Energy)
+    # Energy Calculation
     direct_energy = defaultdict(float)
     pid_to_cells = defaultdict(set)
     
@@ -446,7 +476,10 @@ def plot_3d_particle_hierarchy(particles: pl.DataFrame, calo_hits: pl.DataFrame,
     # --- 3. Visualization Setup (3D) ---
     state = {
         'selected_pid': None, 
-        'min_energy': 0.0
+        'min_energy': 0.0,
+        'gen_filter_active': False,
+        'gen_low': -2,
+        'gen_high': 2
     }
 
     layout = go.Layout(
@@ -465,34 +498,26 @@ def plot_3d_particle_hierarchy(particles: pl.DataFrame, calo_hits: pl.DataFrame,
         margin=dict(l=0, r=0, b=0, t=50)
     )
 
-    # Trace 0: Calo (3D)
     trace_calo = go.Scatter3d(
-        x=c_x, y=c_y, z=c_z,
-        mode='markers',
+        x=c_x, y=c_y, z=c_z, mode='markers',
         marker=dict(size=3, color='orange', opacity=0.3),
         visible=False, name='Calo Hits'
     )
 
-    # Trace 1: Normal Lines (3D)
     trace_norm = go.Scatter3d(
-        x=[], y=[], z=[],
-        mode='lines',
+        x=[], y=[], z=[], mode='lines',
         line=dict(color='#888', width=3),
         hoverinfo='skip', name='Link'
     )
 
-    # Trace 2: Jump Lines (3D - Red)
     trace_jump = go.Scatter3d(
-        x=[], y=[], z=[],
-        mode='lines',
+        x=[], y=[], z=[], mode='lines',
         line=dict(color='red', width=4, dash='dot'),
         hoverinfo='skip', name='Data Jump'
     )
 
-    # Trace 3: Particles (3D)
     trace_particles = go.Scatter3d(
-        x=all_vx, y=all_vy, z=all_vz,
-        mode='markers',
+        x=all_vx, y=all_vy, z=all_vz, mode='markers',
         marker=dict(size=5, color='#ccc'),
         text=[], customdata=all_pids,
         name='Particles', hoverinfo='text'
@@ -503,24 +528,41 @@ def plot_3d_particle_hierarchy(particles: pl.DataFrame, calo_hits: pl.DataFrame,
     # --- Widgets ---
     info_box = widgets.HTML("<b>Click a particle or search a PID to explore.</b>")
     
-    # Search Widgets
+    # Row 1: Basic Controls
     txt_search = widgets.Text(
-        value='', placeholder='Enter PID', description='Search PID:', 
-        layout=widgets.Layout(width='200px')
+        value='', placeholder='Enter PID', description='PID:', 
+        layout=widgets.Layout(width='180px')
     )
     btn_search = widgets.Button(
         description='Go', button_style='primary', icon='search', 
         layout=widgets.Layout(width='60px')
     )
-    
-    btn_calo = widgets.ToggleButton(description="Show Calo", value=False, icon='cube')
-    slider_energy = widgets.FloatSlider(value=0, min=0, max=max_e/2, step=0.1, description='Min Dep E:')
+    btn_calo = widgets.ToggleButton(description="Show Calo", value=False, icon='cube', layout=widgets.Layout(width='120px'))
+    slider_energy = widgets.FloatSlider(value=0, min=0, max=max_e/2, step=0.1, description='Min E:', layout=widgets.Layout(width='250px'))
+
+    # Row 2: Generation Filtering Controls
+    # Logic: low < gen < high
+    btn_gen_filter = widgets.ToggleButton(
+        description="Filter Gen", value=False, icon='filter', 
+        button_style='', layout=widgets.Layout(width='120px'),
+        tooltip="Activate generation filtering"
+    )
+    txt_gen_low = widgets.IntText(
+        value=-2, description='Low <', 
+        layout=widgets.Layout(width='140px'),
+        disabled=True
+    )
+    txt_gen_high = widgets.IntText(
+        value=2, description='< High', 
+        layout=widgets.Layout(width='140px'),
+        disabled=True
+    )
 
     # --- 4. Logic ---
 
     def get_gen_map(center_pid):
         dmap = {center_pid: 0}
-        # Down
+        # Down (Descendants)
         q = deque([(center_pid, 0)])
         visited = {center_pid}
         while q:
@@ -530,7 +572,7 @@ def plot_3d_particle_hierarchy(particles: pl.DataFrame, calo_hits: pl.DataFrame,
                     visited.add(child)
                     dmap[child] = d + 1
                     q.append((child, d + 1))
-        # Up
+        # Up (Ancestors)
         curr = center_pid
         d = 0
         while True:
@@ -541,13 +583,21 @@ def plot_3d_particle_hierarchy(particles: pl.DataFrame, calo_hits: pl.DataFrame,
             curr = par
         return dmap
 
+    # Define common names for lookup if PDG_ID_TO_NAME is missing
+    PDG_NAMES_FALLBACK = {'11': 'e-', '-11': 'e+', '22': 'gamma', '13': 'mu-', '-13': 'mu+', '211': 'pi+', '-211': 'pi-'}
+
     def update_view(msg_override=None):
         sel_pid = state['selected_pid']
         min_e = state['min_energy']
+        
+        # Generation State
+        gen_active = state['gen_filter_active']
+        g_low = state['gen_low']
+        g_high = state['gen_high']
 
         # A. Filtering
         if sel_pid is None:
-            # --- All mode ---
+            # --- All mode (Gen filter ignored here as there is no generation 0) ---
             visible = []
             for p in all_pids:
                 if inclusive_energy[p] >= min_e - 1e-5:
@@ -557,8 +607,9 @@ def plot_3d_particle_hierarchy(particles: pl.DataFrame, calo_hits: pl.DataFrame,
             sizes = [4] * len(visible)
             texts = []
             for p in visible:
-                pdg = pid_to_pdg.get(p)
-                name = PDG_ID_TO_NAME.get(str(pdg), str(pdg))
+                pdg = str(pid_to_pdg.get(p))
+                # Try to use global dict if exists, else fallback
+                name = globals().get('PDG_ID_TO_NAME', PDG_NAMES_FALLBACK).get(pdg, pdg)
                 p_self_e = pid_to_self_energy.get(p, 0.0)
                 
                 texts.append(f"PID: {p}<br>Name: {name}<br>E (self): {p_self_e:.4f} GeV<br>E (dep): {inclusive_energy[p]:.4f} GeV")
@@ -572,7 +623,22 @@ def plot_3d_particle_hierarchy(particles: pl.DataFrame, calo_hits: pl.DataFrame,
         else:
             # --- Tree mode ---
             gen_map = get_gen_map(sel_pid)
-            visible = [p for p in gen_map.keys() if inclusive_energy[p] >= min_e-1e-5]
+            
+            # Apply Filters (Energy AND Generation)
+            visible = []
+            for p, gen in gen_map.items():
+                # 1. Energy Check
+                if inclusive_energy[p] < min_e - 1e-5:
+                    continue
+                
+                # 2. Generation Check (if active)
+                # Requirement: text_box_low_limit < show_gen < text_box_hight_limit
+                if gen_active:
+                    if not (g_low < gen < g_high):
+                        continue
+                
+                visible.append(p)
+            
             display_set = set(visible)
             
             cols, sizes, texts = [], [], []
@@ -584,8 +650,8 @@ def plot_3d_particle_hierarchy(particles: pl.DataFrame, calo_hits: pl.DataFrame,
                 par = parent_map.get(pid)
                 par_str = str(par) if par else "Root"
                 
-                pdg = pid_to_pdg.get(pid)
-                name = PDG_ID_TO_NAME.get(str(pdg), str(pdg))
+                pdg = str(pid_to_pdg.get(pid))
+                name = globals().get('PDG_ID_TO_NAME', PDG_NAMES_FALLBACK).get(pdg, pdg)
                 p_self_e = pid_to_self_energy.get(pid, 0.0)
                 
                 texts.append(
@@ -612,6 +678,7 @@ def plot_3d_particle_hierarchy(particles: pl.DataFrame, calo_hits: pl.DataFrame,
             
             for pid in visible:
                 par = parent_map.get(pid)
+                # Only draw line if Parent is also visible
                 if par is not None and par in display_set:
                     p_i, c_i = pid_to_idx[par], pid_to_idx[pid]
                     gap = abs(gen_map[pid] - gen_map[par])
@@ -625,10 +692,12 @@ def plot_3d_particle_hierarchy(particles: pl.DataFrame, calo_hits: pl.DataFrame,
                     else:
                         xj.extend(coords_x); yj.extend(coords_y); zj.extend(coords_z)
 
-            pdg_sel = pid_to_pdg.get(sel_pid)
-            name_sel = PDG_ID_TO_NAME.get(str(pdg_sel), str(pdg_sel))
+            pdg_sel = str(pid_to_pdg.get(sel_pid))
+            name_sel = globals().get('PDG_ID_TO_NAME', PDG_NAMES_FALLBACK).get(pdg_sel, pdg_sel)
 
             title_txt = f"Hierarchy: PID {sel_pid} ({name_sel})"
+            
+            filter_status = f"<br>Generation Filter: {g_low} < gen < {g_high}" if gen_active else ""
             
             info_html = f"""
             <div style="border:1px solid #ccc; padding:8px;">
@@ -637,6 +706,7 @@ def plot_3d_particle_hierarchy(particles: pl.DataFrame, calo_hits: pl.DataFrame,
                 <b>Self Energy:</b> {pid_to_self_energy.get(sel_pid, 0):.4f} GeV<br>
                 Ancestors: {n_anc} | Descendants: {n_desc}<br>
                 <b>Total E deps in calo (by descendants):</b> {inclusive_energy[sel_pid]:.4f} GeV
+                {filter_status}
             </div>
             """
 
@@ -644,13 +714,16 @@ def plot_3d_particle_hierarchy(particles: pl.DataFrame, calo_hits: pl.DataFrame,
         with fig.batch_update():
             # Update Particles
             idx_list = [pid_to_idx[p] for p in visible]
-            fig.data[3].x = [all_vx[i] for i in idx_list]
-            fig.data[3].y = [all_vy[i] for i in idx_list]
-            fig.data[3].z = [all_vz[i] for i in idx_list]
-            fig.data[3].marker.color = cols
-            fig.data[3].marker.size = sizes
-            fig.data[3].text = texts
-            fig.data[3].customdata = visible
+            if idx_list:
+                fig.data[3].x = [all_vx[i] for i in idx_list]
+                fig.data[3].y = [all_vy[i] for i in idx_list]
+                fig.data[3].z = [all_vz[i] for i in idx_list]
+                fig.data[3].marker.color = cols
+                fig.data[3].marker.size = sizes
+                fig.data[3].text = texts
+                fig.data[3].customdata = visible
+            else:
+                fig.data[3].x = []; fig.data[3].y = []; fig.data[3].z = []
             
             # Update Lines
             fig.data[1].x = xn; fig.data[1].y = yn; fig.data[1].z = zn
@@ -668,11 +741,7 @@ def plot_3d_particle_hierarchy(particles: pl.DataFrame, calo_hits: pl.DataFrame,
             
             fig.layout.title = title_txt
         
-        # If an override message is provided (e.g. error), append it or replace
-        if msg_override:
-            info_box.value = msg_override
-        else:
-            info_box.value = info_html
+        info_box.value = msg_override if msg_override else info_html
 
     # --- 5. Handlers ---
     def on_click(trace, points, selector):
@@ -684,50 +753,47 @@ def plot_3d_particle_hierarchy(particles: pl.DataFrame, calo_hits: pl.DataFrame,
 
     def run_search(_):
         val = txt_search.value.strip()
-        if not val:
-            return
-        
+        if not val: return
         try:
             target_pid = int(val)
             if target_pid in pid_set:
                 state['selected_pid'] = target_pid
                 update_view()
             else:
-                # Notify user without crashing
-                err_msg = f"""
-                <div style="color: #a94442; background-color: #f2dede; border-color: #ebccd1; padding: 10px; border-radius: 4px;">
-                    <strong>PID Not Found:</strong> The particle ID <code>{target_pid}</code> does not exist in this event.
-                </div>
-                """
-                # We update the view (to keep current graph) but override info box
-                # Or just update info box directly. 
-                # Let's keep graph same and just change info box.
-                info_box.value = err_msg
+                info_box.value = f"<b style='color:red'>PID {target_pid} not found.</b>"
         except ValueError:
-            err_msg = """
-            <div style="color: #a94442; background-color: #f2dede; border-color: #ebccd1; padding: 10px; border-radius: 4px;">
-                <strong>Input Error:</strong> Please enter a valid integer PID.
-            </div>
-            """
-            info_box.value = err_msg
+            info_box.value = "<b style='color:red'>Invalid PID.</b>"
 
+    # Widget Observers
     fig.data[3].on_click(on_click)
+    
+    # Standard Controls
     slider_energy.observe(lambda c: (state.update({'min_energy': c['new']}), update_view()), names='value')
     btn_calo.observe(lambda c: fig.data[0].update(visible=c['new']), names='value')
     
+    # Generation Filter Controls
+    def toggle_gen_controls(change):
+        is_active = change['new']
+        state['gen_filter_active'] = is_active
+        txt_gen_low.disabled = not is_active
+        txt_gen_high.disabled = not is_active
+        update_view()
+
+    btn_gen_filter.observe(toggle_gen_controls, names='value')
+    txt_gen_low.observe(lambda c: (state.update({'gen_low': c['new']}), update_view()), names='value')
+    txt_gen_high.observe(lambda c: (state.update({'gen_high': c['new']}), update_view()), names='value')
+    
     # Search Handlers
     btn_search.on_click(run_search)
-    txt_search.on_submit(run_search) # Allows pressing Enter
+    txt_search.on_submit(run_search)
 
     update_view()
     
-    # Return UI
-    return widgets.VBox([
-        widgets.HBox([txt_search, btn_search, btn_calo, slider_energy]), 
-        fig, 
-        info_box
-    ])
-
+    # Return UI organized in rows
+    row1 = widgets.HBox([txt_search, btn_search, btn_calo, slider_energy])
+    row2 = widgets.HBox([btn_gen_filter, txt_gen_low, txt_gen_high])
+    
+    return widgets.VBox([row1, row2, fig, info_box])
 
 def plot_num_contributing_clusters(
     calo: pl.DataFrame,

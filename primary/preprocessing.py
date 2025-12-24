@@ -1947,6 +1947,88 @@ def set_target_particles_mask(
         .collect(streaming=True)
     )
 
+def set_target_particles_maskv2(
+    particles: pl.DataFrame, 
+    ) -> pl.DataFrame:
+    """
+    Adds a boolean mask 'is_target_particle' to the particles DataFrame.
+    A particle is a target if:
+    1. It has a track OR it enters the calorimeter.
+    2. AND it does not have an ancestor with a track (unless it is the track itself).
+    """
+    # 0. Get Lineage (External calculation)
+    # Ensure this function returns a DataFrame with [event_id, particle_id, ancestor_with_track_id]
+    particles_with_track_linage = map_to_nearest_ancestor_with_track(particles)
+    
+    # 1. Identify Target Particles (Flat List)
+    almost_target_particles = (
+        particles.lazy()
+        .select(["event_id", "particle_id", "enter_calo", "has_track"])
+        .explode(["particle_id", "enter_calo", "has_track"])
+        .with_columns(pl.col("particle_id").cast(pl.Int64)) # Safety cast
+        
+        # Condition 1: Enter Calo OR Has Track
+        .filter(pl.col("enter_calo") | pl.col("has_track"))
+        
+        .join(
+            particles_with_track_linage.lazy(),
+            on=["event_id", "particle_id"],
+            how="left"
+        )
+        
+        # Condition 2: No ancestor with track OR is the track itself
+        # FIX: Removed the 'True' that was bypassing this check
+        .filter(
+            pl.col("ancestor_with_track_id").is_null() | pl.col('has_track')
+        )
+        .select(['event_id', 'particle_id', 'has_track'])
+        .unique()
+    ).collect(streaming=True)
+    back_track_p = (almost_target_particles
+    .select(['event_id', 'particle_id', 'has_track'])
+    .filter(~pl.col('has_track'))
+    )
+    back_tracked = backtrack_to_target_roots(
+        particles,
+        back_track_p.select(['event_id', 'particle_id']),
+        back_track_p.select(['event_id', 'particle_id'])
+    )
+
+    target_particles = pl.union(almost_target_particles.filter(pl.col('has_track')).select(['event_id', 'particle_id']),
+        back_tracked
+        .select(['event_id', 'target_particle_id'])
+        .rename({'target_particle_id':'particle_id'})
+        .unique())
+    # 2. Join back to original data efficiently
+    return (
+        particles.lazy()
+        .select(["event_id", "particle_id"])
+        .explode("particle_id")
+        .with_columns(pl.col("particle_id").cast(pl.Int64)) # Safety cast
+        
+        # FIX 1: Capture global order
+        .with_row_index("global_order")
+        
+        .join(
+            target_particles,
+            on=["event_id", "particle_id"],
+            how="left"
+        )
+        .with_columns(pl.col("is_target_particle").fill_null(False))
+        
+        # FIX 2: Restore order before grouping
+        .sort("global_order")
+        .group_by("event_id", maintain_order=True)
+        .agg(pl.col("is_target_particle"))
+        
+        .join(
+            particles.lazy(),
+            on="event_id",
+            how="inner"
+        )
+        .collect(streaming=True)
+    )
+
 
 def backtrack_to_target(
     particles: pl.DataFrame, 
@@ -2104,6 +2186,201 @@ def backtrack_to_target(
 
     return result
 
+import polars as pl
+
+def backtrack_to_target_roots(
+    particles: pl.DataFrame, 
+    src_df: pl.DataFrame, 
+    target_df: pl.DataFrame
+) -> pl.DataFrame:
+    """
+    Backtracks from src_df particles to find the 'greatest ancestor' 
+    (root) that exists within target_df.
+    
+    Logic:
+    - If a particle is in target_df but its parent is NOT, it is a Root (Stop).
+    - If a particle is in target_df and its parent is ALSO in target_df, Keep Going.
+    - If a particle is not in target_df, Keep Going (trying to find the target layer).
+    
+    Args:
+        particles: The full lineage info (event_id, particle_id, parent_id).
+                   Expected to contain Lists if one row per event.
+        src_df: Where to start (event_id, particle_id).
+        target_df: The subset defining the 'valid' area.
+    
+    Returns:
+        DataFrame: [event_id, src_particle_id, target_particle_id]
+    """
+    
+    print("Step 1: Preparing the Lookup Map (Context aware)...")
+    
+    # 1. Flatten the world
+    # We must explode the columns because 'particles' likely contains lists (1 row per event)
+    flat_particles = (
+        particles.lazy()
+        .select([
+            pl.col("event_id"),
+            pl.col("particle_id"),
+            pl.col("parent_id"),
+            pl.col("is_parent_missing")
+        ])
+        .explode(["particle_id", "parent_id", "is_parent_missing"])
+        .with_columns([
+            pl.col("particle_id").cast(pl.Int64),
+            pl.col("parent_id").cast(pl.Int64)
+        ])
+    )
+
+    # 2. Identify Targets
+    # We just need the list of IDs that count as "Target Territory"
+    targets_list = (
+        target_df.lazy()
+        .select([
+            pl.col("event_id"), 
+            pl.col("particle_id").cast(pl.Int64)
+        ])
+        .with_columns(pl.lit(True).alias("in_target"))
+    )
+
+    # 3. Create the Lookup Table
+    # We need to know if 'Self' is in target AND if 'Parent' is in target.
+    lookup_table = (
+        flat_particles
+        # Join 1: Check if I am in target
+        .join(
+            targets_list, 
+            on=["event_id", "particle_id"], 
+            how="left"
+        )
+        .rename({"in_target": "self_in_target"})
+        # Join 2: Check if my Parent is in target
+        .join(
+            targets_list,
+            left_on=["event_id", "parent_id"],
+            right_on=["event_id", "particle_id"],
+            how="left"
+        )
+        .rename({"in_target": "parent_in_target"})
+        .select([
+            pl.col("event_id"),
+            pl.col("particle_id").alias("node"),
+            
+            # --- THE NEW NAVIGATION LOGIC ---
+            pl.when(
+                # STOP CONDITION:
+                # I am in the target group, BUT my parent is not (or doesn't exist).
+                # This makes me the "Greatest Ancestor" in the specific dataframe.
+                pl.col("self_in_target") & 
+                (pl.col("parent_in_target").is_null()) # is_null implies false here due to left join
+            )
+                .then(pl.col("particle_id"))
+                
+            .when(pl.col("is_parent_missing"))
+                # DEAD END:
+                # I am not a root target (failed check above), and I have nowhere to go.
+                .then(None)
+                
+            .otherwise(
+                # CONTINUE:
+                # Either I am not in target (swim up), 
+                # OR I am in target and my parent is too (swim up).
+                pl.col("parent_id")
+            ).alias("next_hop")
+        ])
+        .collect(streaming=True)
+    )
+
+    print("Step 2: Initializing Active Paths from Source...")
+    
+    active_paths = (
+        src_df.lazy()
+        .select([
+            pl.col("event_id"),
+            pl.col("particle_id").cast(pl.Int64).alias("src_particle_id"),
+            pl.col("particle_id").cast(pl.Int64).alias("current_ptr")
+        ])
+        .collect(streaming=True)
+    )
+
+    print("Step 3: Backtracking Loop...")
+    
+    iteration = 0
+    while True:
+        iteration += 1
+        
+        next_step = active_paths.join(
+            lookup_table,
+            left_on=["event_id", "current_ptr"],
+            right_on=["event_id", "node"],
+            how="left",
+            suffix="_jump"
+        )
+        
+        # Convergence Check:
+        # Stop if everyone has settled (next_hop == current_ptr) OR everyone hit a dead end (next_hop is null)
+        updates = next_step.filter(
+            pl.col("next_hop").is_not_null() & 
+            (pl.col("next_hop") != pl.col("current_ptr"))
+        )
+        
+        if updates.height == 0:
+            print(f"Converged after {iteration} iterations.")
+            active_paths = next_step.select([
+                pl.col("event_id"),
+                pl.col("src_particle_id"),
+                pl.col("next_hop").alias("current_ptr")
+            ])
+            break
+            
+        active_paths = next_step.select([
+            pl.col("event_id"),
+            pl.col("src_particle_id"),
+            pl.col("next_hop").alias("current_ptr")
+        ])
+
+    print("Step 4: Final validation...")
+    
+    # We filter to ensure the particle we stopped at is actually in the target_df.
+    # (Removes cases where we swam all the way up to a Dead End without hitting a Target Root).
+    
+    result = (
+        active_paths.lazy()
+        .rename({"current_ptr": "target_particle_id"})
+        .join(
+            target_df.lazy().select([
+                pl.col("event_id"), 
+                pl.col("particle_id").cast(pl.Int64).alias("target_particle_id")
+            ]),
+            on=["event_id", "target_particle_id"],
+            how="inner" # Inner join keeps only valid found roots
+        )
+        .collect(streaming=True)
+    )
+
+    return result
+
+def get_particle_direct_children(particles: pl.DataFrame, event_id: int, particle_id: int) -> pl.DataFrame:
+    """
+    Returns the direct children of a given particle in a specific event.
+    """
+    return (
+        particles.lazy()
+        .select([
+            pl.col("event_id"),
+            pl.col("particle_id"),
+            pl.col("parent_id"),
+            pl.col("pdg_id"),
+            pl.col("energy"),
+            pl.col('vx'), pl.col('vy'), pl.col('vz')
+        ])
+        .explode(["particle_id", "parent_id", "pdg_id", "energy", 'vx', 'vy', 'vz'])
+        .filter(
+            (pl.col("event_id") == event_id) &
+            (pl.col("parent_id") == particle_id)
+        )
+        .select(["particle_id", 'event_id', 'pdg_id', 'energy', 'vx', 'vy', 'vz'])
+        .collect(streaming=True)
+    )
 
 def preprocess_for_model(particles: pl.DataFrame, tracks: pl.DataFrame, calo_hits: pl.DataFrame, num_of_events: int=-1) -> Dict[str,pl.DataFrame]:
     """
