@@ -1994,11 +1994,11 @@ def set_target_particles_maskv2(
         back_track_p.select(['event_id', 'particle_id'])
     )
 
-    target_particles = pl.union(almost_target_particles.filter(pl.col('has_track')).select(['event_id', 'particle_id']),
+    target_particles = pl.union([almost_target_particles.filter(pl.col('has_track')).select(['event_id', 'particle_id']).unique(),
         back_tracked
         .select(['event_id', 'target_particle_id'])
         .rename({'target_particle_id':'particle_id'})
-        .unique())
+        .unique()]).with_columns(pl.lit(True).alias('is_target_particle'))
     # 2. Join back to original data efficiently
     return (
         particles.lazy()
@@ -2010,7 +2010,7 @@ def set_target_particles_maskv2(
         .with_row_index("global_order")
         
         .join(
-            target_particles,
+            target_particles.lazy(),
             on=["event_id", "particle_id"],
             how="left"
         )
@@ -2396,7 +2396,7 @@ def preprocess_for_model(particles: pl.DataFrame, tracks: pl.DataFrame, calo_hit
     particles = add_particle_have_track_mask(particles, tracks)
     particles = add_eta_and_phi(particles)
     particles = get_particles_id_parent_of_inside_calo_particles_maskv3(particles, calo_hits)
-    particles = set_target_particles_mask(particles)
+    particles = set_target_particles_maskv2(particles)
 
     calo_hits = add_ms_cluster_labels(calo_hits, bandwidth=120.0)
 
