@@ -1013,7 +1013,7 @@ def add_ms_cluster_labels(calo_hits: pl.DataFrame, bandwidth: float = 60.0) -> p
 
 def cluster_purity(calo_hits_with_clusters:pl.DataFrame, ancestors:pl.DataFrame) -> pl.DataFrame:
     """
-    Computes the purity of each cluster based on ultimate ancestors of contributing particles.
+    Computes the particle deposited energy ratio in clusters
     """
     # Explode to align hits with clusters
     exploded = (
@@ -2400,6 +2400,39 @@ def preprocess_for_model(particles: pl.DataFrame, tracks: pl.DataFrame, calo_hit
 
     calo_hits = add_ms_cluster_labels(calo_hits, bandwidth=120.0)
 
+    # Target particle caloremeter calo clusters deposits ---------
+
+    depositors_list = (
+        calo_hits.lazy()
+        .select(['event_id', 'contrib_particle_ids'])
+        .explode('contrib_particle_ids')
+        .explode('contrib_particle_ids') # Double explode if list[list]
+        .rename({'contrib_particle_ids': 'particle_id'})
+        .unique(subset=['event_id', 'particle_id'])
+        .select([
+            pl.col('event_id'),
+            pl.col('particle_id').cast(pl.Int64)
+        ])
+    )
+
+    target_particles = (
+        particles.lazy()
+        .select(['event_id', 'particle_id', 'is_target_particle', 'pdg_id',
+                  'energy', 'eta', 'phi', 'px', 'py', 'pz',
+                  'charge','mass', 'has_track'])
+        .explode( 'particle_id', 'is_target_particle', 'pdg_id',
+                  'energy', 'eta', 'phi', 'px', 'py', 'pz',
+                  'charge','mass', 'has_track')
+        .filter(pl.col('is_target_particle'))
+        .sort('event_id')
+        .with_row_index("global_order")
+        .sort('global_order')
+        .drop('is_target_particle', 'global_order')
+        .group_by('event_id', maintain_order=True)
+        .agg('*')
+        .collect(streaming=True)
+    )
+
     # Merge Calo Hits with Cluster Labels, Calibrate Energies
     calo_clusters = (
         calo_hits.lazy()
@@ -2439,44 +2472,65 @@ def preprocess_for_model(particles: pl.DataFrame, tracks: pl.DataFrame, calo_hit
         .agg('*')
         .collect(streaming=True)
     )
-    target_particles = (
-        particles.lazy()
-        .select(['event_id', 'particle_id', 'is_target_particle', 'pdg_id',
-                  'energy', 'eta', 'phi', 'px', 'py', 'pz',
-                  'charge','mass', 'has_track'])
-        .explode( 'particle_id', 'is_target_particle', 'pdg_id',
-                  'energy', 'eta', 'phi', 'px', 'py', 'pz',
-                  'charge','mass', 'has_track')
-        .filter(pl.col('is_target_particle'))
-        .sort('event_id')
-        .with_row_index("global_order")
-        .sort('global_order')
-        .drop('is_target_particle', 'global_order')
+
+    target_particles_idx =  (
+        target_particles.lazy()
+        .select(['event_id', 'particle_id'])
+        .explode('particle_id')
+        .with_row_index('particle_idx')
         .group_by('event_id', maintain_order=True)
-        .agg('*')
-        .collect(streaming=True)
+        .agg([
+            pl.col('particle_id'),
+            (pl.col('particle_idx') - pl.col('particle_idx').min()).alias('particle_idx')
+        ])
+        .explode(['particle_id', 'particle_idx'])
+        .collect()
     )
-    truth_particles = (
-        particles.lazy()
-        .select(['event_id', 'particle_id', 'is_parent_missing', 'pdg_id',
-                  'energy', 'eta', 'phi', 'px', 'py', 'pz',
-                  'charge','mass', 'has_track'])
-        .explode( 'particle_id', 'is_parent_missing', 'pdg_id',
-                  'energy', 'eta', 'phi', 'px', 'py', 'pz',
-                  'charge','mass', 'has_track')
-        .filter(pl.col('is_parent_missing'))
-        .sort('event_id')
-        .with_row_index("global_order")
-        .sort('global_order')
-        .drop('is_parent_missing', 'global_order')
+    cluster_to_cluster_idx = (
+        calo_clusters.lazy()
+        .select(['event_id', 'cluster_id'])
+        .explode('cluster_id')
+        .with_row_index('cluster_idx')
         .group_by('event_id', maintain_order=True)
-        .agg('*')
-        .collect(streaming=True)
+        .agg([
+            pl.col('cluster_id'),
+            (pl.col('cluster_idx') - pl.col('cluster_idx').min()).alias('cluster_idx')
+        ])
+        .explode(['cluster_id', 'cluster_idx'])
+        .collect()
     )
+    
+
+    points_to_target = backtrack_to_target(particles=particles,
+                       src_df=depositors_list,
+                       target_df=target_particles_idx.select(['event_id', 'particle_id']))
+    target_particles_deps = cluster_purity(calo_hits_with_clusters=calo_hits, ancestors=points_to_target)
+    target_particles_deps_aggrigated = (target_particles_deps.lazy()
+                                        .select(['event_id', 'cluster_id', 'ultimate_ancestor_id', 'total_energy_deps_in_cluster'])
+                                        .rename({'ultimate_ancestor_id':'particle_id'})
+                                        .join(
+                                            target_particles_idx.lazy(),
+                                            on=['event_id', 'particle_id'],
+                                            how='left'
+                                            )
+                                        .join(
+                                            cluster_to_cluster_idx.lazy(),
+                                            on=['event_id', 'cluster_id'],
+                                            how='left'
+                                            )
+                                        .sort(['event_id', 'cluster_id'])
+                                        .drop('particle_id', 'cluster_id')
+                                        .group_by('event_id', maintain_order=True)
+                                        .agg('*')
+                                        ).collect(streaming=True)
+    
+    # ----------------------------------------------
+
+    x=2
     return {
         "target_particles": target_particles,
-        "truth_particles": truth_particles,
         "calo_clusters": calo_clusters,
         "tracks": tracks,
+        "target_particles_deps": target_particles_deps_aggrigated
     }
 
