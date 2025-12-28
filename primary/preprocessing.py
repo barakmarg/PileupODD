@@ -2382,6 +2382,146 @@ def get_particle_direct_children(particles: pl.DataFrame, event_id: int, particl
         .collect(streaming=True)
     )
 
+def calculate_extrapolated_features_polars(tracks: pl.DataFrame, B_field=3.0, R_cal_mm=1080.0, Z_cal_mm=3030.0):
+    """
+    Efficient Polars implementation of track extrapolation + kinematic features.
+    
+    Adds:
+      - track_tanlambda: The slope in the R-Z plane (cot(theta))
+      - track_omega: The signed curvature (charge / Radius) [1/mm]
+      
+    Guarantees:
+      - Strict Float32 typing (no panics)
+      - Output list order matches input list order exactly
+    """
+    
+    # 0. Constants (Float32 to prevent panics)
+    f32 = pl.Float32
+    alpha = pl.lit(0.0003 * B_field, dtype=f32)
+    R_cal = pl.lit(R_cal_mm, dtype=f32)
+    Z_cal = pl.lit(Z_cal_mm, dtype=f32)
+    v_one = pl.lit(1.0, dtype=f32)
+    v_two = pl.lit(2.0, dtype=f32)
+    v_epsilon = pl.lit(1e-9, dtype=f32)
+
+    # 1. Start Lazy & Create Index BEFORE Explode
+    # We need 'event_idx' to group tracks back to their original event later.
+    q = tracks.lazy().with_row_index("event_idx")
+
+    # 2. Select & Explode
+    # Flatten lists to apply vectorized math on all particles at once.
+    # Order is preserved here.
+    calc_q = q.select(["event_idx", "phi", "theta", "qop", "z0"]) \
+              .explode(["phi", "theta", "qop", "z0"])
+
+    # 3. Vectorized Physics Calculations
+    calc_q = calc_q.with_columns([
+        # Safe qop: avoid division by zero
+        pl.when(pl.col("qop").abs() < v_epsilon)
+          .then(v_epsilon * pl.col("qop").sign())
+          .otherwise(pl.col("qop"))
+          .alias("qop_safe")
+    ]).with_columns([
+        # Kinematics
+        (v_one / pl.col("qop_safe")).abs().alias("p"),
+        pl.col("qop_safe").sign().alias("charge"),
+        
+        # track_tanlambda is exactly cot(theta)
+        (v_one / pl.col("theta").tan()).alias("cot_theta") 
+    ]).with_columns([
+        (pl.col("p") * pl.col("theta").sin()).alias("pt")
+    ]).with_columns([
+        # Radius of Curvature
+        (pl.col("pt") / alpha).alias("R_curv")
+    ]).with_columns([
+        # --- NEW FEATURES START ---
+        
+        # 1. Tan Lambda: The dip angle slope
+        pl.col("cot_theta").alias("track_tanlambda"),
+        
+        # 2. Omega: Signed Curvature (charge / Radius)
+        # We protect against R_curv being 0 (though unlikely with finite p)
+        (pl.col("charge") / pl.col("R_curv")).fill_nan(0.0).alias("track_omega"),
+        
+        # --- NEW FEATURES END ---
+
+        # Continue with Extrapolation logic...
+        (R_cal / (v_two * pl.col("R_curv")))
+            .clip(pl.lit(-1.0, dtype=f32), v_one)
+            .alias("sin_arg")
+    ]).with_columns([
+        (v_two * pl.col("sin_arg").arcsin()).alias("delta_phi_barrel")
+    ]).with_columns([
+        (pl.col("R_curv") * pl.col("delta_phi_barrel")).alias("S_arc_barrel")
+    ]).with_columns([
+        (pl.col("z0") + pl.col("S_arc_barrel") * pl.col("cot_theta")).alias("z_out_barrel")
+    ])
+
+    # 4. Endcap Logic (Conditional Vectorization)
+    calc_q = calc_q.with_columns([
+        (pl.col("z_out_barrel").abs() > Z_cal).alias("hits_endcap")
+    ]).with_columns([
+        # Calculate Endcap targets (valid where hits_endcap==True)
+        (Z_cal * pl.col("z_out_barrel").sign()).alias("z_final_ec"),
+        (pl.col("z_out_barrel") - pl.col("z0")).alias("dz_full")
+    ]).with_columns([
+        (pl.col("z_final_ec") - pl.col("z0")).alias("dz_target")
+    ]).with_columns([
+        (pl.col("dz_target") / pl.col("dz_full")).alias("ratio")
+    ]).with_columns([
+        (pl.col("S_arc_barrel") * pl.col("ratio")).alias("S_arc_ec")
+    ]).with_columns([
+        (pl.col("S_arc_ec") / pl.col("R_curv")).alias("delta_phi_ec")
+    ]).with_columns([
+        (v_two * pl.col("R_curv") * (pl.col("delta_phi_ec") / v_two).sin()).alias("R_final_ec")
+    ])
+
+    # 5. Merge Barrel and Endcap
+    calc_q = calc_q.with_columns([
+        pl.when(pl.col("hits_endcap"))
+          .then(pl.col("z_final_ec"))
+          .otherwise(pl.col("z_out_barrel"))
+          .alias("z_final"),
+        pl.when(pl.col("hits_endcap"))
+          .then(pl.col("R_final_ec"))
+          .otherwise(R_cal)
+          .alias("R_final"),
+        pl.when(pl.col("hits_endcap"))
+          .then(pl.col("delta_phi_ec"))
+          .otherwise(pl.col("delta_phi_barrel"))
+          .alias("delta_phi_final")
+    ])
+
+    # 6. Final Coordinate Calculation
+    calc_q = calc_q.with_columns([
+        (pl.col("phi") - (pl.col("charge") * pl.col("delta_phi_final"))).alias("phi_raw")
+    ]).with_columns([
+        # Normalize Phi [-pi, pi]
+        pl.arctan2(pl.col("phi_raw").sin(), pl.col("phi_raw").cos()).cast(f32).alias("phi_int"),
+        # Theta Int
+        pl.arctan2(pl.col("R_final"), pl.col("z_final")).alias("theta_int")
+    ]).with_columns([
+        # Eta Int
+        (-v_one * (pl.col("theta_int") / v_two).tan().log()).cast(f32).alias("eta_int")
+    ])
+
+    # 7. Implode: Group back to nested lists
+    # maintain_order=True guarantees the list output matches the hit_ids order
+    results = calc_q.group_by("event_idx", maintain_order=True) \
+                    .agg([
+                        pl.col("phi_int"),
+                        pl.col("eta_int"),
+                        pl.col("track_tanlambda"),
+                        pl.col("track_omega")
+                    ])
+
+    # 8. Join back to original dataframe
+    return tracks.lazy().with_row_index("event_idx") \
+                 .join(results, on="event_idx", how="left") \
+                 .drop("event_idx") \
+                 .collect()
+
+
 def preprocess_for_model(particles: pl.DataFrame, tracks: pl.DataFrame, calo_hits: pl.DataFrame, num_of_events: int=-1) -> Dict[str,pl.DataFrame]:
     """
     Aggregates the number of cells per cluster.
@@ -2525,12 +2665,17 @@ def preprocess_for_model(particles: pl.DataFrame, tracks: pl.DataFrame, calo_hit
                                         ).collect(streaming=True)
     
     # ----------------------------------------------
+    tracks = calculate_extrapolated_features_polars(tracks)
 
-    x=2
+     # ----------------------------------------------
     return {
         "target_particles": target_particles,
         "calo_clusters": calo_clusters,
         "tracks": tracks,
         "target_particles_deps": target_particles_deps_aggrigated
     }
+
+
+
+import polars as pl
 
