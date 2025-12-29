@@ -242,7 +242,7 @@ def add_orphan_mask(df: pl.DataFrame) -> pl.DataFrame:
         .collect(streaming=True)
     )
 
-def add_eta_and_phi(particles: pl.DataFrame) -> pl.DataFrame:
+def add_eta_and_phi_and_pt(particles: pl.DataFrame) -> pl.DataFrame:
     """
     Adds 'eta', 'phi', 'pt' with order preservation and numerical safety.
     """
@@ -1949,6 +1949,8 @@ def set_target_particles_mask(
 
 def set_target_particles_maskv2(
     particles: pl.DataFrame, 
+    eta_cut: float = 3.0,
+    pt_cut: float = 1.0
     ) -> pl.DataFrame:
     """
     Adds a boolean mask 'is_target_particle' to the particles DataFrame.
@@ -1963,8 +1965,8 @@ def set_target_particles_maskv2(
     # 1. Identify Target Particles (Flat List)
     almost_target_particles = (
         particles.lazy()
-        .select(["event_id", "particle_id", "enter_calo", "has_track"])
-        .explode(["particle_id", "enter_calo", "has_track"])
+        .select(["event_id", "particle_id", "enter_calo", "has_track", 'pt', 'eta'])
+        .explode(["particle_id", "enter_calo", "has_track", 'pt', 'eta'])
         .with_columns(pl.col("particle_id").cast(pl.Int64)) # Safety cast
         
         # Condition 1: Enter Calo OR Has Track
@@ -1981,6 +1983,7 @@ def set_target_particles_maskv2(
         .filter(
             pl.col("ancestor_with_track_id").is_null() | pl.col('has_track')
         )
+        .filter((pl.col('pt') > pt_cut) & (pl.col('eta').abs() < eta_cut))
         .select(['event_id', 'particle_id', 'has_track'])
         .unique()
     ).collect(streaming=True)
@@ -1999,6 +2002,7 @@ def set_target_particles_maskv2(
         .select(['event_id', 'target_particle_id'])
         .rename({'target_particle_id':'particle_id'})
         .unique()]).with_columns(pl.lit(True).alias('is_target_particle'))
+    
     # 2. Join back to original data efficiently
     return (
         particles.lazy()
@@ -2394,8 +2398,7 @@ def calculate_extrapolated_features_polars(tracks: pl.DataFrame, B_field=3.0, R_
       - Strict Float32 typing (no panics)
       - Output list order matches input list order exactly
     """
-    
-    # 0. Constants (Float32 to prevent panics)
+    # 0. Define strict Float32 constants
     f32 = pl.Float32
     alpha = pl.lit(0.0003 * B_field, dtype=f32)
     R_cal = pl.lit(R_cal_mm, dtype=f32)
@@ -2405,12 +2408,11 @@ def calculate_extrapolated_features_polars(tracks: pl.DataFrame, B_field=3.0, R_
     v_epsilon = pl.lit(1e-9, dtype=f32)
 
     # 1. Start Lazy & Create Index BEFORE Explode
-    # We need 'event_idx' to group tracks back to their original event later.
     q = tracks.lazy().with_row_index("event_idx")
 
     # 2. Select & Explode
     # Flatten lists to apply vectorized math on all particles at once.
-    # Order is preserved here.
+    # Order is preserved here implicitly.
     calc_q = q.select(["event_idx", "phi", "theta", "qop", "z0"]) \
               .explode(["phi", "theta", "qop", "z0"])
 
@@ -2422,30 +2424,27 @@ def calculate_extrapolated_features_polars(tracks: pl.DataFrame, B_field=3.0, R_
           .otherwise(pl.col("qop"))
           .alias("qop_safe")
     ]).with_columns([
-        # Kinematics
+        # --- Basic Kinematics ---
         (v_one / pl.col("qop_safe")).abs().alias("p"),
         pl.col("qop_safe").sign().alias("charge"),
+        (v_one / pl.col("theta").tan()).alias("cot_theta"),
         
-        # track_tanlambda is exactly cot(theta)
-        (v_one / pl.col("theta").tan()).alias("cot_theta") 
+        # --- Regular Eta Calculation ---
+        # eta = -ln(tan(theta / 2))
+        (-v_one * (pl.col("theta") / v_two).tan().log()).cast(f32).alias("eta")
     ]).with_columns([
         (pl.col("p") * pl.col("theta").sin()).alias("pt")
     ]).with_columns([
         # Radius of Curvature
         (pl.col("pt") / alpha).alias("R_curv")
     ]).with_columns([
-        # --- NEW FEATURES START ---
-        
-        # 1. Tan Lambda: The dip angle slope
+        # --- Track Parameters ---
         pl.col("cot_theta").alias("track_tanlambda"),
         
-        # 2. Omega: Signed Curvature (charge / Radius)
-        # We protect against R_curv being 0 (though unlikely with finite p)
+        # Omega: Signed Curvature (charge / Radius)
         (pl.col("charge") / pl.col("R_curv")).fill_nan(0.0).alias("track_omega"),
         
-        # --- NEW FEATURES END ---
-
-        # Continue with Extrapolation logic...
+        # --- Extrapolation Logic Starts ---
         (R_cal / (v_two * pl.col("R_curv")))
             .clip(pl.lit(-1.0, dtype=f32), v_one)
             .alias("sin_arg")
@@ -2457,11 +2456,10 @@ def calculate_extrapolated_features_polars(tracks: pl.DataFrame, B_field=3.0, R_
         (pl.col("z0") + pl.col("S_arc_barrel") * pl.col("cot_theta")).alias("z_out_barrel")
     ])
 
-    # 4. Endcap Logic (Conditional Vectorization)
+    # 4. Endcap Logic
     calc_q = calc_q.with_columns([
         (pl.col("z_out_barrel").abs() > Z_cal).alias("hits_endcap")
     ]).with_columns([
-        # Calculate Endcap targets (valid where hits_endcap==True)
         (Z_cal * pl.col("z_out_barrel").sign()).alias("z_final_ec"),
         (pl.col("z_out_barrel") - pl.col("z0")).alias("dz_full")
     ]).with_columns([
@@ -2492,37 +2490,34 @@ def calculate_extrapolated_features_polars(tracks: pl.DataFrame, B_field=3.0, R_
           .alias("delta_phi_final")
     ])
 
-    # 6. Final Coordinate Calculation
+    # 6. Final Coordinate Calculation (Int features)
     calc_q = calc_q.with_columns([
         (pl.col("phi") - (pl.col("charge") * pl.col("delta_phi_final"))).alias("phi_raw")
     ]).with_columns([
-        # Normalize Phi [-pi, pi]
         pl.arctan2(pl.col("phi_raw").sin(), pl.col("phi_raw").cos()).cast(f32).alias("phi_int"),
-        # Theta Int
         pl.arctan2(pl.col("R_final"), pl.col("z_final")).alias("theta_int")
     ]).with_columns([
-        # Eta Int
         (-v_one * (pl.col("theta_int") / v_two).tan().log()).cast(f32).alias("eta_int")
     ])
 
     # 7. Implode: Group back to nested lists
-    # maintain_order=True guarantees the list output matches the hit_ids order
+    # maintain_order=True guarantees alignment with input lists (e.g. hit_ids)
     results = calc_q.group_by("event_idx", maintain_order=True) \
                     .agg([
                         pl.col("phi_int"),
                         pl.col("eta_int"),
                         pl.col("track_tanlambda"),
-                        pl.col("track_omega")
+                        pl.col("track_omega"),
+                        pl.col("eta")  # <--- Added here
                     ])
 
-    # 8. Join back to original dataframe
+    # 8. Join back
     return tracks.lazy().with_row_index("event_idx") \
                  .join(results, on="event_idx", how="left") \
                  .drop("event_idx") \
                  .collect()
 
-
-def preprocess_for_model(particles: pl.DataFrame, tracks: pl.DataFrame, calo_hits: pl.DataFrame, num_of_events: int=-1) -> Dict[str,pl.DataFrame]:
+def preprocess_for_model(particles: pl.DataFrame, tracks: pl.DataFrame, calo_hits: pl.DataFrame, num_of_events: int=-1, eta_cut: float=2.5, pt_cut: float=1.0) -> Dict[str,pl.DataFrame]:
     """
     Aggregates the number of cells per cluster.
     """
@@ -2534,9 +2529,10 @@ def preprocess_for_model(particles: pl.DataFrame, tracks: pl.DataFrame, calo_hit
     particles = add_orphan_mask(particles)
     particles = add_created_inside_calo_mask(particles)
     particles = add_particle_have_track_mask(particles, tracks)
-    particles = add_eta_and_phi(particles)
+    particles = add_eta_and_phi_and_pt(particles)
     particles = get_particles_id_parent_of_inside_calo_particles_maskv3(particles, calo_hits)
-    particles = set_target_particles_maskv2(particles)
+    particles = set_target_particles_maskv2(particles, eta_cut=eta_cut, pt_cut=pt_cut)
+    # apply cu
 
     calo_hits = add_ms_cluster_labels(calo_hits, bandwidth=120.0)
 
@@ -2558,10 +2554,10 @@ def preprocess_for_model(particles: pl.DataFrame, tracks: pl.DataFrame, calo_hit
     target_particles = (
         particles.lazy()
         .select(['event_id', 'particle_id', 'is_target_particle', 'pdg_id',
-                  'energy', 'eta', 'phi', 'px', 'py', 'pz',
+                  'energy', 'eta', 'phi', 'px', 'py', 'pz', 'pt',
                   'charge','mass', 'has_track'])
         .explode( 'particle_id', 'is_target_particle', 'pdg_id',
-                  'energy', 'eta', 'phi', 'px', 'py', 'pz',
+                  'energy', 'eta', 'phi', 'px', 'py', 'pz', 'pt',
                   'charge','mass', 'has_track')
         .filter(pl.col('is_target_particle'))
         .sort('event_id')
@@ -2666,8 +2662,43 @@ def preprocess_for_model(particles: pl.DataFrame, tracks: pl.DataFrame, calo_hit
     
     # ----------------------------------------------
     tracks = calculate_extrapolated_features_polars(tracks)
+    # change particle id to particle idx
+    tracks_mappings = (
+        tracks.lazy()
+        .select(['event_id', 'majority_particle_id'])
+        .with_columns(
+            # FIX: Use 'int_ranges' (plural) to generate a range for every row
+            local_order=pl.int_ranges(
+                start=0,
+                end=pl.col('majority_particle_id').list.len(), 
+                dtype=pl.UInt32
+            )
+        )
+        .explode(['majority_particle_id', 'local_order'])
+        .rename({'majority_particle_id': 'particle_id'})
+        .join(
+            target_particles_idx.lazy(),
+            on=['event_id', 'particle_id'],
+            how='inner'
+        )
+        .group_by('event_id')
+        .agg(
+            pl.col('particle_idx').sort_by('local_order')
+        )
+    )
 
-     # ----------------------------------------------
+    # 2. Apply to original tracks
+    tracks = (
+        tracks.lazy()
+        .drop('majority_particle_id') 
+        .join(
+            tracks_mappings, 
+            on='event_id', 
+            how='left'
+        )
+        .collect(streaming=True)
+    )
+    # ----------------------------------------------
     return {
         "target_particles": target_particles,
         "calo_clusters": calo_clusters,
