@@ -2724,7 +2724,7 @@ def preprocess_for_model(particles: pl.DataFrame, tracks: pl.DataFrame, calo_hit
         .join(
             target_particles_idx.lazy(),
             on=['event_id', 'particle_id'],
-            how='left'
+            how='inner'
         )
         .group_by('event_id')
         .agg(
@@ -2739,7 +2739,7 @@ def preprocess_for_model(particles: pl.DataFrame, tracks: pl.DataFrame, calo_hit
         .join(
             tracks_mappings, 
             on='event_id', 
-            how='left'
+            how='inner'
         )
         .collect(streaming=True)
     )
