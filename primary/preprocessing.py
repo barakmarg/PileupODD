@@ -2532,7 +2532,7 @@ def preprocess_for_model(particles: pl.DataFrame, tracks: pl.DataFrame, calo_hit
     particles = add_eta_and_phi_and_pt(particles)
     particles = get_particles_id_parent_of_inside_calo_particles_maskv3(particles, calo_hits)
     particles = set_target_particles_maskv2(particles, eta_cut=eta_cut, pt_cut=pt_cut)
-    # apply cu
+    # apply cuts, filter out tracks related to non target particles
 
     calo_hits = add_ms_cluster_labels(calo_hits, bandwidth=120.0)
 
@@ -2569,46 +2569,91 @@ def preprocess_for_model(particles: pl.DataFrame, tracks: pl.DataFrame, calo_hit
         .collect(streaming=True)
     )
 
-    # Merge Calo Hits with Cluster Labels, Calibrate Energies
-    calo_clusters = (
+    # 1. OPTIMIZATION: Pre-compute 'is_hcal'
+    calib_optimized = CALIBRATION.lazy().select([
+        pl.col('detector'),
+        pl.col('calib_factor'),
+        pl.col('system_label').str.contains("Hcal").fill_null(False).alias('is_hcal')
+    ])
+
+    # --- BRANCH A: CENTROIDS & GEOMETRY ---
+    centroids_df = (
         calo_hits.lazy()
-        .select([
-            pl.col("event_id"),
-            pl.col("cluster_id"),
-            pl.col("detector"),
-            pl.col("total_energy"),
-            pl.col("cluster_cx"),
-            pl.col("cluster_cy"),
-            pl.col("cluster_cz"),
-
-        ])
-        .explode(['cluster_id', 'detector', 'total_energy', 'cluster_cx', 'cluster_cy', 'cluster_cz'])
-        .join(
-            CALIBRATION.lazy().select(['detector', 'calib_factor']),
-            on='detector',
-            how='left'
-        )
-        .with_columns((pl.col('total_energy') * pl.col('calib_factor')).alias('calibrated_energy'))
-        .drop('calib_factor')
-        .drop('detector')
-        .drop('total_energy')
+        .select(['event_id', 'cluster_id', 'cluster_cx', 'cluster_cy', 'cluster_cz'])
+        .explode(['cluster_id', 'cluster_cx', 'cluster_cy', 'cluster_cz'])
+        # Deduplicate
         .group_by(['event_id', 'cluster_id'])
-
         .agg([
-            pl.col('calibrated_energy').sum().alias('total_cluster_energy'),
-            pl.col('cluster_cx').first().alias('cluster_cx'),
-            pl.col('cluster_cy').first().alias('cluster_cy'),
-            pl.col('cluster_cz').first().alias('cluster_cz'),
+            pl.col('cluster_cx').first(),
+            pl.col('cluster_cy').first(),
+            pl.col('cluster_cz').first(),
         ])
-        .sort(['event_id', 'cluster_id'])
-        .with_row_index("global_order")
-        .sort('global_order')
-        .drop('global_order')
-        .group_by('event_id', maintain_order=True)
-        .agg('*')
-        .collect(streaming=True)
+        # Calculate Angles once per cluster
+        .with_columns([
+            # FIX: Use pl.arctan2(y, x) instead of y.arctan2(x)
+            pl.arctan2(pl.col('cluster_cy'), pl.col('cluster_cx')).alias('cluster_phi'),
+            
+            # Cluster Eta: arcsinh(z / r_perp)
+            (pl.col('cluster_cz') / (pl.col('cluster_cx').pow(2) + pl.col('cluster_cy').pow(2)).sqrt())
+            .arcsinh()
+            .alias('cluster_eta')
+        ])
     )
 
+    # --- BRANCH B: HIT PHYSICS & TOPOLOGY ---
+    physics_df = (
+        calo_hits.lazy()
+        .select(['event_id', 'cluster_id', 'detector', 'total_energy', 'x', 'y', 'z'])
+        .explode(['cluster_id', 'detector', 'total_energy', 'x', 'y', 'z'])
+        
+        # Join Calibration
+        .join(calib_optimized, on='detector', how='left')
+        
+        # Vectorized Math (Hit Level)
+        .with_columns([
+            (pl.col('total_energy') * pl.col('calib_factor')).alias('cal_E'),
+            (pl.col('x').pow(2) + pl.col('y').pow(2)).alias('_r2') 
+        ])
+        .with_columns([
+            # Hit Rho
+            (pl.col('_r2') + pl.col('z').pow(2)).sqrt().alias('hit_rho'),
+            # Hit Eta
+            (pl.col('z') / pl.col('_r2').sqrt()).arcsinh().alias('hit_eta'),
+            # FIX: Use pl.arctan2(y, x) here as well
+            pl.arctan2(pl.col('y'), pl.col('x')).alias('hit_phi'),
+        ])
+        
+        # Aggregation
+        .group_by(['event_id', 'cluster_id'])
+        .agg([
+            pl.col('cal_E').sum().alias('total_cluster_energy'),
+            pl.col('cal_E').filter(pl.col('is_hcal')).sum().alias('hcal_energy'),
+            
+            # Topological Widths
+            pl.col('hit_eta').std().fill_null(0.0).alias('sigma_eta'),
+            pl.col('hit_phi').std().fill_null(0.0).alias('sigma_phi'),
+            pl.col('hit_rho').std().fill_null(0.0).alias('sigma_rho'),
+        ])
+    )
+
+    # --- FINAL MERGE ---
+    calo_clusters = (
+        physics_df
+        .join(
+            centroids_df, 
+            on=['event_id', 'cluster_id'], 
+            how='left'
+        )
+        .with_columns(
+            (pl.col('hcal_energy') / pl.col('total_cluster_energy'))
+            .fill_nan(0.0)
+            .alias('hcal_fraction')
+        )
+        .sort(['event_id', 'cluster_id'])
+        .group_by('event_id', maintain_order=True)
+        .agg(pl.all())
+        .collect(streaming=True)
+    )
     target_particles_idx =  (
         target_particles.lazy()
         .select(['event_id', 'particle_id'])
@@ -2679,7 +2724,7 @@ def preprocess_for_model(particles: pl.DataFrame, tracks: pl.DataFrame, calo_hit
         .join(
             target_particles_idx.lazy(),
             on=['event_id', 'particle_id'],
-            how='inner'
+            how='left'
         )
         .group_by('event_id')
         .agg(
