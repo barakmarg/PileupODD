@@ -2598,8 +2598,11 @@ def preprocess_for_model(particles: pl.DataFrame, tracks: pl.DataFrame, calo_hit
             # Cluster Eta: arcsinh(z / r_perp)
             (pl.col('cluster_cz') / (pl.col('cluster_cx').pow(2) + pl.col('cluster_cy').pow(2)).sqrt())
             .arcsinh()
-            .alias('cluster_eta')
+            .alias('cluster_eta'),
+            # rho
+            (pl.col('cluster_cx').pow(2) + pl.col('cluster_cy').pow(2)).sqrt().alias('cluster_rho'),
         ])
+        .drop(['cluster_cx', 'cluster_cy', 'cluster_cz'])
     )
 
     # --- BRANCH B: HIT PHYSICS & TOPOLOGY ---
@@ -2614,13 +2617,11 @@ def preprocess_for_model(particles: pl.DataFrame, tracks: pl.DataFrame, calo_hit
         # Vectorized Math (Hit Level)
         .with_columns([
             (pl.col('total_energy') * pl.col('calib_factor')).alias('cal_E'),
-            (pl.col('x').pow(2) + pl.col('y').pow(2)).alias('_r2') 
+            (pl.col('x').pow(2) + pl.col('y').pow(2)).sqrt().alias('hit_rho') 
         ])
         .with_columns([
-            # Hit Rho
-            (pl.col('_r2') + pl.col('z').pow(2)).sqrt().alias('hit_rho'),
             # Hit Eta
-            (pl.col('z') / pl.col('_r2').sqrt()).arcsinh().alias('hit_eta'),
+            (pl.col('z') / pl.col('hit_rho')).arcsinh().alias('hit_eta'),
             # FIX: Use pl.arctan2(y, x) here as well
             pl.arctan2(pl.col('y'), pl.col('x')).alias('hit_phi'),
         ])
