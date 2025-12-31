@@ -1965,10 +1965,11 @@ def set_target_particles_maskv2(
     # 1. Identify Target Particles (Flat List)
     almost_target_particles = (
         particles.lazy()
-        .select(["event_id", "particle_id", "enter_calo", "has_track", 'pt', 'eta'])
-        .explode(["particle_id", "enter_calo", "has_track", 'pt', 'eta'])
+        .select(["event_id", "particle_id", "enter_calo", "has_track", 'pt', 'eta', 'pdg_id'])
+        .explode(["particle_id", "enter_calo", "has_track", 'pt', 'eta', 'pdg_id'])
         .with_columns(pl.col("particle_id").cast(pl.Int64)) # Safety cast
-        
+        # Exclude neutrinos from target particles
+        .filter((pl.col('pdg_id').abs() != 12) & (pl.col('pdg_id').abs() != 14) & (pl.col('pdg_id').abs() != 16))
         # Condition 1: Enter Calo OR Has Track
         .filter(pl.col("enter_calo") | pl.col("has_track"))
         
@@ -2508,6 +2509,7 @@ def calculate_extrapolated_features_polars(tracks: pl.DataFrame, B_field=3.0, R_
                         pl.col("eta_int"),
                         pl.col("track_tanlambda"),
                         pl.col("track_omega"),
+                        pl.col("pt"),
                         pl.col("eta")  # <--- Added here
                     ])
 
