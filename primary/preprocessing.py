@@ -2519,7 +2519,8 @@ def calculate_extrapolated_features_polars(tracks: pl.DataFrame, B_field=3.0, R_
                  .drop("event_idx") \
                  .collect()
 
-def preprocess_for_model(particles: pl.DataFrame, tracks: pl.DataFrame, calo_hits: pl.DataFrame, num_of_events: int=-1, eta_cut: float=2.5, pt_cut: float=1.0) -> Dict[str,pl.DataFrame]:
+def preprocess_for_model(particles: pl.DataFrame, tracks: pl.DataFrame, calo_hits: pl.DataFrame,
+                         num_of_events: int=-1, eta_cut: float=2.5, pt_cut: float=1.0, clusters_cutoff: float=0.1) -> Dict[str,pl.DataFrame]:
     """
     Aggregates the number of cells per cluster.
     """
@@ -2528,16 +2529,79 @@ def preprocess_for_model(particles: pl.DataFrame, tracks: pl.DataFrame, calo_hit
         tracks = tracks.filter(pl.col("event_id") <num_of_events)
         calo_hits = calo_hits.filter(pl.col("event_id") <num_of_events)
 
+    # Cast to Float32
+    particles = particles.with_columns([
+        pl.col(pl.Float64).cast(pl.Float32),
+        pl.col(pl.List(pl.Float64)).cast(pl.List(pl.Float32))
+    ])
+    tracks = tracks.with_columns([
+        pl.col(pl.Float64).cast(pl.Float32),
+        pl.col(pl.List(pl.Float64)).cast(pl.List(pl.Float32))
+    ])
+    calo_hits = calo_hits.with_columns([
+        pl.col(pl.Float64).cast(pl.Float32),
+        pl.col(pl.List(pl.Float64)).cast(pl.List(pl.Float32))
+    ])
+
     particles = add_orphan_mask(particles)
     particles = add_created_inside_calo_mask(particles)
     particles = add_particle_have_track_mask(particles, tracks)
     particles = add_eta_and_phi_and_pt(particles)
     particles = get_particles_id_parent_of_inside_calo_particles_maskv3(particles, calo_hits)
     particles = set_target_particles_maskv2(particles, eta_cut=eta_cut, pt_cut=pt_cut)
-    # apply cuts, filter out tracks related to non target particles
 
+
+    # apply cuts, filter out tracks related to non target particles
+    track_cols = [c for c in tracks.columns if c != 'event_id']
+    tracks = (
+        tracks.lazy()
+        .with_columns(
+            local_order=pl.int_ranges(
+                start=0,
+                end=pl.col('majority_particle_id').list.len(), 
+                dtype=pl.UInt32
+            )
+        )
+        .select(['event_id', 'local_order'] + track_cols)
+        .explode(['local_order'] + track_cols)
+        .with_columns(pl.col('majority_particle_id').cast(pl.Int64))
+        .join(
+            particles.lazy()
+            .select(['event_id', 'particle_id', 'is_target_particle'])
+            .explode(['particle_id', 'is_target_particle'])
+            .filter(pl.col('is_target_particle'))
+            .with_columns(pl.col('particle_id').cast(pl.Int64)),
+            left_on=['event_id', 'majority_particle_id'],
+            right_on=['event_id', 'particle_id'],
+            how='inner'
+        )
+        .sort(['event_id', 'local_order'])
+        .group_by('event_id', maintain_order=True)
+        .agg([pl.col(c) for c in track_cols])
+        .sort('event_id')
+        .collect(streaming=True)
+    )
     calo_hits = add_ms_cluster_labels(calo_hits, bandwidth=120.0)
 
+    # apply cutoff on calo hits, grouby by event_id and cluster_id to aggregate cell ids, if sum < 0.1 Gev drop the cells
+    calo_hits = (
+        calo_hits.lazy()
+        .with_row_index('_event_idx_temp')
+        .explode(pl.all().exclude(['event_id', '_event_idx_temp']))
+        .join(CALIBRATION.lazy().select(['detector', 'calib_factor']), on='detector', how='left')
+        .with_columns(
+            (pl.col('total_energy') * pl.col('calib_factor')).alias('hit_energy_gev')
+        )
+        .with_columns(
+            pl.col('hit_energy_gev').sum().over(['event_id', 'cluster_id']).alias('cluster_sum_energy')
+        )
+        .filter(pl.col('cluster_sum_energy') > clusters_cutoff)
+        .drop(['calib_factor', 'hit_energy_gev', 'cluster_sum_energy'])
+        .group_by(['_event_idx_temp', 'event_id'], maintain_order=True)
+        .agg(pl.all().exclude(['_event_idx_temp', 'event_id']))
+        .drop('_event_idx_temp')
+        .collect(streaming=True)
+    )
     # Target particle caloremeter calo clusters deposits ---------
 
     depositors_list = (
@@ -2692,6 +2756,7 @@ def preprocess_for_model(particles: pl.DataFrame, tracks: pl.DataFrame, calo_hit
     target_particles_deps_aggrigated = (target_particles_deps.lazy()
                                         .select(['event_id', 'cluster_id', 'ultimate_ancestor_id', 'total_energy_deps_in_cluster'])
                                         .rename({'ultimate_ancestor_id':'particle_id'})
+                                        .filter(pl.col("particle_id").is_not_null())
                                         .join(
                                             target_particles_idx.lazy(),
                                             on=['event_id', 'particle_id'],
@@ -2744,6 +2809,7 @@ def preprocess_for_model(particles: pl.DataFrame, tracks: pl.DataFrame, calo_hit
             on='event_id', 
             how='inner'
         )
+        .sort('event_id')
         .collect(streaming=True)
     )
     # ----------------------------------------------
