@@ -2822,5 +2822,4 @@ def preprocess_for_model(particles: pl.DataFrame, tracks: pl.DataFrame, calo_hit
 
 
 
-import polars as pl
 
