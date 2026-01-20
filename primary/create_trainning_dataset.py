@@ -60,6 +60,7 @@ def generate_normalization_yaml(data: Dict[str, pl.DataFrame]) -> str:
         "rho":        {"df": "calo_clusters", "col": "cluster_rho", "transform": None, "type": "min_max_sym"},
         "e":          {"df": "calo_clusters", "col": "total_cluster_energy", "transform": "sqrt", "type": "min_max_sym"},
         "pt":         {"df": "tracks",        "col": "pt",          "transform": "sqrt", "type": "min_max_sym"},
+        "cluster_pt": {"df": "calo_clusters", "col": None,         "transform": "sqrt", "type": "min_max_sym"},
         "sigma_eta":  {"df": "calo_clusters", "col": "sigma_eta",   "transform": "sqrt", "type": "std"},
         "sigma_phi":  {"df": "calo_clusters", "col": "sigma_phi",   "transform": "sqrt", "type": "std"},
         "sigma_rho":  {"df": "calo_clusters", "col": "sigma_rho",   "transform": "sqrt", "type": "std"},
@@ -82,22 +83,28 @@ def generate_normalization_yaml(data: Dict[str, pl.DataFrame]) -> str:
             
         df = data[df_name]
         
-        if col_name not in df.columns:
-            continue
+        if key == "cluster_pt":
+            # Special case: compute pt from energy and eta
+            energy_series = df.select(pl.col("total_cluster_energy")).explode("total_cluster_energy").get_column("total_cluster_energy")
+            eta_series = df.select(pl.col("cluster_eta")).explode("cluster_eta").get_column("cluster_eta")
+            series = energy_series / eta_series.cosh()
+        else:
+            if col_name not in df.columns:
+                continue
 
-        try:
-            # Check if column is List type and explode if so
-            is_list = False
-            dtype = df.schema[col_name]
-            if isinstance(dtype, pl.List):
-                is_list = True
-            
-            if is_list:
-                series = df.select(pl.col(col_name).explode()).get_column(col_name)
-            else:
-                series = df.get_column(col_name)
-        except Exception:
-             raise ValueError(f"Column {col_name} not found in DataFrame {df_name}")
+            try:
+                # Check if column is List type and explode if so
+                is_list = False
+                dtype = df.schema[col_name]
+                if isinstance(dtype, pl.List):
+                    is_list = True
+                
+                if is_list:
+                    series = df.select(pl.col(col_name).explode()).get_column(col_name)
+                else:
+                    series = df.get_column(col_name)
+            except Exception:
+                 raise ValueError(f"Column {col_name} not found in DataFrame {df_name}")
 
         
         if len(series) == 0:
@@ -139,6 +146,179 @@ def generate_normalization_yaml(data: Dict[str, pl.DataFrame]) -> str:
         
         yaml_config[key] = ordered_entry
         
+    return yaml.dump(yaml_config, sort_keys=False, default_flow_style=False)
+
+
+def generate_normalization_stats_sequential(data_dir: str) -> str:
+    """
+    Generates normalization stats sequentially from parquet files in a directory.
+    Memory-efficient alternative to generate_normalization_yaml.
+    """
+    from pathlib import Path
+    from tqdm import tqdm
+    import numpy as np
+    
+    # Define the schema: (Dataframe Name, Column Name, Transform, Type)
+    config_schema = {
+        "eta":        {"df": "calo_clusters", "col": "cluster_eta", "transform": None, "type": "min_max_sym"},
+        "rho":        {"df": "calo_clusters", "col": "cluster_rho", "transform": None, "type": "min_max_sym"},
+        "e":          {"df": "calo_clusters", "col": "total_cluster_energy", "transform": "sqrt", "type": "min_max_sym"},
+        "pt":         {"df": "tracks",        "col": "pt",          "transform": "sqrt", "type": "min_max_sym"},
+        "cluster_pt": {"df": "calo_clusters", "col": None,         "transform": "sqrt", "type": "min_max_sym"},
+        "sigma_eta":  {"df": "calo_clusters", "col": "sigma_eta",   "transform": "sqrt", "type": "std"},
+        "sigma_phi":  {"df": "calo_clusters", "col": "sigma_phi",   "transform": "sqrt", "type": "std"},
+        "sigma_rho":  {"df": "calo_clusters", "col": "sigma_rho",   "transform": "sqrt", "type": "std"},
+        "d0":         {"df": "tracks",        "col": "d0",          "transform": None,   "type": "min_max_sym"},
+        "z0":         {"df": "tracks",        "col": "z0",          "transform": None,   "type": "min_max_sym"},
+        "tanlambda":  {"df": "tracks",        "col": "track_tanlambda", "transform": None, "type": "min_max_sym"},
+        "omega":      {"df": "tracks",        "col": "track_omega", "transform": None,   "type": "std"},
+    }
+    
+    # Initialize accumulators
+    stats = {}
+    for key in config_schema:
+        stats[key] = {
+            "count": 0,
+            "sum": 0.0,
+            "sum_sq": 0.0,
+            "min": float('inf'),
+            "max": float('-inf')
+        }
+
+    path = Path(data_dir)
+    # Search for track files to determine chunks
+    # Assuming standard naming: tracks-{index}.parquet
+    # We look for tracks-*.parquet as the driver for indices
+    track_files = sorted(list(path.glob("tracks-*.parquet")))
+    
+    if not track_files:
+        print(f"No tracks-*.parquet files found in {data_dir}. Cannot generate stats.")
+        return ""
+
+    indices = []
+    for f in track_files:
+        try:
+            # Extract index between last '-' and '.'
+            indices.append(f.name.split('-')[-1].split('.')[0])
+        except Exception:
+            pass
+
+    # Process files sequentially
+    for idx_str in tqdm(indices, desc="Computing Normalization Stats"):
+        
+        # Identify which dataframes we need for the schema
+        required_dfs = set(v["df"] for v in config_schema.values())
+        loaded_dfs = {}
+        
+        # Load necessary files for this index
+        for df_name in required_dfs:
+            fpath = path / f"{df_name}-{idx_str}.parquet"
+            if fpath.exists():
+                loaded_dfs[df_name] = pl.read_parquet(fpath)
+            
+        # Compute stats for each schema entry
+        for key, schema in config_schema.items():
+            df_name = schema["df"]
+            col_name = schema["col"]
+            transform = schema["transform"]
+            
+            if df_name not in loaded_dfs:
+                continue
+                
+            df = loaded_dfs[df_name]
+            
+            series = None
+            
+            # Special handling for cluster_pt
+            if key == "cluster_pt":
+                if "total_cluster_energy" in df.columns and "cluster_eta" in df.columns:
+                    e = df.select(pl.col("total_cluster_energy").explode()).get_column("total_cluster_energy")
+                    eta = df.select(pl.col("cluster_eta").explode()).get_column("cluster_eta")
+                    series = e / eta.cosh()
+            else:
+                if col_name not in df.columns:
+                    continue
+                
+                # Check if list and explode
+                dtype = df.schema[col_name]
+                if isinstance(dtype, pl.List):
+                    series = df.select(pl.col(col_name).explode()).get_column(col_name)
+                else:
+                    series = df.get_column(col_name)
+
+            if series is None or len(series) == 0:
+                continue
+                
+            if transform == "sqrt":
+                series = series.sqrt()
+            
+            # Convert to numpy for accumulation
+            arr = series.to_numpy()
+            
+            # Remove NaNs / Infs
+            arr = arr[np.isfinite(arr)]
+            
+            if len(arr) == 0:
+                continue
+                
+            n = len(arr)
+            s = np.sum(arr)
+            ss = np.sum(arr * arr)
+            mn = np.min(arr)
+            mx = np.max(arr)
+            
+            stats[key]["count"] += n
+            stats[key]["sum"] += s
+            stats[key]["sum_sq"] += ss
+            if mn < stats[key]["min"]:
+                stats[key]["min"] = mn
+            if mx > stats[key]["max"]:
+                stats[key]["max"] = mx
+
+    # Finalize
+    yaml_config = {}
+    
+    def smart_fmt(val):
+         if isinstance(val, (int, float, np.number)):
+            if abs(val) >= 10 and abs(round(val) - val) < 1e-3:
+                  return int(round(val))
+            return float(f"{val:.4f}")
+         return val
+
+    for key, schema in config_schema.items():
+        s = stats[key]
+        N = s["count"]
+        
+        if N == 0:
+            continue
+            
+        mean_val = s["sum"] / N
+        var_val = (s["sum_sq"] - (s["sum"]**2 / N)) / (N - 1) if N > 1 else 0.0
+        if var_val < 0: var_val = 0.0
+        std_val = np.sqrt(var_val)
+        
+        entry = {
+            "type": schema["type"],
+            "mean": float(f"{mean_val:.4f}"),
+            "std": float(f"{std_val:.4f}"),
+            "min": smart_fmt(s["min"]),
+            "max": smart_fmt(s["max"])
+        }
+        
+        if schema["transform"]:
+            entry["fn"] = schema["transform"]
+        
+        # Order keys
+        ordered = {}
+        ordered["type"] = entry["type"]
+        if "fn" in entry: ordered["fn"] = entry["fn"]
+        ordered["mean"] = entry["mean"]
+        ordered["std"] = entry["std"]
+        ordered["min"] = entry["min"]
+        ordered["max"] = entry["max"]
+        
+        yaml_config[key] = ordered
+
     return yaml.dump(yaml_config, sort_keys=False, default_flow_style=False)
 
 
@@ -579,6 +759,113 @@ def preprocess_for_model(particles: pl.DataFrame, tracks: pl.DataFrame, calo_hit
         "target_particles_deps": filtered_data["target_particles_deps"]
     }
 
+
+
+def run_preprocessing_pipeline(r=None, event_name: str="ttbar_pu0", ):
+    from huggingface_hub import HfFileSystem
+    import polars as pl
+    import tqdm
+    import gc
+    fs = HfFileSystem()
+    if r is not None:
+        number_of_files = r
+    for i in tqdm.tqdm(number_of_files):
+        file_path = f"datasets/CERN/ColliderML-Release-1/data/{event_name}_particles/train-{i:05d}-of-00100.parquet"
+        print(f"Processing file: {file_path}")
+        if not fs.exists(file_path):
+            raise FileNotFoundError(f"File not found: {file_path}")
+
+        file_path = f"datasets/CERN/ColliderML-Release-1/data/{event_name}_particles/train-{i:05d}-of-00100.parquet"
+        with fs.open(file_path, "rb") as f:
+            particles = pl.read_parquet(f)
+
+
+        file_path = f"datasets/CERN/ColliderML-Release-1/data/{event_name}_calo_hits/train-{i:05d}-of-00100.parquet"
+        with fs.open(file_path, "rb") as f:
+            calo_hits = pl.read_parquet(f)
+
+        file_path = f"datasets/CERN/ColliderML-Release-1/data/{event_name}_tracks/train-{i:05d}-of-00100.parquet"
+        with fs.open(file_path, "rb") as f:
+            tracks = pl.read_parquet(f)
+
+        preprocessed_data = preprocess_for_model(particles=particles, tracks=tracks,
+                                                  calo_hits=calo_hits, num_of_events=-1, 
+                                                  pt_cut=1, eta_cut=3.0, clusters_cutoff=0.25)
+        
+        # write preprocessed data to local disk as parquets
+        file_path_data = f"/storage/agrp/barakma/PileupODD/data/{event_name}"
+        from pathlib import Path
+        Path(file_path_data).mkdir(parents=True, exist_ok=True)
+        for key, df in preprocessed_data.items():
+            df.write_parquet(f"{file_path_data}/{key}-{i:05d}.parquet")
+        
+        # Free memory
+        del particles, tracks, calo_hits, preprocessed_data
+        gc.collect()
+
+
+def unify_data_indices(N: int, base_path: str = "/storage/agrp/barakma/PileupODD/data"):
+    """
+    Unifies scattered parquet files across ALL splits (train/val/test) into single concatenated files PER INDEX.
+    
+    For each index i, reads: base_path/{train,val,test}/{key}-{index}.parquet
+    Writes to:  base_path/unify/{key}-{index}.parquet
+    
+    Args:
+        N (int): The exclusive upper bound for the file index (0 to N-1).
+        base_path (str): The root data directory containing train, val, and test folders.
+    """
+    from pathlib import Path
+    import polars as pl
+    
+    splits = ["train", "val", "test"]
+    # Keys corresponding to the dataframes produced in the pipeline
+    keys = ["target_particles", "calo_clusters", "tracks", "target_particles_deps"]
+    
+    unify_root = Path(base_path) / "unify"
+    unify_root.mkdir(parents=True, exist_ok=True)
+
+    # Check split directories existence once
+    existing_splits = []
+    for split in splits:
+        split_dir = Path(base_path) / split
+        if split_dir.exists():
+            existing_splits.append(split_dir)
+        else:
+            print(f"Warning: Split directory does not exist: {split_dir}")
+
+    if not existing_splits:
+        print("No split directories found. Exiting.")
+        return
+    
+    for i in range(N):
+        idx_str = f"{i:05d}"
+        
+        for key in keys:
+            files_to_concat = []
+            
+            for split_dir in existing_splits:
+                # Standard filename format: {key}-{i:05d}.parquet
+                fname = f"{key}-{idx_str}.parquet"
+                fpath = split_dir / fname
+                
+                if fpath.exists():
+                    files_to_concat.append(str(fpath))
+            
+            if not files_to_concat:
+                continue
+            
+            try:
+                # Use scan_parquet for memory efficiency (lazy evaluation)
+                # Sort by event_id before writing to ensure deterministic order
+                lf = pl.scan_parquet(files_to_concat).sort("event_id")
+                
+                out_file = unify_root / f"{key}-{idx_str}.parquet"
+                lf.sink_parquet(out_file)
+                print(f"Unified index {idx_str} for '{key}' -> {out_file}")
+                
+            except Exception as e:
+                print(f"Error unifying '{key}' index {idx_str}: {e}")
 
 
 

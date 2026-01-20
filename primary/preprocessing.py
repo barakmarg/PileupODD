@@ -2,6 +2,7 @@ from typing import Dict, List
 import polars as pl
 from sklearn.cluster import MeanShift
 import numpy as np
+import torch
 from primary.calibration import CALIBRATION
 import awkward as ak
 import numpy as np
@@ -1010,6 +1011,124 @@ def add_ms_cluster_labels(calo_hits: pl.DataFrame, bandwidth: float = 60.0) -> p
     
     print(f"Done. Total time: {time.time()-t0:.2f}s")
     return final_df
+
+import tqdm
+def add_ms_cluster_labels_gpu(calo_hits: pl.DataFrame, bandwidth: float = 120.0) -> pl.DataFrame:
+    print(f"--- Starting FAST GPU Clustering (Float32, MeanShift, bw={bandwidth}) ---")
+    t0 = time.time()
+    
+    device = torch.device('cuda')
+    
+    # CONFIGURATION FOR SPEED vs PRECISION
+    # density_subsample_ratio=0.25: Uses 25% of points to calculate gradients.
+    #                               Sufficent for dense calorimeter blobs.
+    # seed_ratio=0.05:              Starts with 5% of points as seeds.
+    from primary.gpu_meanshift import MeanShiftGPU
+    ms_gpu = MeanShiftGPU(
+        bandwidth=bandwidth, 
+        density_subsample_ratio=0.25, 
+        seed_ratio=0.05, 
+        max_iter=60,
+        device=device
+    )
+
+    # --- A. Flatten Data ---
+    flat_hits = (
+        calo_hits.lazy()
+        .select(['event_id', 'x', 'y', 'z'])
+        .explode(['x', 'y', 'z'])
+        .with_row_index("global_id")
+        .collect()
+    )
+
+    # Convert to Numpy
+    df_numpy = flat_hits.sort("event_id")
+    
+    # Load ALL data to GPU memory at once
+    all_points_np = np.column_stack((
+        df_numpy["x"].to_numpy(),
+        df_numpy["y"].to_numpy(),
+        df_numpy["z"].to_numpy()
+    )).astype(np.float32) 
+    
+    # Copy to GPU (Float32)
+    all_points_gpu = torch.from_numpy(all_points_np).to(device)
+    
+    all_gid = df_numpy["global_id"].to_numpy()
+    all_eid = df_numpy["event_id"].to_numpy()
+
+    # Find event boundaries
+    unique_events, split_indices = np.unique(all_eid, return_index=True)
+    split_indices = split_indices[1:]
+    
+    # Create View Slices (Zero Copy)
+    events_tensors = torch.tensor_split(all_points_gpu, tuple(split_indices))
+    events_gids = np.split(all_gid, split_indices)
+    
+    num_events = len(events_tensors)
+    print(f"Data prepared: {num_events} events. GPU Load Time: {time.time()-t0:.2f}s")
+
+    # --- B. GPU Loop ---
+    res_gids, res_cids, res_cx, res_cy, res_cz = [], [], [], [], []
+
+    # Using TQDM to track speed
+    for i in tqdm.tqdm(range(num_events), desc="Processing Events"):
+        points_i = events_tensors[i] # GPU Slice
+        gids_i = events_gids[i]
+        
+        if points_i.shape[0] == 0: continue
+
+        # --- RUN ALGO ---
+        ms_gpu.fit(points_i)
+        
+        # --- EXTRACT RESULTS ---
+        # Minimal transfer to CPU
+        labels = ms_gpu.labels_.cpu().numpy()
+        centers = ms_gpu.cluster_centers_.cpu().numpy()
+        
+        if len(centers) > 0:
+            center_x = centers[labels, 0]
+            center_y = centers[labels, 1]
+            center_z = centers[labels, 2]
+        else:
+            center_x, center_y, center_z = np.zeros((3, len(points_i)))
+            
+        res_gids.append(gids_i)
+        res_cids.append(labels)
+        res_cx.append(center_x)
+        res_cy.append(center_y)
+        res_cz.append(center_z)
+
+    # --- C. Re-Assemble ---
+    print("Aggregating results...")
+    
+    labels_df = pl.DataFrame({
+        "global_id": np.concatenate(res_gids),
+        "cluster_id": np.concatenate(res_cids),
+        "cluster_cx": np.concatenate(res_cx),
+        "cluster_cy": np.concatenate(res_cy),
+        "cluster_cz": np.concatenate(res_cz),
+    })
+
+    cluster_lists = (
+        flat_hits.lazy()
+        .select(["event_id", "global_id"])
+        .join(labels_df.lazy(), on="global_id", how="left")
+        .sort("global_id") 
+        .group_by("event_id", maintain_order=True)
+        .agg([
+            pl.col("cluster_id"),
+            pl.col("cluster_cx"),
+            pl.col("cluster_cy"),
+            pl.col("cluster_cz")
+        ])
+        .collect()
+    )
+    
+    final_df = calo_hits.join(cluster_lists, on="event_id", how="left")
+    print(f"Done. Total time: {time.time()-t0:.2f}s")
+    return final_df
+
 
 def cluster_purity(calo_hits_with_clusters:pl.DataFrame, ancestors:pl.DataFrame) -> pl.DataFrame:
     """

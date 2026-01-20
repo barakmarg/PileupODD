@@ -946,4 +946,167 @@ def plot_num_contributing_ancestors(
     plt.show()
     return cluster_stats
 
+def histogram_ht_ratio(particles: pl.DataFrame, eta_cut:float, pt_cut:float)-> pl.DataFrame:
+    # sum pt of target particles within eta cut, pt cut
+    ht_target = (
+    particles.lazy()
+    .select(['event_id', 'particle_id','pt', 'eta', 'is_target_particle', 'pdg_id'])
+    .explode(['particle_id','pt', 'eta', 'is_target_particle', 'pdg_id'])
+    .filter((pl.col('is_target_particle') &
+            (pl.col('eta').abs() < eta_cut) &
+            (pl.col('pt') > pt_cut) ) &
+            # filter out neutrinos
+             ((pl.col('pdg_id').abs() != 12) & (pl.col('pdg_id').abs() != 14) & (pl.col('pdg_id').abs() != 16) )
+            )
+    .group_by('event_id')
+    .agg(pl.col('pt').sum().alias('ht_target'))
+    )
+
+    ht_truth =(
+    particles.lazy()
+    .select(['event_id', 'particle_id','pt', 'eta', 'is_parent_missing', 'pdg_id'])
+    .explode(['particle_id','pt', 'eta', 'is_parent_missing', 'pdg_id'])
+    .filter((pl.col('is_parent_missing') &
+            (pl.col('eta').abs() < eta_cut) &
+            (pl.col('pt') > pt_cut) )&
+               ((pl.col('pdg_id').abs() != 12) & (pl.col('pdg_id').abs() != 14) & (pl.col('pdg_id').abs() != 16) ))
+    .group_by('event_id')
+    .agg(pl.col('pt').sum().alias('ht_truth'))
+    )
+    ht_combined = ht_target.join(ht_truth, on='event_id', how='inner').collect(streaming=True)
+
+    import matplotlib.pyplot as plt
+    import numpy as np
+
+    # Convert to numpy for plotting
+    x = ht_combined['ht_truth'].to_numpy()
+    y = ht_combined['ht_target'].to_numpy()
+
+    # Calculate ratio
+    ratio = np.divide(y, x, out=np.zeros_like(y), where=x!=0)
+
+    # Calculate statistics
+    mean_ratio = np.mean(ratio)
+    std_ratio = np.std(ratio)
+    n_events = len(ratio)
+
+    plt.figure(figsize=(10, 6))
+    plt.hist(ratio, bins=50, range=(0, 2), color='blue', edgecolor='black', alpha=0.7)
+    plt.title(f"Ratio of Target HT / Truth HT (eta_cut={eta_cut}, pt_cut={pt_cut}) - Mean: {mean_ratio:.2f}, Std: {std_ratio:.2f}, N: {n_events}")
+    plt.xlabel("HT Target / HT Truth")
+    plt.ylabel("Number of Events") 
+    return ht_combined
+
+
+def plot_calo_cluster_cutoff_plots(calo: pl.DataFrame):
+
+    import plotly.graph_objects as go
+    import matplotlib.pyplot as plt
+    import numpy as np
+    from primary.calibration import CALIBRATION
+
+    cluster_stats = (
+        calo.lazy()
+        .select(["event_id", "cluster_id"])
+        .explode("cluster_id")
+        .group_by(["event_id", "cluster_id"])
+        .agg(pl.count().alias("count"))
+        .rename({"count": "cluster_size"})
+        .collect()
+    )
+    size_cdf = (
+        cluster_stats.lazy()
+        .group_by("cluster_size")
+        .agg(pl.count().alias("num_clusters"))
+        .sort("cluster_size")
+        .collect()
+        .with_columns([
+            pl.col("num_clusters").cum_sum().shift(1).fill_null(0).alias("clusters_lt"),
+        ])
+        .with_columns([
+            (pl.col("clusters_lt") / pl.col("num_clusters").sum() * 100).alias("percentage_lt"),
+        ])
+    )
+
+    fig = go.Figure(
+        go.Scatter(
+            x=size_cdf["cluster_size"],
+            y=size_cdf["percentage_lt"],
+            mode="markers+lines",
+            marker=dict(size=8, color="mediumslateblue"),
+            hovertemplate="Partition size < %{x}<br>Share: %{y:.2f}%<extra></extra>",
+        )
+    )
+    fig.update_layout(
+        title="Cumulative share of partitions by size",
+        xaxis_title="Partition size (cells)",
+        yaxis_title="Percentage of partitions",
+        yaxis=dict(range=[0, 100]),
+    )
+    fig.show()
+
+
+
+    cluster_energy_stats = (
+        calo.lazy()
+        .select(["event_id", "cluster_id", "detector", "total_energy"])
+        .explode(["cluster_id", "detector", "total_energy"])
+        .join(
+            CALIBRATION.lazy().select(["detector", "calib_factor"]),
+            on="detector",
+        )
+        .group_by(["event_id", "cluster_id"])
+        .agg([
+            pl.len().alias("cluster_size"),
+            (pl.col("total_energy") * pl.col("calib_factor")).sum().alias("cluster_energy"),
+        ])
+        .collect(streaming=True)
+    )
+
+    # 2. Calculate Global Energy Distribution
+    energy_cdf = (
+        cluster_energy_stats.lazy()
+        # BUG FIX: Group ONLY by cluster_size. 
+        # We want to sum the energy of ALL clusters of size X in the entire dataset.
+        .group_by("cluster_size")
+        .agg([
+            pl.col("cluster_energy").sum().alias("total_energy_at_size"),
+        ])
+        .sort("cluster_size")
+        .with_columns([
+            # Cumulative sum of the GLOBAL energy
+            pl.col("total_energy_at_size")
+            .cum_sum()
+            .shift(1)
+            .fill_null(0)
+            .alias("energy_lt_global")
+        ])
+        .with_columns([
+            # Normalize by the grand total energy of the entire dataset
+            (pl.col("energy_lt_global") / pl.col("total_energy_at_size").sum() * 100)
+            .alias("avg_energy_pct")
+        ])
+        .collect()
+    )
+
+    # 3. Plot
+    fig = go.Figure(
+        go.Scatter(
+            x=energy_cdf["cluster_size"],
+            y=energy_cdf["avg_energy_pct"],
+            mode="markers+lines",
+            marker=dict(size=6, color="darkorchid"),
+            line=dict(width=2),
+            hovertemplate="Partition size < %{x}<br>Total Energy share: %{y:.2f}%<extra></extra>",
+        )
+    )
+    fig.update_layout(
+        title="Cumulative share of energy by partition size (Global)",
+        xaxis_title="Partition size (cells)",
+        yaxis_title="Energy share [%]",
+        yaxis=dict(range=[0, 100]),
+        template="plotly_white"
+    )
+    fig.show()
+
 
