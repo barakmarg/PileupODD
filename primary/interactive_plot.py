@@ -1,8 +1,23 @@
+from matplotlib import widgets
 import polars as pl
 import numpy as np
 import plotly.graph_objects as go
 from primary.calibration import CALIBRATION
 from primary.pdg_mappings import PDG_ID_TO_NAME
+import polars as pl
+import matplotlib.pyplot as plt
+from primary.preprocessing import cluster_purity, particle_energy_calo_deposits_ratio
+import plotly.express as px
+from primary.preprocessing import particle_purity_by_class
+
+import numpy as np
+from primary.pdg_mappings import PDG_ID_TO_NAME
+
+import numpy as np
+import plotly.graph_objects as go
+import ipywidgets as widgets
+from collections import defaultdict, deque
+
 # -----------------------------------------------------------------------------
 # Helper: Data Prep (Same as before)
 # -----------------------------------------------------------------------------
@@ -243,3 +258,439 @@ def plot_calo_clusters_3d(calo_hits: pl.DataFrame,
 
     if show:
         fig.show()
+
+
+def plot_3d_particle_hierarchy(particles: pl.DataFrame, calo_hits: pl.DataFrame, event_id=0):
+    """
+    3D Particle Hierarchy Explorer (X, Y, Z).
+    - Interactive 3D rotation and zooming.
+    - Lineage tracing with generation coloring.
+    - Search by PID.
+    - Hover info includes self-energy and deposited energy.
+    - Generation Filtering (Low < Gen < High).
+    """
+    
+    # --- 1. Data Loading ---
+    p_data = particles.filter(pl.col('event_id')==event_id)
+    c_data = calo_hits.filter(pl.col('event_id')==event_id)
+    
+    # Check if CALIBRATION is available, else mock or handle import
+    try:
+        from primary.calibration import CALIBRATION
+        has_calib = True
+    except ImportError:
+        # Fallback if calibration module is missing in this context
+        has_calib = False
+        
+    if has_calib:
+        c_data = (
+            c_data.lazy()
+            .select(['event_id', 'x', 'y', 'z', 'contrib_energies', 'contrib_particle_ids', 'detector'])
+            .explode(['x', 'y', 'z', 'contrib_energies', 'contrib_particle_ids', 'detector'])
+            .with_row_index('global_idx')
+            .join(CALIBRATION.lazy(), on="detector", how="left")
+            .explode(['contrib_energies', 'contrib_particle_ids'])
+            .with_columns([
+                (pl.col('contrib_energies') * pl.col('calib_factor').fill_null(1.0)).alias('energy'),
+                pl.col('contrib_particle_ids').cast(pl.Int64).alias('particle_id')
+            ])
+            .sort('global_idx')
+            .group_by(['event_id','x', 'y', 'z', 'detector'], maintain_order=True)
+            .agg([
+                pl.col('particle_id').alias('contrib_particle_ids'),
+                pl.col('energy').alias('contrib_energies')
+            ])
+            .group_by(['event_id'], maintain_order=True)  
+            .agg('*')
+            .collect()
+        )
+    
+    # Particle Data
+    all_pids = p_data["particle_id"].explode().to_numpy()
+    all_pdg_ids = p_data["pdg_id"].explode().to_numpy()
+    
+    # Extract Self Energy
+    particle_energies = p_data["energy"].explode().to_numpy()
+
+    pid_to_pdg = dict(zip(all_pids, all_pdg_ids))
+    pid_to_self_energy = {pid: float(en) for pid, en in zip(all_pids, particle_energies)}
+    pid_set = set(all_pids) 
+    
+    # Handle Parents 
+    raw_parents = p_data["parent_id"].explode().to_numpy()
+    raw_parents = np.nan_to_num(raw_parents, nan=0.0)
+    all_parent_ids = raw_parents.astype(np.int64)
+    
+    # 3D Coordinates
+    all_vx = p_data["vx"].explode().to_numpy()
+    all_vy = p_data["vy"].explode().to_numpy()
+    all_vz = p_data["vz"].explode().to_numpy()
+    
+    # Calo Data
+    c_x = c_data["x"].explode().to_numpy()
+    c_y = c_data["y"].explode().to_numpy()
+    c_z = c_data["z"].explode().to_numpy()
+    c_contrib_ids = c_data["contrib_particle_ids"].explode().to_numpy()
+    c_contrib_enes = c_data["contrib_energies"].explode().to_numpy()
+
+    # --- 2. Build Graph & Energy ---
+    pid_to_idx = {pid: i for i, pid in enumerate(all_pids)}
+    parent_map = {}
+    children_map = defaultdict(list)
+    out_degree = defaultdict(int)
+
+    for i, pid in enumerate(all_pids):
+        par_id = all_parent_ids[i]
+        if par_id != 0 and par_id != pid and par_id in pid_to_idx:
+            parent_map[pid] = par_id
+            children_map[par_id].append(pid)
+            out_degree[par_id] += 1
+        else:
+            parent_map[pid] = None
+
+    # Energy Calculation
+    direct_energy = defaultdict(float)
+    pid_to_cells = defaultdict(set)
+    
+    for cell_i, (contribs, energies) in enumerate(zip(c_contrib_ids, c_contrib_enes)):
+        if contribs is None: continue
+        for pid, en in zip(contribs, energies):
+            pid = int(pid)
+            direct_energy[pid] += float(en)
+            pid_to_cells[pid].add(cell_i)
+
+    inclusive_energy = direct_energy.copy()
+    queue = deque([pid for pid in all_pids if out_degree[pid] == 0])
+    
+    while queue:
+        child_id = queue.popleft()
+        par_id = parent_map.get(child_id)
+        if par_id is not None:
+            inclusive_energy[par_id] += inclusive_energy[child_id]
+            out_degree[par_id] -= 1
+            if out_degree[par_id] == 0:
+                queue.append(par_id)
+                
+    max_e = max(inclusive_energy.values()) if inclusive_energy else 10.0
+
+    # --- 3. Visualization Setup (3D) ---
+    state = {
+        'selected_pid': None, 
+        'min_energy': 0.0,
+        'gen_filter_active': False,
+        'gen_low': -2,
+        'gen_high': 2
+    }
+
+    layout = go.Layout(
+        title=f"Event {event_id} 3D Topology",
+        width=900, height=700,
+        scene=dict(
+            xaxis_title="X (mm)",
+            yaxis_title="Y (mm)",
+            zaxis_title="Z (mm)",
+            aspectmode='data'
+        ),
+        hovermode='closest',
+        clickmode='event+select',
+        uirevision='static_cam',
+        template="plotly_white",
+        margin=dict(l=0, r=0, b=0, t=50)
+    )
+
+    trace_calo = go.Scatter3d(
+        x=c_x, y=c_y, z=c_z, mode='markers',
+        marker=dict(size=3, color='orange', opacity=0.3),
+        visible=False, name='Calo Hits'
+    )
+
+    trace_norm = go.Scatter3d(
+        x=[], y=[], z=[], mode='lines',
+        line=dict(color='#888', width=3),
+        hoverinfo='skip', name='Link'
+    )
+
+    trace_jump = go.Scatter3d(
+        x=[], y=[], z=[], mode='lines',
+        line=dict(color='red', width=4, dash='dot'),
+        hoverinfo='skip', name='Data Jump'
+    )
+
+    trace_particles = go.Scatter3d(
+        x=all_vx, y=all_vy, z=all_vz, mode='markers',
+        marker=dict(size=5, color='#ccc'),
+        text=[], customdata=all_pids,
+        name='Particles', hoverinfo='text'
+    )
+
+    fig = go.FigureWidget(data=[trace_calo, trace_norm, trace_jump, trace_particles], layout=layout)
+    
+    # --- Widgets ---
+    info_box = widgets.HTML("<b>Click a particle or search a PID to explore.</b>")
+    
+    # Row 1: Basic Controls
+    txt_search = widgets.Text(
+        value='', placeholder='Enter PID', description='PID:', 
+        layout=widgets.Layout(width='180px')
+    )
+    btn_search = widgets.Button(
+        description='Go', button_style='primary', icon='search', 
+        layout=widgets.Layout(width='60px')
+    )
+    btn_calo = widgets.ToggleButton(description="Show Calo", value=False, icon='cube', layout=widgets.Layout(width='120px'))
+    slider_energy = widgets.FloatSlider(value=0, min=0, max=max_e/2, step=0.1, description='Min E:', layout=widgets.Layout(width='250px'))
+
+    # Row 2: Generation Filtering Controls
+    # Logic: low < gen < high
+    btn_gen_filter = widgets.ToggleButton(
+        description="Filter Gen", value=False, icon='filter', 
+        button_style='', layout=widgets.Layout(width='120px'),
+        tooltip="Activate generation filtering"
+    )
+    txt_gen_low = widgets.IntText(
+        value=-2, description='Low <', 
+        layout=widgets.Layout(width='140px'),
+        disabled=True
+    )
+    txt_gen_high = widgets.IntText(
+        value=2, description='< High', 
+        layout=widgets.Layout(width='140px'),
+        disabled=True
+    )
+
+    # --- 4. Logic ---
+
+    def get_gen_map(center_pid):
+        dmap = {center_pid: 0}
+        # Down (Descendants)
+        q = deque([(center_pid, 0)])
+        visited = {center_pid}
+        while q:
+            curr, d = q.popleft()
+            for child in children_map.get(curr, []):
+                if child not in visited:
+                    visited.add(child)
+                    dmap[child] = d + 1
+                    q.append((child, d + 1))
+        # Up (Ancestors)
+        curr = center_pid
+        d = 0
+        while True:
+            par = parent_map.get(curr)
+            if par is None or par in dmap: break
+            d -= 1
+            dmap[par] = d
+            curr = par
+        return dmap
+
+    # Define common names for lookup if PDG_ID_TO_NAME is missing
+    PDG_NAMES_FALLBACK = {'11': 'e-', '-11': 'e+', '22': 'gamma', '13': 'mu-', '-13': 'mu+', '211': 'pi+', '-211': 'pi-'}
+
+    def update_view(msg_override=None):
+        sel_pid = state['selected_pid']
+        min_e = state['min_energy']
+        
+        # Generation State
+        gen_active = state['gen_filter_active']
+        g_low = state['gen_low']
+        g_high = state['gen_high']
+
+        # A. Filtering
+        if sel_pid is None:
+            # --- All mode (Gen filter ignored here as there is no generation 0) ---
+            visible = []
+            for p in all_pids:
+                if inclusive_energy[p] >= min_e - 1e-5:
+                    visible.append(p)
+            
+            cols = ['#dddddd'] * len(visible)
+            sizes = [4] * len(visible)
+            texts = []
+            for p in visible:
+                pdg = str(pid_to_pdg.get(p))
+                # Try to use global dict if exists, else fallback
+                name = globals().get('PDG_ID_TO_NAME', PDG_NAMES_FALLBACK).get(pdg, pdg)
+                p_self_e = pid_to_self_energy.get(p, 0.0)
+                
+                texts.append(f"PID: {p}<br>Name: {name}<br>E (self): {p_self_e:.4f} GeV<br>E (dep): {inclusive_energy[p]:.4f} GeV")
+            
+            xn, yn, zn = [], [], []
+            xj, yj, zj = [], [], []
+            
+            title_txt = f"All Particles (> {min_e:.2f} GeV)"
+            info_html = f"Showing {len(visible)} particles in 3D."
+            
+        else:
+            # --- Tree mode ---
+            gen_map = get_gen_map(sel_pid)
+            
+            # Apply Filters (Energy AND Generation)
+            visible = []
+            for p, gen in gen_map.items():
+                # 1. Energy Check
+                if inclusive_energy[p] < min_e - 1e-5:
+                    continue
+                
+                # 2. Generation Check (if active)
+                # Requirement: text_box_low_limit < show_gen < text_box_hight_limit
+                if gen_active:
+                    if not (g_low < gen < g_high):
+                        continue
+                
+                visible.append(p)
+            
+            display_set = set(visible)
+            
+            cols, sizes, texts = [], [], []
+            n_anc = sum(1 for v in gen_map.values() if v < 0)
+            n_desc = sum(1 for v in gen_map.values() if v > 0)
+
+            for pid in visible:
+                gen = gen_map[pid]
+                par = parent_map.get(pid)
+                par_str = str(par) if par else "Root"
+                
+                pdg = str(pid_to_pdg.get(pid))
+                name = globals().get('PDG_ID_TO_NAME', PDG_NAMES_FALLBACK).get(pdg, pdg)
+                p_self_e = pid_to_self_energy.get(pid, 0.0)
+                
+                texts.append(
+                    f"PID: {pid}, Name: {name}<br>"
+                    f"Parent: {par_str}<br>"
+                    f"Gen: {gen:+d}<br>"
+                    f"E (self): {p_self_e:.4f}<br>"
+                    f"E (dep): {inclusive_energy[pid]:.4f}"
+                )
+                
+                if gen == 0:
+                    cols.append('#D62728') # Red (Selected)
+                    sizes.append(10)
+                elif gen < 0:
+                    cols.append('#1F77B4') # Blue (Ancestors)
+                    sizes.append(6)
+                else:
+                    cols.append('#2CA02C') # Green (Descendants)
+                    sizes.append(6)
+
+            # Line Construction
+            xn, yn, zn = [], [], []
+            xj, yj, zj = [], [], []
+            
+            for pid in visible:
+                par = parent_map.get(pid)
+                # Only draw line if Parent is also visible
+                if par is not None and par in display_set:
+                    p_i, c_i = pid_to_idx[par], pid_to_idx[pid]
+                    gap = abs(gen_map[pid] - gen_map[par])
+                    
+                    coords_x = [all_vx[p_i], all_vx[c_i], None]
+                    coords_y = [all_vy[p_i], all_vy[c_i], None]
+                    coords_z = [all_vz[p_i], all_vz[c_i], None]
+                    
+                    if gap == 1:
+                        xn.extend(coords_x); yn.extend(coords_y); zn.extend(coords_z)
+                    else:
+                        xj.extend(coords_x); yj.extend(coords_y); zj.extend(coords_z)
+
+            pdg_sel = str(pid_to_pdg.get(sel_pid))
+            name_sel = globals().get('PDG_ID_TO_NAME', PDG_NAMES_FALLBACK).get(pdg_sel, pdg_sel)
+
+            title_txt = f"Hierarchy: PID {sel_pid} ({name_sel})"
+            
+            filter_status = f"<br>Generation Filter: {g_low} < gen < {g_high}" if gen_active else ""
+            
+            info_html = f"""
+            <div style="border:1px solid #ccc; padding:8px;">
+                <h3 style="color:#D62728; margin:0;">PID: {sel_pid}</h3>
+                <b>Type:</b> {name_sel} (PDG: {pdg_sel})<br>
+                <b>Self Energy:</b> {pid_to_self_energy.get(sel_pid, 0):.4f} GeV<br>
+                Ancestors: {n_anc} | Descendants: {n_desc}<br>
+                <b>Total E deps in calo (by descendants):</b> {inclusive_energy[sel_pid]:.4f} GeV
+                {filter_status}
+            </div>
+            """
+
+        # B. Batch Update
+        with fig.batch_update():
+            # Update Particles
+            idx_list = [pid_to_idx[p] for p in visible]
+            if idx_list:
+                fig.data[3].x = [all_vx[i] for i in idx_list]
+                fig.data[3].y = [all_vy[i] for i in idx_list]
+                fig.data[3].z = [all_vz[i] for i in idx_list]
+                fig.data[3].marker.color = cols
+                fig.data[3].marker.size = sizes
+                fig.data[3].text = texts
+                fig.data[3].customdata = visible
+            else:
+                fig.data[3].x = []; fig.data[3].y = []; fig.data[3].z = []
+            
+            # Update Lines
+            fig.data[1].x = xn; fig.data[1].y = yn; fig.data[1].z = zn
+            fig.data[2].x = xj; fig.data[2].y = yj; fig.data[2].z = zj
+            
+            # Update Calo
+            if visible:
+                active_cells = set()
+                for p in visible: active_cells.update(pid_to_cells[p])
+                fig.data[0].x = [c_x[i] for i in active_cells]
+                fig.data[0].y = [c_y[i] for i in active_cells]
+                fig.data[0].z = [c_z[i] for i in active_cells]
+            else:
+                fig.data[0].x = []; fig.data[0].y = []; fig.data[0].z = []
+            
+            fig.layout.title = title_txt
+        
+        info_box.value = msg_override if msg_override else info_html
+
+    # --- 5. Handlers ---
+    def on_click(trace, points, selector):
+        if not points.point_inds: return
+        clicked = trace.customdata[points.point_inds[0]]
+        # Toggle selection
+        state['selected_pid'] = None if state['selected_pid'] == clicked else clicked
+        update_view()
+
+    def run_search(_):
+        val = txt_search.value.strip()
+        if not val: return
+        try:
+            target_pid = int(val)
+            if target_pid in pid_set:
+                state['selected_pid'] = target_pid
+                update_view()
+            else:
+                info_box.value = f"<b style='color:red'>PID {target_pid} not found.</b>"
+        except ValueError:
+            info_box.value = "<b style='color:red'>Invalid PID.</b>"
+
+    # Widget Observers
+    fig.data[3].on_click(on_click)
+    
+    # Standard Controls
+    slider_energy.observe(lambda c: (state.update({'min_energy': c['new']}), update_view()), names='value')
+    btn_calo.observe(lambda c: fig.data[0].update(visible=c['new']), names='value')
+    
+    # Generation Filter Controls
+    def toggle_gen_controls(change):
+        is_active = change['new']
+        state['gen_filter_active'] = is_active
+        txt_gen_low.disabled = not is_active
+        txt_gen_high.disabled = not is_active
+        update_view()
+
+    btn_gen_filter.observe(toggle_gen_controls, names='value')
+    txt_gen_low.observe(lambda c: (state.update({'gen_low': c['new']}), update_view()), names='value')
+    txt_gen_high.observe(lambda c: (state.update({'gen_high': c['new']}), update_view()), names='value')
+    
+    # Search Handlers
+    btn_search.on_click(run_search)
+    txt_search.on_submit(run_search)
+
+    update_view()
+    
+    # Return UI organized in rows
+    row1 = widgets.HBox([txt_search, btn_search, btn_calo, slider_energy])
+    row2 = widgets.HBox([btn_gen_filter, txt_gen_low, txt_gen_high])
+    
+    return widgets.VBox([row1, row2, fig, info_box])
