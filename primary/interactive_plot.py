@@ -268,14 +268,13 @@ from collections import defaultdict, deque
 def plot_3d_particle_hierarchy(particles: pl.DataFrame, calo_hits: pl.DataFrame, event_id=0):
     """
     3D Particle Hierarchy Explorer.
-    - Features: Search, Calo Toggle, Energy Slider, Gen Filter, Target Filter.
-    - NEW: Eta Cone Visualization.
-    - NEW: Momentum Lines (Bug-free, colored by momentum).
+    - Updated to include Zoom, View Persistence, and Momentum Filtering.
+    - Fixed Indentation.
     """
     
     # --- 1. Data Loading ---
-    p_data = particles.filter(pl.col('event_id')==event_id)
-    c_data = calo_hits.filter(pl.col('event_id')==event_id)
+    p_data = particles.filter(pl.col('event_id') == event_id)
+    c_data = calo_hits.filter(pl.col('event_id') == event_id)
     
     # Calibration Handling
     try:
@@ -314,7 +313,6 @@ def plot_3d_particle_hierarchy(particles: pl.DataFrame, calo_hits: pl.DataFrame,
 
     # Mappings
     pid_to_pdg = dict(zip(all_pids, all_pdg_ids))
-    pid_to_self_energy = {pid: float(en) for pid, en in zip(all_pids, particle_energies)}
     pid_set = set(all_pids) 
     
     # Parents 
@@ -329,8 +327,10 @@ def plot_3d_particle_hierarchy(particles: pl.DataFrame, calo_hits: pl.DataFrame,
     
     # Momentum Extraction
     def safe_extract(col):
-        try: return p_data[col].explode().to_numpy()
-        except: return np.zeros_like(all_vx)
+        try:
+            return p_data[col].explode().to_numpy()
+        except Exception:
+            return np.zeros_like(all_vx)
     
     all_px = safe_extract("px")
     all_py = safe_extract("py")
@@ -338,9 +338,9 @@ def plot_3d_particle_hierarchy(particles: pl.DataFrame, calo_hits: pl.DataFrame,
     all_p_mag = np.sqrt(all_px**2 + all_py**2 + all_pz**2)
     # Safe mag for normalization
     safe_mag = np.where(all_p_mag == 0, 1.0, all_p_mag)
+    max_p_mag = float(np.max(all_p_mag)) if len(all_p_mag) > 0 else 10.0
 
-    # --- RESTORED CALO DATA EXTRACTION ---
-    # This was missing in the previous traceback causing NameError
+    # Calo Data Extraction
     c_x = c_data["x"].explode().to_numpy()
     c_y = c_data["y"].explode().to_numpy()
     c_z = c_data["z"].explode().to_numpy()
@@ -379,7 +379,8 @@ def plot_3d_particle_hierarchy(particles: pl.DataFrame, calo_hits: pl.DataFrame,
     pid_to_cells = defaultdict(set)
     
     for cell_i, (contribs, energies) in enumerate(zip(c_contrib_ids, c_contrib_enes)):
-        if contribs is None: continue
+        if contribs is None:
+            continue
         for pid, en in zip(contribs, energies):
             pid = int(pid)
             direct_energy[pid] += float(en)
@@ -409,7 +410,9 @@ def plot_3d_particle_hierarchy(particles: pl.DataFrame, calo_hits: pl.DataFrame,
         'target_filter_active': False,
         'eta_viz_active': False,
         'eta_val': 2.5,
-        'mom_viz_active': False 
+        'mom_viz_active': False,
+        'min_mom': 0.0,
+        'zoom_level': 1.0
     }
 
     layout = go.Layout(
@@ -419,7 +422,8 @@ def plot_3d_particle_hierarchy(particles: pl.DataFrame, calo_hits: pl.DataFrame,
             xaxis_title="X (mm)",
             yaxis_title="Y (mm)",
             zaxis_title="Z (mm)",
-            aspectmode='data'
+            aspectmode='data',
+            uirevision='constant_view_id'  # Prevents camera reset
         ),
         hovermode='closest',
         clickmode='event+select',
@@ -443,13 +447,12 @@ def plot_3d_particle_hierarchy(particles: pl.DataFrame, calo_hits: pl.DataFrame,
         name='Particles', hoverinfo='text'
     )
     
-    # MOMENTUM TRACE: Scatter3d Lines (Visible, Colored)
     trace_momentum = go.Scatter3d(
         x=[], y=[], z=[],
         mode='lines',
         line=dict(
             width=5, 
-            color=[], # Will be filled with floats
+            color=[], 
             colorscale='Turbo',
             showscale=True,
             colorbar=dict(title='Mom (GeV)', len=0.5, x=0.9)
@@ -480,6 +483,9 @@ def plot_3d_particle_hierarchy(particles: pl.DataFrame, calo_hits: pl.DataFrame,
     slider_eta = widgets.FloatSlider(value=2.5, min=0.1, max=5.0, step=0.1, description='|Eta|:', layout=widgets.Layout(width='250px'), disabled=True)
     
     btn_show_mom = widgets.ToggleButton(description="Show Mom.", value=False, icon='location-arrow', button_style='success', layout=widgets.Layout(width='120px'))
+    slider_mom_filter = widgets.FloatSlider(value=0, min=0, max=max_p_mag, step=0.1, description='Min Mom:', layout=widgets.Layout(width='250px'), disabled=True)
+
+    slider_zoom = widgets.FloatSlider(value=1.0, min=1.0, max=10.0, step=0.1, description='Zoom:', icon='search-plus', layout=widgets.Layout(width='250px'))
 
     # --- Logic ---
 
@@ -498,7 +504,8 @@ def plot_3d_particle_hierarchy(particles: pl.DataFrame, calo_hits: pl.DataFrame,
         d = 0
         while True:
             par = parent_map.get(curr)
-            if par is None or par in dmap: break
+            if par is None or par in dmap:
+                break
             d -= 1
             dmap[par] = d
             curr = par
@@ -509,17 +516,27 @@ def plot_3d_particle_hierarchy(particles: pl.DataFrame, calo_hits: pl.DataFrame,
         r_max = z_limit * np.tan(theta)
         N = 32
         phi = np.linspace(0, 2*np.pi, N, endpoint=False)
-        x = [0.0]; y = [0.0]; z = [0.0]
-        x.extend(r_max * np.cos(phi)); y.extend(r_max * np.sin(phi)); z.extend([z_limit] * N)
-        x.extend(r_max * np.cos(phi)); y.extend(r_max * np.sin(phi)); z.extend([-z_limit] * N)
+        x = [0.0]
+        y = [0.0]
+        z = [0.0]
+        x.extend(r_max * np.cos(phi))
+        y.extend(r_max * np.sin(phi))
+        z.extend([z_limit] * N)
+        x.extend(r_max * np.cos(phi))
+        y.extend(r_max * np.sin(phi))
+        z.extend([-z_limit] * N)
         i_l, j_l, k_l = [], [], []
         for m in range(1, N+1):
             next_m = m + 1 if m < N else 1
-            i_l.append(0); j_l.append(m); k_l.append(next_m)
+            i_l.append(0)
+            j_l.append(m)
+            k_l.append(next_m)
         offset = N
         for m in range(1, N+1):
             next_m = m + 1 if m < N else 1
-            i_l.append(0); j_l.append(m + offset); k_l.append(next_m + offset)
+            i_l.append(0)
+            j_l.append(m + offset)
+            k_l.append(next_m + offset)
         return x, y, z, i_l, j_l, k_l
 
     PDG_NAMES_FALLBACK = {'11': 'e-', '-11': 'e+', '22': 'gamma', '13': 'mu-', '-13': 'mu+', '211': 'pi+', '-211': 'pi-'}
@@ -533,13 +550,17 @@ def plot_3d_particle_hierarchy(particles: pl.DataFrame, calo_hits: pl.DataFrame,
         eta_active = state['eta_viz_active']
         eta_val = state['eta_val']
         mom_active = state['mom_viz_active']
+        min_mom = state['min_mom']
+        zoom = state['zoom_level']
 
         # A. Filtering
         if sel_pid is None:
             visible = []
             for p in all_pids:
-                if inclusive_energy[p] < min_e - 1e-5: continue
-                if tgt_active and not pid_to_is_target.get(p, False): continue
+                if inclusive_energy[p] < min_e - 1e-5:
+                    continue
+                if tgt_active and not pid_to_is_target.get(p, False):
+                    continue
                 visible.append(p)
             
             cols, sizes, texts = [], [], []
@@ -547,9 +568,11 @@ def plot_3d_particle_hierarchy(particles: pl.DataFrame, calo_hits: pl.DataFrame,
                 pdg = str(pid_to_pdg.get(p))
                 name = globals().get('PDG_ID_TO_NAME', PDG_NAMES_FALLBACK).get(pdg, pdg)
                 if pid_to_is_target.get(p, False):
-                    cols.append('#800080'); sizes.append(6)
+                    cols.append('#800080')
+                    sizes.append(6)
                 else:
-                    cols.append('#dddddd'); sizes.append(4)
+                    cols.append('#dddddd')
+                    sizes.append(4)
                 texts.append(f"PID: {p}<br>Name: {name}<br>E: {inclusive_energy[p]:.4f}")
             
             xn, yn, zn = [], [], []
@@ -561,9 +584,12 @@ def plot_3d_particle_hierarchy(particles: pl.DataFrame, calo_hits: pl.DataFrame,
             gen_map = get_gen_map(sel_pid)
             visible = []
             for p, gen in gen_map.items():
-                if inclusive_energy[p] < min_e - 1e-5: continue
-                if gen_active and not (g_low < gen < g_high): continue
-                if tgt_active and not pid_to_is_target.get(p, False): continue
+                if inclusive_energy[p] < min_e - 1e-5:
+                    continue
+                if gen_active and not (g_low < gen < g_high):
+                    continue
+                if tgt_active and not pid_to_is_target.get(p, False):
+                    continue
                 visible.append(p)
             
             display_set = set(visible)
@@ -579,10 +605,18 @@ def plot_3d_particle_hierarchy(particles: pl.DataFrame, calo_hits: pl.DataFrame,
                 tgt_str = " (TARGET)" if is_tgt else ""
                 texts.append(f"PID: {pid}{tgt_str}<br>Gen: {gen:+d}<br>E: {inclusive_energy[pid]:.4f}")
                 
-                if gen == 0: cols.append('#D62728'); sizes.append(10)
-                elif is_tgt: cols.append('#800080'); sizes.append(7)
-                elif gen < 0: cols.append('#1F77B4'); sizes.append(6)
-                else: cols.append('#2CA02C'); sizes.append(6)
+                if gen == 0:
+                    cols.append('#D62728')
+                    sizes.append(10)
+                elif is_tgt:
+                    cols.append('#800080')
+                    sizes.append(7)
+                elif gen < 0:
+                    cols.append('#1F77B4')
+                    sizes.append(6)
+                else:
+                    cols.append('#2CA02C')
+                    sizes.append(6)
 
             xn, yn, zn = [], [], []
             xj, yj, zj = [], [], []
@@ -596,9 +630,13 @@ def plot_3d_particle_hierarchy(particles: pl.DataFrame, calo_hits: pl.DataFrame,
                               [all_vy[p_i], all_vy[c_i], None], 
                               [all_vz[p_i], all_vz[c_i], None])
                     if gap == 1:
-                        xn.extend(coords[0]); yn.extend(coords[1]); zn.extend(coords[2])
+                        xn.extend(coords[0])
+                        yn.extend(coords[1])
+                        zn.extend(coords[2])
                     else:
-                        xj.extend(coords[0]); yj.extend(coords[1]); zj.extend(coords[2])
+                        xj.extend(coords[0])
+                        yj.extend(coords[1])
+                        zj.extend(coords[2])
 
             pdg_sel = str(pid_to_pdg.get(sel_pid))
             name_sel = globals().get('PDG_ID_TO_NAME', PDG_NAMES_FALLBACK).get(pdg_sel, pdg_sel)
@@ -615,6 +653,12 @@ def plot_3d_particle_hierarchy(particles: pl.DataFrame, calo_hits: pl.DataFrame,
 
         # B. Batch Update
         with fig.batch_update():
+            # Apply Zoom via Axis Range
+            axis_limit = max_coord / zoom
+            fig.layout.scene.xaxis.range = [-axis_limit, axis_limit]
+            fig.layout.scene.yaxis.range = [-axis_limit, axis_limit]
+            fig.layout.scene.zaxis.range = [-axis_limit, axis_limit]
+
             idx_list = [pid_to_idx[p] for p in visible]
             
             # 1. Particles
@@ -627,79 +671,92 @@ def plot_3d_particle_hierarchy(particles: pl.DataFrame, calo_hits: pl.DataFrame,
                 fig.data[3].text = texts
                 fig.data[3].customdata = visible
             else:
-                fig.data[3].x = []; fig.data[3].y = []; fig.data[3].z = []
+                fig.data[3].x = []
+                fig.data[3].y = []
+                fig.data[3].z = []
             
             # 2. Links
-            fig.data[1].x = xn; fig.data[1].y = yn; fig.data[1].z = zn
-            fig.data[2].x = xj; fig.data[2].y = yj; fig.data[2].z = zj
+            fig.data[1].x = xn
+            fig.data[1].y = yn
+            fig.data[1].z = zn
+            fig.data[2].x = xj
+            fig.data[2].y = yj
+            fig.data[2].z = zj
             
             # 3. Calo
             if visible:
                 active_cells = set()
-                for p in visible: active_cells.update(pid_to_cells[p])
+                for p in visible:
+                    active_cells.update(pid_to_cells[p])
                 fig.data[0].x = [c_x[i] for i in active_cells]
                 fig.data[0].y = [c_y[i] for i in active_cells]
                 fig.data[0].z = [c_z[i] for i in active_cells]
             else:
-                fig.data[0].x = []; fig.data[0].y = []; fig.data[0].z = []
+                fig.data[0].x = []
+                fig.data[0].y = []
+                fig.data[0].z = []
 
-            # 4. Momentum Lines (FIXED: Disjoint Lines with Valid Colors)
+            # 4. Momentum Lines (With Filter)
             if mom_active and idx_list:
-                sub_px = all_px[idx_list]
-                sub_py = all_py[idx_list]
-                sub_pz = all_pz[idx_list]
-                sub_mag = all_p_mag[idx_list]
-                sub_safe = safe_mag[idx_list]
+                # Filter visible particles by Momentum Magnitude
+                idx_filtered = [i for i in idx_list if all_p_mag[i] >= min_mom]
                 
-                # Origins
-                vx = all_vx[idx_list]
-                vy = all_vy[idx_list]
-                vz = all_vz[idx_list]
-                
-                # Tips
-                tx = vx + (sub_px / sub_safe) * ARROW_LEN
-                ty = vy + (sub_py / sub_safe) * ARROW_LEN
-                tz = vz + (sub_pz / sub_safe) * ARROW_LEN
-                
-                n_points = len(idx_list)
-                
-                # Interleaved Geometry: Start, End, None
-                combined_x = np.empty(n_points * 3, dtype=object)
-                combined_x[0::3] = vx
-                combined_x[1::3] = tx
-                combined_x[2::3] = None
-                
-                combined_y = np.empty(n_points * 3, dtype=object)
-                combined_y[0::3] = vy
-                combined_y[1::3] = ty
-                combined_y[2::3] = None
-                
-                combined_z = np.empty(n_points * 3, dtype=object)
-                combined_z[0::3] = vz
-                combined_z[1::3] = tz
-                combined_z[2::3] = None
-                
-                # Colors: Start, End, GAP (Use valid numeric value for gap to satisfy validator)
-                combined_c = np.empty(n_points * 3, dtype=np.float64)
-                combined_c[0::3] = sub_mag
-                combined_c[1::3] = sub_mag
-                # The validator forces numeric type, but since geom is None, this isn't drawn.
-                # Repeating sub_mag is safe.
-                combined_c[2::3] = sub_mag 
-                
-                fig.data[4].x = combined_x
-                fig.data[4].y = combined_y
-                fig.data[4].z = combined_z
-                fig.data[4].line.color = combined_c
-                fig.data[4].visible = True
+                if idx_filtered:
+                    sub_px = all_px[idx_filtered]
+                    sub_py = all_py[idx_filtered]
+                    sub_pz = all_pz[idx_filtered]
+                    sub_mag = all_p_mag[idx_filtered]
+                    sub_safe = safe_mag[idx_filtered]
+                    
+                    vx = all_vx[idx_filtered]
+                    vy = all_vy[idx_filtered]
+                    vz = all_vz[idx_filtered]
+                    
+                    tx = vx + (sub_px / sub_safe) * ARROW_LEN
+                    ty = vy + (sub_py / sub_safe) * ARROW_LEN
+                    tz = vz + (sub_pz / sub_safe) * ARROW_LEN
+                    
+                    n_points = len(idx_filtered)
+                    
+                    combined_x = np.empty(n_points * 3, dtype=object)
+                    combined_x[0::3] = vx
+                    combined_x[1::3] = tx
+                    combined_x[2::3] = None
+                    
+                    combined_y = np.empty(n_points * 3, dtype=object)
+                    combined_y[0::3] = vy
+                    combined_y[1::3] = ty
+                    combined_y[2::3] = None
+                    
+                    combined_z = np.empty(n_points * 3, dtype=object)
+                    combined_z[0::3] = vz
+                    combined_z[1::3] = tz
+                    combined_z[2::3] = None
+                    
+                    combined_c = np.empty(n_points * 3, dtype=np.float64)
+                    combined_c[0::3] = sub_mag
+                    combined_c[1::3] = sub_mag
+                    combined_c[2::3] = sub_mag
+                    
+                    fig.data[4].x = combined_x
+                    fig.data[4].y = combined_y
+                    fig.data[4].z = combined_z
+                    fig.data[4].line.color = combined_c
+                    fig.data[4].visible = True
+                else:
+                    fig.data[4].visible = False
             else:
                 fig.data[4].visible = False
 
             # 5. Eta Cones
             if eta_active:
                 ex, ey, ez, ei, ej, ek = generate_cone_mesh(eta_val, max_coord * 1.1)
-                fig.data[5].x = ex; fig.data[5].y = ey; fig.data[5].z = ez
-                fig.data[5].i = ei; fig.data[5].j = ej; fig.data[5].k = ek
+                fig.data[5].x = ex
+                fig.data[5].y = ey
+                fig.data[5].z = ez
+                fig.data[5].i = ei
+                fig.data[5].j = ej
+                fig.data[5].k = ek
                 fig.data[5].visible = True
             else:
                 fig.data[5].visible = False
@@ -710,14 +767,16 @@ def plot_3d_particle_hierarchy(particles: pl.DataFrame, calo_hits: pl.DataFrame,
 
     # --- Handlers ---
     def on_click(trace, points, selector):
-        if not points.point_inds: return
+        if not points.point_inds:
+            return
         clicked = trace.customdata[points.point_inds[0]]
         state['selected_pid'] = None if state['selected_pid'] == clicked else clicked
         update_view()
 
     def run_search(_):
         val = txt_search.value.strip()
-        if not val: return
+        if not val:
+            return
         try:
             target_pid = int(val)
             if target_pid in pid_set:
@@ -738,6 +797,7 @@ def plot_3d_particle_hierarchy(particles: pl.DataFrame, calo_hits: pl.DataFrame,
         txt_gen_low.disabled = not change['new']
         txt_gen_high.disabled = not change['new']
         update_view()
+
     btn_gen_filter.observe(toggle_gen, names='value')
     txt_gen_low.observe(lambda c: (state.update({'gen_low': c['new']}), update_view()), names='value')
     txt_gen_high.observe(lambda c: (state.update({'gen_high': c['new']}), update_view()), names='value')
@@ -746,13 +806,20 @@ def plot_3d_particle_hierarchy(particles: pl.DataFrame, calo_hits: pl.DataFrame,
         state['eta_viz_active'] = change['new']
         slider_eta.disabled = not change['new']
         update_view()
+
     btn_show_eta.observe(toggle_eta, names='value')
     slider_eta.observe(lambda c: (state.update({'eta_val': c['new']}), update_view()), names='value')
     
     def toggle_mom(change):
         state['mom_viz_active'] = change['new']
+        slider_mom_filter.disabled = not change['new']
         update_view()
+
     btn_show_mom.observe(toggle_mom, names='value')
+    
+    # New Sliders Listeners
+    slider_mom_filter.observe(lambda c: (state.update({'min_mom': c['new']}), update_view()), names='value')
+    slider_zoom.observe(lambda c: (state.update({'zoom_level': c['new']}), update_view()), names='value')
 
     btn_search.on_click(run_search)
     txt_search.on_submit(run_search)
@@ -761,6 +828,7 @@ def plot_3d_particle_hierarchy(particles: pl.DataFrame, calo_hits: pl.DataFrame,
     
     row1 = widgets.HBox([txt_search, btn_search, btn_calo, slider_energy])
     row2 = widgets.HBox([btn_target_filter, btn_gen_filter, txt_gen_low, txt_gen_high])
-    row3 = widgets.HBox([btn_show_eta, slider_eta, btn_show_mom]) 
+    row3 = widgets.HBox([btn_show_eta, slider_eta, btn_show_mom, slider_mom_filter])
+    row4 = widgets.HBox([slider_zoom])
     
-    return widgets.VBox([row1, row2, row3, fig, info_box])
+    return widgets.VBox([row1, row2, row3, row4, fig, info_box])
