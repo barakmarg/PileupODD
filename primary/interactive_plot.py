@@ -259,17 +259,13 @@ def plot_calo_clusters_3d(calo_hits: pl.DataFrame,
     if show:
         fig.show()
 # -----------------------------------------------------------------------------
-import plotly.graph_objects as go
-import ipywidgets as widgets
-import polars as pl
-import numpy as np
-from collections import defaultdict, deque
+
 
 def plot_3d_particle_hierarchy(particles: pl.DataFrame, calo_hits: pl.DataFrame, event_id=0):
     """
     3D Particle Hierarchy Explorer.
-    - Updated to include Zoom, View Persistence, and Momentum Filtering.
-    - Fixed Indentation.
+    - Updated: Initial Zoom = 20x, Max Zoom = 200x.
+    - Fixed: Eta cones do not stretch view.
     """
     
     # --- 1. Data Loading ---
@@ -353,7 +349,7 @@ def plot_3d_particle_hierarchy(particles: pl.DataFrame, calo_hits: pl.DataFrame,
         max_coord = max(max_coord, float(np.max(np.abs(c_z))))
         
     # FIXED ARROW LENGTH (5% of scene)
-    ARROW_LEN = max(5.0, max_coord * 0.05)
+    ARROW_LEN = max(0.50, max_coord * 0.05)
 
     # Target Mapping
     target_mask = p_data["is_target_particle"].explode().to_numpy()
@@ -401,6 +397,7 @@ def plot_3d_particle_hierarchy(particles: pl.DataFrame, calo_hits: pl.DataFrame,
     max_e = max(inclusive_energy.values()) if inclusive_energy else 10.0
 
     # --- 3. Visualization Setup ---
+    # CHANGED: Initial zoom level set to 20.0
     state = {
         'selected_pid': None, 
         'min_energy': 0.0,
@@ -412,7 +409,7 @@ def plot_3d_particle_hierarchy(particles: pl.DataFrame, calo_hits: pl.DataFrame,
         'eta_val': 2.5,
         'mom_viz_active': False,
         'min_mom': 0.0,
-        'zoom_level': 1.0
+        'zoom_level': 20.0  # Initial State
     }
 
     layout = go.Layout(
@@ -422,7 +419,10 @@ def plot_3d_particle_hierarchy(particles: pl.DataFrame, calo_hits: pl.DataFrame,
             xaxis_title="X (mm)",
             yaxis_title="Y (mm)",
             zaxis_title="Z (mm)",
-            aspectmode='data',
+            # FIXED: 'data' -> 'manual' to prevent reshaping when cones appear
+            aspectmode='manual', 
+            # FIXED: Forces 1:1:1 geometric scaling regardless of data limits
+            aspectratio=dict(x=1, y=1, z=1),
             uirevision='constant_view_id'  # Prevents camera reset
         ),
         hovermode='closest',
@@ -485,7 +485,18 @@ def plot_3d_particle_hierarchy(particles: pl.DataFrame, calo_hits: pl.DataFrame,
     btn_show_mom = widgets.ToggleButton(description="Show Mom.", value=False, icon='location-arrow', button_style='success', layout=widgets.Layout(width='120px'))
     slider_mom_filter = widgets.FloatSlider(value=0, min=0, max=max_p_mag, step=0.1, description='Min Mom:', layout=widgets.Layout(width='250px'), disabled=True)
 
-    slider_zoom = widgets.FloatSlider(value=1.0, min=1.0, max=10.0, step=0.1, description='Zoom:', icon='search-plus', layout=widgets.Layout(width='250px'))
+    # =========================================================
+    # CHANGED: Initial=20.0, Max=200.0
+    # =========================================================
+    slider_zoom = widgets.FloatSlider(
+        value=20.0,     # Initial Value
+        min=1.0, 
+        max=200.0,      # Max Value
+        step=0.1, 
+        description='Zoom:', 
+        icon='search-plus', 
+        layout=widgets.Layout(width='250px')
+    )
 
     # --- Logic ---
 
