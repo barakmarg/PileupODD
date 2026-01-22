@@ -17,6 +17,7 @@ import numpy as np
 import plotly.graph_objects as go
 import ipywidgets as widgets
 from collections import defaultdict, deque
+from IPython.display import display
 
 # -----------------------------------------------------------------------------
 # Helper: Data Prep (Same as before)
@@ -854,6 +855,9 @@ def target_vs_truth_particles(particles):
     from matplotlib.colors import LogNorm
     from primary.pdg_mappings import PDG_ID_TO_NAME
     from primary.preprocessing import backtrack_to_target
+    
+    # 1. PREPARE DATA
+    # ------------------------------------------------
     target_p = (
         particles.lazy()
         .select(['event_id', 'particle_id', 'is_target_particle'])
@@ -870,9 +874,6 @@ def target_vs_truth_particles(particles):
     )
     mappings = backtrack_to_target(particles=particles, src_df=target_p, target_df=truth_p).rename({'src_particle_id':'target_particle_id','target_particle_id':'truth_particle_id'})
         
-    # 1. PREPARE DATA
-    # ------------------------------------------------
-    # (Assuming 'combined' and 'PDG_ID_TO_NAME' are defined)
     combined = (
         particles.lazy()
         .select(['event_id', 'particle_id', 'pt', 'eta', 'energy'])
@@ -898,7 +899,6 @@ def target_vs_truth_particles(particles):
             (pl.col('total_target_energy') / pl.col('energy')).alias('energy_ratio')
         ])).collect()
     
-    # Aggregate stats for the Bar Chart
     pdg_stats = (
         combined.lazy()
         .group_by("pdg_id")
@@ -912,63 +912,43 @@ def target_vs_truth_particles(particles):
         .collect()
     )
 
-    # Convert to simple list/pandas for easier indexing in the callback
-    # DF for Pt Ratios
+    # Prepare Bar Chart Data
     df_bar = pdg_stats.sort("avg_pt_ratio", descending=False).head(40).to_pandas()
     df_bar['name'] = df_bar['pdg_id'].map(lambda x: PDG_ID_TO_NAME.get(str(x), PDG_ID_TO_NAME.get(int(x), "Unknown")))
     df_bar['label'] = df_bar['name'] + " (" + df_bar['pdg_id'].astype(str) + ")"
 
-    # DF for Energy Ratios
     df_bar_en = pdg_stats.sort("avg_energy_ratio", descending=False).head(40).to_pandas()
     df_bar_en['name'] = df_bar_en['pdg_id'].map(lambda x: PDG_ID_TO_NAME.get(str(x), PDG_ID_TO_NAME.get(int(x), "Unknown")))
     df_bar_en['label'] = df_bar_en['name'] + " (" + df_bar_en['pdg_id'].astype(str) + ")"
 
-    # 2. CREATE FIGURES (Using FigureWidget)
+    # 2. CREATE FIGURES
     # ------------------------------------------------
 
     # -- Main Bar Chart Sum Pt --
     f_bar = go.FigureWidget(
-        data=[
-            go.Bar(
-                x=df_bar['label'],
-                y=df_bar['avg_pt_ratio'],
-                marker=dict(color=df_bar['avg_pt_ratio'], colorscale='Viridis'),
-                customdata=np.stack((df_bar['pdg_id'], df_bar['total_energy']), axis=-1), # Store PDG ID and Energy
-                hovertemplate="<b>%{x}</b><br>Avg Pt Ratio: %{y:.3f}<br>Count: %{text}<br>Total Energy: %{customdata[1]:.2e}<extra></extra>",
-                text=df_bar['count'],
-            )
-        ],
-        layout=go.Layout(
-            title="Top 20 Worst Pt Ratios (Click bars to drill down)",
-            xaxis_title="Particle",
-            yaxis_title="Avg Pt Ratio",
-            margin=dict(l=40, r=40, t=40, b=80),
-            height=400
-        )
+        data=[go.Bar(
+            x=df_bar['label'], y=df_bar['avg_pt_ratio'],
+            marker=dict(color=df_bar['avg_pt_ratio'], colorscale='Viridis'),
+            customdata=np.stack((df_bar['pdg_id'], df_bar['total_energy']), axis=-1),
+            hovertemplate="<b>%{x}</b><br>Avg Pt Ratio: %{y:.3f}<br>Count: %{text}<br>Total Energy: %{customdata[1]:.2e}<extra></extra>",
+            text=df_bar['count'],
+        )],
+        layout=go.Layout(title="Top 20 Worst Pt Ratios", xaxis_title="Particle", yaxis_title="Avg Pt Ratio", height=400, margin=dict(l=40, r=40, t=40, b=80))
     )
 
     # -- Main Bar Chart Energy --
     f_bar_en_widget = go.FigureWidget(
-        data=[
-            go.Bar(
-                x=df_bar_en['label'],
-                y=df_bar_en['avg_energy_ratio'],
-                marker=dict(color=df_bar_en['avg_energy_ratio'], colorscale='Viridis'),
-                customdata=np.stack((df_bar_en['pdg_id'], df_bar_en['total_energy']), axis=-1), # Store PDG ID and Energy
-                hovertemplate="<b>%{x}</b><br>Avg Energy Ratio: %{y:.3f}<br>Count: %{text}<br>Total Energy: %{customdata[1]:.2e}<extra></extra>",
-                text=df_bar_en['count'],
-            )
-        ],
-        layout=go.Layout(
-            title="Top 20 Worst Energy Ratios (Click bars to drill down)",
-            xaxis_title="Particle",
-            yaxis_title="Avg Energy Ratio",
-            margin=dict(l=40, r=40, t=40, b=80),
-            height=400
-        )
+        data=[go.Bar(
+            x=df_bar_en['label'], y=df_bar_en['avg_energy_ratio'],
+            marker=dict(color=df_bar_en['avg_energy_ratio'], colorscale='Viridis'),
+            customdata=np.stack((df_bar_en['pdg_id'], df_bar_en['total_energy']), axis=-1),
+            hovertemplate="<b>%{x}</b><br>Avg Energy Ratio: %{y:.3f}<br>Count: %{text}<br>Total Energy: %{customdata[1]:.2e}<extra></extra>",
+            text=df_bar_en['count'],
+        )],
+        layout=go.Layout(title="Top 20 Worst Energy Ratios", xaxis_title="Particle", yaxis_title="Avg Energy Ratio", height=400, margin=dict(l=40, r=40, t=40, b=80))
     )
 
-    # -- Detail Histograms (Initially Empty) --
+    # -- Detail Histograms (Distributions) --
     f_pt = go.FigureWidget(
         data=[go.Histogram(x=[], name="Pt", marker_color='#636EFA')],
         layout=go.Layout(title="Pt Distribution", height=300, margin=dict(l=40, r=40, t=40, b=40), yaxis_type='log')
@@ -977,18 +957,38 @@ def target_vs_truth_particles(particles):
         data=[go.Histogram(x=[], name="Energy", marker_color='#EF553B')],
         layout=go.Layout(title="Energy Distribution", height=300, margin=dict(l=40, r=40, t=40, b=40), yaxis_type='log')
     )
-    f_ratio = Output()
-    f_en_ratio = Output()
 
+    # -- Detail Histograms (Ratios) -- 
+    # CHANGED: These are now FigureWidgets instead of Output widgets
+    f_ratio = go.FigureWidget(
+        data=[go.Histogram(
+            x=[], name="Pt Ratio", marker_color='blue', opacity=0.7,
+            xbins=dict(start=0, end=2.05, size=0.05) # Pre-define bins here
+        )],
+        layout=go.Layout(
+            title="Pt Ratio", xaxis_title="Target PT / Truth PT", yaxis_title="Events",
+            height=300, margin=dict(l=40, r=40, t=40, b=40)
+        )
+    )
+    f_en_ratio = go.FigureWidget(
+        data=[go.Histogram(
+            x=[], name="Energy Ratio", marker_color='red', opacity=0.7,
+            xbins=dict(start=0, end=2.05, size=0.05)
+        )],
+        layout=go.Layout(
+            title="Energy Ratio", xaxis_title="Target Energy / Truth Energy", yaxis_title="Events",
+            height=300, margin=dict(l=40, r=40, t=40, b=40)
+        )
+    )
+
+    # -- 2D Matplotlib Plots (Still need Output widgets for Matplotlib) --
     f_pt2d = Output()
     f_en2d = Output()
-
 
     # 3. DEFINE CLICK CALLBACK
     # ------------------------------------------------
     def update_graphs_generic(selected_pdg, particle_name):
-        # Filter Data (using Polars)
-        # Note: We filter the original 'combined' frame here
+        # Filter Data
         subset = (
             combined.lazy()
             .filter(pl.col("pdg_id") == selected_pdg)
@@ -996,126 +996,80 @@ def target_vs_truth_particles(particles):
             .collect()
         )
 
-        # Calculate Sums
         sum_truth_energy = subset["energy"].sum()
         sum_target_energy = subset["total_target_energy"].sum()
 
-        # Update Titles to show what we are looking at
-        f_pt.layout.title.text = f"Pt Distribution: {particle_name} ({selected_pdg})"
-        f_en.layout.title.text = f"Energy Dist: {particle_name} ({selected_pdg}) | Sum Truth: {sum_truth_energy:.1f}, Sum Target: {sum_target_energy:.1f}"
+        # Update Distribution Widgets (Batch animate for smoothness)
+        f_pt.layout.title.text = f"Pt Dist: {particle_name}"
+        f_en.layout.title.text = f"Energy Dist: {particle_name} | Truth: {sum_truth_energy:.1e}"
 
-        # Update the data in the existing histogram widgets
-        # batch_animate=True prevents flickering
         with f_pt.batch_animate():
             f_pt.data[0].x = subset["truth_pt"]
             
         with f_en.batch_animate():
             f_en.data[0].x = subset["energy"]
 
-        # Calculate statistics for ratio plot
-        ratio = subset["pt_ratio"].to_numpy()
-        mean_ratio = np.mean(ratio)
-        std_ratio = np.std(ratio)
-        n_events = len(ratio)
+        # Update Ratio Widgets (Batch animate for smoothness - NO display() calls)
+        pt_ratios = subset["pt_ratio"].to_numpy()
+        en_ratios = subset["energy_ratio"].to_numpy()
         
-        with f_ratio:
-            f_ratio.clear_output(wait=True)
-            plt.figure(figsize=(5, 3.5)) # Reduced size to fit better in HBox
-            bins = np.arange(0, 2.05, 0.05)
-            plt.hist(ratio, bins=bins, range=(0, 2), color='blue', edgecolor='black', alpha=0.7)
-            plt.title(f"Pt Ratio: {particle_name}\nMean: {mean_ratio:.2f}, Std: {std_ratio:.2f}, N: {n_events}, bins=np.arange(0, 2.05, 0.05)", fontsize=9)
-            plt.xlabel("Target PT / Truth PT")
-            plt.ylabel("Number of Events")
-            plt.tight_layout()
-            plt.show()
+        f_ratio.layout.title.text = f"Pt Ratio: {particle_name} (Mean: {np.mean(pt_ratios):.2f})"
+        f_en_ratio.layout.title.text = f"Energy Ratio: {particle_name} (Mean: {np.mean(en_ratios):.2f})"
 
-        # Calculate statistics for ratio plot
-        ratio = subset["energy_ratio"].to_numpy()
-        mean_ratio = np.mean(ratio)
-        std_ratio = np.std(ratio)
-        n_events = len(ratio)
+        with f_ratio.batch_animate():
+            f_ratio.data[0].x = pt_ratios
+            
+        with f_en_ratio.batch_animate():
+            f_en_ratio.data[0].x = en_ratios
         
-        with f_en_ratio:
-            f_en_ratio.clear_output(wait=True)
-            plt.figure(figsize=(5, 3.5)) # Reduced size to fit better in HBox
-            bins = np.arange(0, 2.05, 0.05)
-            plt.hist(ratio, bins=bins, range=(0, 2), color='blue', edgecolor='black', alpha=0.7)
-            plt.title(f"Energy Ratio: {particle_name}\nMean: {mean_ratio:.2f}, Std: {std_ratio:.2f}, N: {n_events}, bins=np.arange(0, 2.05, 0.05)", fontsize=9)
-            plt.xlabel("Target Energy / Truth Energy")
-            plt.ylabel("Number of Events")
-            plt.tight_layout()
-            plt.show()
-        
-        # Create matplotlib 2D histograms
+        # Update 2D Histograms (Matplotlib requires recreating the plot)
         with f_pt2d:
             f_pt2d.clear_output(wait=True)
             x = subset['truth_pt'].to_numpy()
             y = subset['total_target_pt'].to_numpy()
             max_val = max(np.max(x), np.max(y)) * 1.05
-            plt.figure(figsize=(8, 6))
+            plt.figure(figsize=(6, 5))
             h = plt.hist2d(x, y, bins=100, range=[[0, max_val], [0, max_val]], 
                             cmap='viridis', norm=LogNorm(), cmin=1)
-            cbar = plt.colorbar(h[3])
-            cbar.set_label('Number of Truth Particles')
-            plt.plot([0, max_val], [0, max_val], 'g--', linewidth=1.5, label='Ideal (y=x)')
-            plt.plot([0, max_val], [0, 0.9 * max_val], 'o--', linewidth=1.5, label='y=0.9x')
-            plt.plot([0, max_val], [0, 0.7 * max_val], 'r--', linewidth=1.5, label='y=0.7x')
-            plt.xlabel("Truth PT")
-            plt.ylabel("Total Target PT")
-            plt.title(f"Truth PT vs Total Target PT: {particle_name} ({selected_pdg})")
-            plt.legend()
-            plt.grid(True, alpha=0.3)
-            plt.show()
+            plt.colorbar(h[3], label='Count')
+            plt.plot([0, max_val], [0, max_val], 'g--', label='y=x')
+            plt.xlabel("Truth PT"); plt.ylabel("Target PT")
+            plt.title(f"Truth vs Target PT: {particle_name}")
+            plt.grid(True, alpha=0.3); plt.show()
         
         with f_en2d:
             f_en2d.clear_output(wait=True)
             x = subset['energy'].to_numpy()
             y = subset['total_target_energy'].to_numpy()
             max_val = max(np.max(x), np.max(y)) * 1.05
-            plt.figure(figsize=(8, 6))
+            plt.figure(figsize=(6, 5))
             h = plt.hist2d(x, y, bins=100, range=[[0, max_val], [0, max_val]], 
                             cmap='viridis', norm=LogNorm(), cmin=1)
-            cbar = plt.colorbar(h[3])
-            cbar.set_label('Number of Truth Particles')
-            plt.plot([0, max_val], [0, max_val], 'g--', linewidth=1.5, label='Ideal (y=x)')
-            plt.plot([0, max_val], [0, 0.9 * max_val], 'o--', linewidth=1.5, label='y=0.9x')
-            plt.plot([0, max_val], [0, 0.7 * max_val], 'r--', linewidth=1.5, label='y=0.7x')
-            plt.xlabel("Truth Energy")
-            plt.ylabel("Total Target Energy")
-            plt.title(f"Truth Energy vs Total Target Energy: {particle_name} ({selected_pdg})")
-            plt.legend()
-            plt.grid(True, alpha=0.3)
-            plt.show()
+            plt.colorbar(h[3], label='Count')
+            plt.plot([0, max_val], [0, max_val], 'g--', label='y=x')
+            plt.xlabel("Truth Energy"); plt.ylabel("Target Energy")
+            plt.title(f"Truth vs Target Energy: {particle_name}")
+            plt.grid(True, alpha=0.3); plt.show()
 
     def update_graphs_pt(trace, points, selector):
         if not points.point_inds: return
         idx = points.point_inds[0]
-        selected_pdg = trace.customdata[idx][0]
-        particle_name = df_bar.iloc[idx]['name']
-        update_graphs_generic(selected_pdg, particle_name)
+        update_graphs_generic(trace.customdata[idx][0], df_bar.iloc[idx]['name'])
 
     def update_graphs_en(trace, points, selector):
         if not points.point_inds: return
         idx = points.point_inds[0]
-        selected_pdg = trace.customdata[idx][0]
-        particle_name = df_bar_en.iloc[idx]['name']
-        update_graphs_generic(selected_pdg, particle_name)
+        update_graphs_generic(trace.customdata[idx][0], df_bar_en.iloc[idx]['name'])
 
-    # Link the callback to the bar chart
     f_bar.data[0].on_click(update_graphs_pt)
     f_bar_en_widget.data[0].on_click(update_graphs_en)
 
-
     # 4. DISPLAY
     # ------------------------------------------------
-    # Use IPyWidgets to arrange them
-    ui = VBox([
+    return VBox([
         f_bar,
         f_bar_en_widget,
-        HBox([f_ratio, f_en_ratio]),
+        HBox([f_ratio, f_en_ratio]), # These are now FigureWidgets
         HBox([f_pt, f_en]),
         HBox([f_pt2d, f_en2d])
     ])
-
-    # Just display the variable 'ui' in the notebook
-    return ui

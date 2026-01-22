@@ -2156,8 +2156,9 @@ def set_target_particles_maskv2(
 
 def set_target_particles_maskv3(
     particles: pl.DataFrame, 
-    eta_cut: float = 3.5,
-    pt_cut: float = 1.0
+    truth_eta_cut: float = 3.0,
+    truth_pt_cut: float = 1.0,
+    target_pt_cut: float = 0.2
     ) -> pl.DataFrame:
     """
     Adds a boolean mask 'is_target_particle' to the particles DataFrame.
@@ -2191,7 +2192,6 @@ def set_target_particles_maskv3(
         .filter(
             pl.col("ancestor_with_track_id").is_null() | pl.col('has_track')
         )
-        #.filter((pl.col('pt') > pt_cut) & (pl.col('eta').abs() < eta_cut))
         .select(['event_id', 'particle_id', 'has_track'])
         .unique()
     ).collect(streaming=True)
@@ -2239,8 +2239,8 @@ def set_target_particles_maskv3(
                         how='inner',
                     )
                     .filter(
-                        (pl.col('pt_truth') > pt_cut) & (pl.col('pt_target') > pt_cut / 3) &
-                        (pl.col('eta_truth').abs() < eta_cut)
+                        (pl.col('pt_truth') > truth_pt_cut) & (pl.col('pt_target') > target_pt_cut) &
+                        (pl.col('eta_truth').abs() < truth_eta_cut)
                     )
                     .select(['event_id', 'target_particle_id'])
                     .unique()
@@ -2254,8 +2254,8 @@ def set_target_particles_maskv3(
         .explode('particle_id','is_parent_missing', 'eta', 'pt', 'pdg_id')
         .filter(pl.col('is_parent_missing') 
                 & (pl.col('pdg_id').abs() != 12) & (pl.col('pdg_id').abs() != 14) & (pl.col('pdg_id').abs() != 16)
-                & (pl.col('eta').abs() < eta_cut)
-                & (pl.col('pt') > pt_cut)
+                & (pl.col('eta').abs() < truth_eta_cut)
+                & (pl.col('pt') > truth_pt_cut)
                 )
         .select(['event_id', 'particle_id'])
         .with_columns(pl.lit(True).alias('is_truth_particle'))
