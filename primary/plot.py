@@ -513,15 +513,13 @@ def plot_num_contributing_ancestors(
     plt.show()
     return cluster_stats
 
-def histogram_ht_ratio(particles: pl.DataFrame, eta_cut:float, pt_cut:float)-> pl.DataFrame:
+def histogram_ht_ratio(particles: pl.DataFrame)-> pl.DataFrame:
     # sum pt of target particles within eta cut, pt cut
     ht_target = (
     particles.lazy()
     .select(['event_id', 'particle_id','pt', 'eta', 'is_target_particle', 'pdg_id'])
     .explode(['particle_id','pt', 'eta', 'is_target_particle', 'pdg_id'])
-    .filter((pl.col('is_target_particle') &
-            (pl.col('eta').abs() < eta_cut) &
-            (pl.col('pt') > pt_cut) ) &
+    .filter((pl.col('is_target_particle') ) &
             # filter out neutrinos
              ((pl.col('pdg_id').abs() != 12) & (pl.col('pdg_id').abs() != 14) & (pl.col('pdg_id').abs() != 16) )
             )
@@ -531,12 +529,11 @@ def histogram_ht_ratio(particles: pl.DataFrame, eta_cut:float, pt_cut:float)-> p
 
     ht_truth =(
     particles.lazy()
-    .select(['event_id', 'particle_id','pt', 'eta', 'is_parent_missing', 'pdg_id'])
-    .explode(['particle_id','pt', 'eta', 'is_parent_missing', 'pdg_id'])
-    .filter((pl.col('is_parent_missing') &
-            (pl.col('eta').abs() < eta_cut) &
-            (pl.col('pt') > pt_cut) )&
-               ((pl.col('pdg_id').abs() != 12) & (pl.col('pdg_id').abs() != 14) & (pl.col('pdg_id').abs() != 16) ))
+    .select(['event_id', 'particle_id','pt', 'eta', 'is_truth_particle', 'pdg_id'])
+    .explode(['particle_id','pt', 'eta', 'is_truth_particle', 'pdg_id'])
+    .filter((pl.col('is_truth_particle')) &
+               ((pl.col('pdg_id').abs() != 12) & (pl.col('pdg_id').abs() != 14) & (pl.col('pdg_id').abs() != 16) )
+               )
     .group_by('event_id')
     .agg(pl.col('pt').sum().alias('ht_truth'))
     )
@@ -559,8 +556,56 @@ def histogram_ht_ratio(particles: pl.DataFrame, eta_cut:float, pt_cut:float)-> p
 
     plt.figure(figsize=(10, 6))
     plt.hist(ratio, bins=50, range=(0, 2), color='blue', edgecolor='black', alpha=0.7)
-    plt.title(f"Ratio of Target HT / Truth HT (eta_cut={eta_cut}, pt_cut={pt_cut}) - Mean: {mean_ratio:.2f}, Std: {std_ratio:.2f}, N: {n_events}")
+    plt.title(f"Ratio of Target HT / Truth HT - Mean: {mean_ratio:.2f}, Std: {std_ratio:.2f}, N: {n_events}")
     plt.xlabel("HT Target / HT Truth")
+    plt.ylabel("Number of Events") 
+    return ht_combined
+
+def histogram_energy_ratio(particles: pl.DataFrame)-> pl.DataFrame:
+    # sum pt of target particles within eta cut, pt cut
+    ht_target = (
+    particles.lazy()
+    .select(['event_id', 'particle_id','energy', 'eta', 'is_target_particle', 'pdg_id'])
+    .explode(['particle_id','energy', 'eta', 'is_target_particle', 'pdg_id'])
+    .filter((pl.col('is_target_particle') ) &
+            # filter out neutrinos
+             ((pl.col('pdg_id').abs() != 12) & (pl.col('pdg_id').abs() != 14) & (pl.col('pdg_id').abs() != 16) )
+            )
+    .group_by('event_id')
+    .agg(pl.col('energy').sum().alias('energy_target'))
+    )
+
+    ht_truth =(
+    particles.lazy()
+    .select(['event_id', 'particle_id','energy', 'eta', 'is_truth_particle', 'pdg_id'])
+    .explode(['particle_id','energy', 'eta', 'is_truth_particle', 'pdg_id'])
+    .filter((pl.col('is_truth_particle')) &
+               ((pl.col('pdg_id').abs() != 12) & (pl.col('pdg_id').abs() != 14) & (pl.col('pdg_id').abs() != 16) )
+               )
+    .group_by('event_id')
+    .agg(pl.col('energy').sum().alias('energy_truth'))
+    )
+    ht_combined = ht_target.join(ht_truth, on='event_id', how='inner').collect(streaming=True)
+
+    import matplotlib.pyplot as plt
+    import numpy as np
+
+    # Convert to numpy for plotting
+    x = ht_combined['energy_truth'].to_numpy()
+    y = ht_combined['energy_target'].to_numpy()
+    # Calculate ratio
+    ratio = np.divide(y, x, out=np.zeros_like(y), where=x!=0)
+
+    # Calculate statistics
+    mean_ratio = np.mean(ratio)
+    std_ratio = np.std(ratio)
+    n_events = len(ratio)
+
+    plt.figure(figsize=(10, 6))
+    bins = np.arange(0, 2.05, 0.05)
+    plt.hist(ratio, bins=bins, color='blue', edgecolor='black', alpha=0.7)
+    plt.title(f"Ratio of Target Sum Energy / Truth Sum Energy - Mean: {mean_ratio:.2f}, Std: {std_ratio:.2f}, N: {n_events}, bins=np.arange(0, 2.05, 0.05)")
+    plt.xlabel("Energy Target / Energy Truth")
     plt.ylabel("Number of Events") 
     return ht_combined
 

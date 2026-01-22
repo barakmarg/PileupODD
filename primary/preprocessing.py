@@ -2154,6 +2154,173 @@ def set_target_particles_maskv2(
     )
 
 
+def set_target_particles_maskv3(
+    particles: pl.DataFrame, 
+    eta_cut: float = 3.5,
+    pt_cut: float = 1.0
+    ) -> pl.DataFrame:
+    """
+    Adds a boolean mask 'is_target_particle' to the particles DataFrame.
+    A particle is a target if:
+    1. It has a track OR it enters the calorimeter.
+    2. AND it does not have an ancestor with a track (unless it is the track itself).
+    """
+    # 0. Get Lineage (External calculation)
+    # Ensure this function returns a DataFrame with [event_id, particle_id, ancestor_with_track_id]
+    particles_with_track_linage = map_to_nearest_ancestor_with_track(particles)
+    
+    # 1. Identify Target Particles (Flat List)
+    almost_target_particles = (
+        particles.lazy()
+        .select(["event_id", "particle_id", "enter_calo", "has_track", 'pt', 'eta', 'pdg_id'])
+        .explode(["particle_id", "enter_calo", "has_track", 'pt', 'eta', 'pdg_id'])
+        .with_columns(pl.col("particle_id").cast(pl.Int64)) # Safety cast
+        # Exclude neutrinos from target particles
+        .filter((pl.col('pdg_id').abs() != 12) & (pl.col('pdg_id').abs() != 14) & (pl.col('pdg_id').abs() != 16))
+        # Condition 1: Enter Calo OR Has Track
+        .filter(pl.col("enter_calo") | pl.col("has_track"))
+        
+        .join(
+            particles_with_track_linage.lazy(),
+            on=["event_id", "particle_id"],
+            how="left"
+        )
+        
+        # Condition 2: No ancestor with track OR is the track itself
+        # FIX: Removed the 'True' that was bypassing this check
+        .filter(
+            pl.col("ancestor_with_track_id").is_null() | pl.col('has_track')
+        )
+        #.filter((pl.col('pt') > pt_cut) & (pl.col('eta').abs() < eta_cut))
+        .select(['event_id', 'particle_id', 'has_track'])
+        .unique()
+    ).collect(streaming=True)
+    back_track_p = (almost_target_particles
+    .select(['event_id', 'particle_id', 'has_track'])
+    .filter(~pl.col('has_track'))
+    )
+    back_tracked = backtrack_to_target_roots(
+        particles,
+        back_track_p.select(['event_id', 'particle_id']),
+        back_track_p.select(['event_id', 'particle_id'])
+    )
+
+    target_particles = pl.union([almost_target_particles.filter(pl.col('has_track')).select(['event_id', 'particle_id']).unique(),
+        back_tracked
+        .select(['event_id', 'target_particle_id'])
+        .rename({'target_particle_id':'particle_id'})
+        .unique()]).with_columns(pl.lit(True).alias('is_target_particle'))
+    # Now apply cuts!
+    # Accept target if  truth ancestor has pt>pt_cut and target particle pt>pt_cut/3
+    particle_roots_no_parents = (
+        particles.lazy()
+        .select(['event_id', 'particle_id', 'is_parent_missing'])
+        .explode('particle_id','is_parent_missing')
+        .filter(pl.col('is_parent_missing') 
+                )
+        .select(['event_id', 'particle_id'])
+    ).collect(streaming=True)
+
+    mappings_target_to_truth =  backtrack_to_target(particles=particles, src_df=target_particles, target_df=particle_roots_no_parents).rename({'src_particle_id':'target_particle_id','target_particle_id':'truth_particle_id'}) 
+    particles_with_pt_eta = particles.lazy().select(['event_id', 'particle_id', 'pt', 'eta']).explode(['particle_id', 'pt', 'eta'])
+
+    target_particles =(particles_with_pt_eta.rename({'particle_id':'target_particle_id', 'pt':'pt_target', 'eta':'eta_target'})
+                    .join(
+                        mappings_target_to_truth.lazy(),
+                        left_on=['event_id', 'target_particle_id'],
+                        right_on=['event_id', 'target_particle_id'],
+                        how='inner',
+                    )
+                    .join(
+                        particles_with_pt_eta.rename({'particle_id':'truth_particle_id', 'pt':'pt_truth', 'eta':'eta_truth'})
+                        ,
+                        left_on=['event_id', 'truth_particle_id'],
+                        right_on=['event_id', 'truth_particle_id'],
+                        how='inner',
+                    )
+                    .filter(
+                        (pl.col('pt_truth') > pt_cut) & (pl.col('pt_target') > pt_cut / 3) &
+                        (pl.col('eta_truth').abs() < eta_cut)
+                    )
+                    .select(['event_id', 'target_particle_id'])
+                    .unique()
+                    .rename({'target_particle_id':'particle_id'})
+                    .with_columns(pl.lit(True).alias('is_target_particle'))
+                    ).collect(streaming=True)
+    
+    truth_particles = (
+        particles.lazy()
+        .select(['event_id', 'particle_id', 'is_parent_missing', 'eta', 'pt', 'pdg_id'])
+        .explode('particle_id','is_parent_missing', 'eta', 'pt', 'pdg_id')
+        .filter(pl.col('is_parent_missing') 
+                & (pl.col('pdg_id').abs() != 12) & (pl.col('pdg_id').abs() != 14) & (pl.col('pdg_id').abs() != 16)
+                & (pl.col('eta').abs() < eta_cut)
+                & (pl.col('pt') > pt_cut)
+                )
+        .select(['event_id', 'particle_id'])
+        .with_columns(pl.lit(True).alias('is_truth_particle'))
+    ).collect(streaming=True)
+    # 2. Join back target to original data efficiently
+    result = (
+        particles.lazy()
+        .select(["event_id", "particle_id"])
+        .explode("particle_id")
+        .with_columns(pl.col("particle_id").cast(pl.Int64)) # Safety cast
+        
+        # FIX 1: Capture global order
+        .with_row_index("global_order")
+        
+        .join(
+            truth_particles.lazy(),
+            on=["event_id", "particle_id"],
+            how="left"
+        )
+        .with_columns(pl.col("is_truth_particle").fill_null(False))
+        
+        # FIX 2: Restore order before grouping
+        .sort("global_order")
+        .group_by("event_id", maintain_order=True)
+        .agg(pl.col("is_truth_particle"))
+        
+        .join(
+            particles.lazy(),
+            on="event_id",
+            how="inner"
+        )
+        .collect(streaming=True)
+    )
+
+    result = (
+        result.lazy()
+        .select(["event_id", "particle_id"])
+        .explode("particle_id")
+        .with_columns(pl.col("particle_id").cast(pl.Int64)) # Safety cast
+        
+        # FIX 1: Capture global order
+        .with_row_index("global_order")
+        
+        .join(
+            target_particles.lazy(),
+            on=["event_id", "particle_id"],
+            how="left"
+        )
+        .with_columns(pl.col("is_target_particle").fill_null(False))
+        
+        # FIX 2: Restore order before grouping
+        .sort("global_order")
+        .group_by("event_id", maintain_order=True)
+        .agg(pl.col("is_target_particle"))
+        
+        .join(
+            result.lazy(),
+            on="event_id",
+            how="inner"
+        )
+        .collect(streaming=True)
+    )
+    return result
+
+
 def backtrack_to_target(
     particles: pl.DataFrame, 
     src_df: pl.DataFrame, 
