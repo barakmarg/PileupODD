@@ -609,7 +609,211 @@ def histogram_energy_ratio(particles: pl.DataFrame)-> pl.DataFrame:
     plt.ylabel("Number of Events") 
     return ht_combined
 
+def histogram_ht_filter_taus(particles: pl.DataFrame) -> pl.DataFrame:
+    # sum pt of target particles within eta cut, pt cut
+    target_p = (
+        particles.lazy()
+        .select(['event_id', 'particle_id', 'is_target_particle'])
+        .explode(['particle_id', 'is_target_particle'])
+        .filter(pl.col('is_target_particle') )
+    )
 
+    truth_p = (
+        particles.lazy()
+        .select(['event_id', 'particle_id', 'is_truth_particle', 'pdg_id'])
+        .explode(['particle_id', 'is_truth_particle', 'pdg_id'])
+        .filter(pl.col('is_truth_particle') )
+
+    )
+    from primary.preprocessing import backtrack_to_target
+    mappings_target_to_truth =  backtrack_to_target(particles=particles, src_df=target_p.select(['event_id', 'particle_id'])
+                                                    , target_df=truth_p.select(['event_id', 'particle_id'])).rename({'src_particle_id':'target_particle_id','target_particle_id':'truth_particle_id'}) 
+
+    # filter out taus truth and its decendants
+    target_p = (
+    target_p.lazy()
+    .rename({'particle_id':'target_particle_id'})
+    .join(mappings_target_to_truth.lazy(),
+        left_on=['event_id', 'target_particle_id'],
+        right_on=['event_id', 'target_particle_id'],
+        how='inner')
+    .join(
+        truth_p.lazy().rename({'particle_id':'truth_particle_id', 'pdg_id':'pdg_id'}),
+        left_on=['event_id', 'truth_particle_id'],
+        right_on=['event_id', 'truth_particle_id'],
+        how='inner')
+    .filter(pl.col('pdg_id').abs() != 15)
+    .select(['event_id', 'target_particle_id'])
+    .rename({'target_particle_id':'particle_id'})
+
+    ).collect()
+    truth_p = (
+            truth_p.lazy()
+            .filter(pl.col('pdg_id').abs() != 15)
+            .select(['event_id', 'particle_id'])
+            ).collect()
+
+    ht_target = (
+    particles.lazy()
+    .select(['event_id', 'particle_id','pt', 'eta',  'pdg_id'])
+    .explode(['particle_id','pt', 'eta', 'pdg_id'])
+    .join(
+        target_p.lazy(),
+        left_on=['event_id', 'particle_id'],
+        right_on=['event_id', 'particle_id'],
+        how='inner'
+    )
+    .filter(
+            # filter out neutrinos
+                ((pl.col('pdg_id').abs() != 12) & (pl.col('pdg_id').abs() != 14) & (pl.col('pdg_id').abs() != 16) )
+            )
+    .group_by('event_id')
+    .agg(pl.col('pt').sum().alias('ht_target'))
+    )
+
+    ht_truth =(
+    particles.lazy()
+    .select(['event_id', 'particle_id','pt', 'eta',  'pdg_id'])
+    .explode(['particle_id','pt', 'eta', 'pdg_id'])
+    .join(
+
+        truth_p.lazy(),
+        left_on=['event_id', 'particle_id'],
+        right_on=['event_id', 'particle_id'],
+        how='inner'
+    )
+    .filter(
+                ((pl.col('pdg_id').abs() != 12) & (pl.col('pdg_id').abs() != 14) & (pl.col('pdg_id').abs() != 16) )
+                )
+    .group_by('event_id')
+    .agg(pl.col('pt').sum().alias('ht_truth'))
+    )
+    ht_combined = ht_target.join(ht_truth, on='event_id', how='inner').collect(streaming=True)
+
+    import matplotlib.pyplot as plt
+    import numpy as np
+
+    # Convert to numpy for plotting
+    x = ht_combined['ht_truth'].to_numpy()
+    y = ht_combined['ht_target'].to_numpy()
+
+    # Calculate ratio
+    ratio = np.divide(y, x, out=np.zeros_like(y), where=x!=0)
+
+    # Calculate statistics
+    mean_ratio = np.mean(ratio)
+    std_ratio = np.std(ratio)
+    n_events = len(ratio)
+
+    plt.figure(figsize=(10, 6))
+    plt.hist(ratio, bins=50, range=(0, 2), color='blue', edgecolor='black', alpha=0.7)
+    plt.title(f"Filter truth taus and its decendents- Ratio of Target HT / Truth HT - Mean: {mean_ratio:.2f}, Std: {std_ratio:.2f}, N: {n_events}")
+    plt.xlabel("HT Target / HT Truth")
+    plt.ylabel("Number of Events") 
+    return ht_combined
+
+def histogram_energy_filter_taus(particles: pl.DataFrame) -> pl.DataFrame:
+    # sum energy of target particles within eta cut, pt cut
+    target_p = (
+        particles.lazy()
+        .select(['event_id', 'particle_id', 'is_target_particle'])
+        .explode(['particle_id', 'is_target_particle'])
+        .filter(pl.col('is_target_particle') )
+    )
+
+    truth_p = (
+        particles.lazy()
+        .select(['event_id', 'particle_id', 'is_truth_particle', 'pdg_id'])
+        .explode(['particle_id', 'is_truth_particle', 'pdg_id'])
+        .filter(pl.col('is_truth_particle') )
+
+    )
+    from primary.preprocessing import backtrack_to_target
+    mappings_target_to_truth =  backtrack_to_target(particles=particles, src_df=target_p.select(['event_id', 'particle_id'])
+                                                    , target_df=truth_p.select(['event_id', 'particle_id'])).rename({'src_particle_id':'target_particle_id','target_particle_id':'truth_particle_id'}) 
+
+    # filter out taus truth and its decendants
+    target_p = (
+    target_p.lazy()
+    .rename({'particle_id':'target_particle_id'})
+    .join(mappings_target_to_truth.lazy(),
+        left_on=['event_id', 'target_particle_id'],
+        right_on=['event_id', 'target_particle_id'],
+        how='inner')
+    .join(
+        truth_p.lazy().rename({'particle_id':'truth_particle_id', 'pdg_id':'pdg_id'}),
+        left_on=['event_id', 'truth_particle_id'],
+        right_on=['event_id', 'truth_particle_id'],
+        how='inner')
+    .filter(pl.col('pdg_id').abs() != 15)
+    .select(['event_id', 'target_particle_id'])
+    .rename({'target_particle_id':'particle_id'})
+
+    ).collect()
+    truth_p = (
+            truth_p.lazy()
+            .filter(pl.col('pdg_id').abs() != 15)
+            .select(['event_id', 'particle_id'])
+            ).collect()
+
+    energy_target = (
+    particles.lazy()
+    .select(['event_id', 'particle_id','energy', 'eta',  'pdg_id'])
+    .explode(['particle_id','energy', 'eta', 'pdg_id'])
+    .join(
+        target_p.lazy(),
+        left_on=['event_id', 'particle_id'],
+        right_on=['event_id', 'particle_id'],
+        how='inner'
+    )
+    .filter(
+            # filter out neutrinos
+                ((pl.col('pdg_id').abs() != 12) & (pl.col('pdg_id').abs() != 14) & (pl.col('pdg_id').abs() != 16) )
+            )
+    .group_by('event_id')
+    .agg(pl.col('energy').sum().alias('energy_target'))
+    )
+
+    energy_truth =(
+    particles.lazy()
+    .select(['event_id', 'particle_id','energy', 'eta',  'pdg_id'])
+    .explode(['particle_id','energy', 'eta', 'pdg_id'])
+    .join(
+
+        truth_p.lazy(),
+        left_on=['event_id', 'particle_id'],
+        right_on=['event_id', 'particle_id'],
+        how='inner'
+    )
+    .filter(
+                ((pl.col('pdg_id').abs() != 12) & (pl.col('pdg_id').abs() != 14) & (pl.col('pdg_id').abs() != 16) )
+                )
+    .group_by('event_id')
+    .agg(pl.col('energy').sum().alias('energy_truth'))
+    )
+    energy_combined = energy_target.join(energy_truth, on='event_id', how='inner').collect(streaming=True)
+
+    import matplotlib.pyplot as plt
+    import numpy as np
+
+    # Convert to numpy for plotting
+    x = energy_combined['energy_truth'].to_numpy()
+    y = energy_combined['energy_target'].to_numpy()
+
+    # Calculate ratio
+    ratio = np.divide(y, x, out=np.zeros_like(y), where=x!=0)
+
+    # Calculate statistics
+    mean_ratio = np.mean(ratio)
+    std_ratio = np.std(ratio)
+    n_events = len(ratio)
+
+    plt.figure(figsize=(10, 6))
+    plt.hist(ratio, bins=50, range=(0, 2), color='blue', edgecolor='black', alpha=0.7)
+    plt.title(f"Filter truth taus and its decendents- Ratio of Target Energy / Truth Energy - Mean: {mean_ratio:.2f}, Std: {std_ratio:.2f}, N: {n_events}")
+    plt.xlabel("Energy Target / Energy Truth")
+    plt.ylabel("Number of Events") 
+    return energy_combined
 import polars as pl
 import matplotlib.pyplot as plt
 import numpy as np
