@@ -393,6 +393,9 @@ def filter_orphans_and_reindex(
         .drop('_orig_idx')
         .group_by('event_id', maintain_order=True)
         .agg(pl.all())
+        .with_columns(
+            pl.int_ranges(0, pl.col('particle_id').list.len(), dtype=pl.UInt32).alias('particle_idx')
+        )
         .collect(streaming=True)
     )
 
