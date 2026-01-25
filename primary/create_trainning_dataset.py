@@ -4,7 +4,7 @@ import yaml # type: ignore
 
 from sklearn.model_selection import train_test_split
 from primary.preprocessing import add_eta_and_phi_and_pt, add_eta_and_phi_and_pt, add_ms_cluster_labels, add_ms_cluster_labels, \
-     add_orphan_mask, add_created_inside_calo_mask, add_particle_have_track_mask, set_target_particles_maskv2, get_particles_id_parent_of_inside_calo_particles_maskv3, \
+     add_orphan_mask, add_created_inside_calo_mask, add_particle_have_track_mask, set_target_particles_maskv3, get_particles_id_parent_of_inside_calo_particles_maskv3, \
     add_eta_and_phi_and_pt, add_ms_cluster_labels, backtrack_to_target, cluster_purity, calculate_extrapolated_features_polars
 from primary.calibration import CALIBRATION
 
@@ -605,7 +605,7 @@ def create_calo_clusters(calo_hits: pl.DataFrame) -> pl.DataFrame:
 
 def preprocess_for_model(particles: pl.DataFrame, tracks: pl.DataFrame, calo_hits: pl.DataFrame,
 
-                         num_of_events: int=-1, eta_cut: float=2.5, pt_cut: float=1.0, clusters_cutoff: float=0.1) -> Dict[str,pl.DataFrame]:
+                         num_of_events: int=-1,  truth_eta_cut: float=3.0, truth_pt_cut: float=1.0, target_pt_cut: float=0.3, clusters_cutoff: float=0.1) -> Dict[str,pl.DataFrame]:
     """
     Aggregates the number of cells per cluster.
     """
@@ -633,7 +633,7 @@ def preprocess_for_model(particles: pl.DataFrame, tracks: pl.DataFrame, calo_hit
     particles = add_particle_have_track_mask(particles, tracks)
     particles = add_eta_and_phi_and_pt(particles)
     particles = get_particles_id_parent_of_inside_calo_particles_maskv3(particles, calo_hits)
-    particles = set_target_particles_maskv2(particles, eta_cut=eta_cut, pt_cut=pt_cut)
+    particles = set_target_particles_maskv3(particles, truth_eta_cut=truth_eta_cut, truth_pt_cut=truth_pt_cut, target_pt_cut=target_pt_cut)
 
 
     # apply cuts, filter out tracks related to non target particles
@@ -790,7 +790,7 @@ def run_preprocessing_pipeline(r=None, event_name: str="ttbar_pu0", ):
 
         preprocessed_data = preprocess_for_model(particles=particles, tracks=tracks,
                                                   calo_hits=calo_hits, num_of_events=-1, 
-                                                  pt_cut=1, eta_cut=3.0, clusters_cutoff=0.25)
+                                                  truth_pt_cut=1, truth_eta_cut=3.0, target_pt_cut=0.3, clusters_cutoff=0.25)
         
         # write preprocessed data to local disk as parquets
         file_path_data = f"/storage/agrp/barakma/PileupODD/data/{event_name}"

@@ -1130,58 +1130,6 @@ def add_ms_cluster_labels_gpu(calo_hits: pl.DataFrame, bandwidth: float = 120.0)
     return final_df
 
 
-def cluster_purity(calo_hits_with_clusters:pl.DataFrame, ancestors:pl.DataFrame) -> pl.DataFrame:
-    """
-    Computes the particle deposited energy ratio in clusters
-    """
-    # Explode to align hits with clusters
-    exploded = (
-                calo_hits_with_clusters.lazy().select(['event_id','contrib_energies', 'contrib_particle_ids', 'cluster_id', 'detector'])
-        .explode(['contrib_energies', 'contrib_particle_ids', 'cluster_id', 'detector'])
-        .explode(['contrib_energies', 'contrib_particle_ids']).rename({'contrib_particle_ids':'particle_id','contrib_energies':'energy'})
-        .join(
-                CALIBRATION.select(['detector', 'calib_factor']),
-                on='detector',
-        )
-        .with_columns((pl.col('energy') * pl.col('calib_factor')).alias('energy'))
-        .drop('calib_factor')
-        .drop('detector')
- )
-
-    # Join with ancestors to get ultimate ancestor IDs
-    exploded = exploded.join(
-        ancestors.lazy(),
-        left_on="particle_id",
-        right_on="particle_id",
-        how="left"
-    )
-
-    energy_gruped_by_cluster =(exploded.group_by('event_id','cluster_id', 'ultimate_ancestor_id')
-                               .agg(pl.col('energy').sum().alias('total_energy_in_cluster'))
-                               
-                               )
-    del exploded
-    energy_by_ancestor = (
-        energy_gruped_by_cluster.group_by('event_id', 'ultimate_ancestor_id')
-        .agg(pl.col('total_energy_in_cluster').sum().alias('energy_by_ancestor'))
-    
-    )
-    final = (energy_gruped_by_cluster.join(
-        energy_by_ancestor,
-        on=['event_id', 'ultimate_ancestor_id'],
-        how='left')
-        .rename({'ultimate_ancestor_id':'ultimate_ancestor_id', 
-                 'cluster_id':'cluster_id',
-                 'total_energy_in_cluster':'total_energy_deps_in_cluster',
-                 'energy_by_ancestor':'total_energy_deps'})
-        .with_columns(
-            (pl.col('total_energy_deps_in_cluster') / pl.col('total_energy_deps')).alias('purity')
-        )
-    ).collect(streaming=True)
-
-    return final
-
-
 def particle_energy_calo_deposits_ratio(
     calo_hits: pl.DataFrame, 
     ancestors: pl.DataFrame, 
