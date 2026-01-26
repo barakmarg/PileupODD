@@ -547,7 +547,6 @@ def create_calo_clusters(calo_hits: pl.DataFrame) -> pl.DataFrame:
             # rho
             (pl.col('cluster_cx').pow(2) + pl.col('cluster_cy').pow(2)).sqrt().alias('cluster_rho'),
         ])
-        .drop(['cluster_cx', 'cluster_cy', 'cluster_cz'])
     )
 
     # --- BRANCH B: HIT PHYSICS & TOPOLOGY ---
@@ -708,11 +707,11 @@ def preprocess_for_model(particles: pl.DataFrame, tracks: pl.DataFrame, calo_hit
     target_particles = (
         particles.lazy()
         .select(['event_id', 'particle_id', 'is_target_particle', 'pdg_id',
-                  'energy', 'eta', 'phi', 'px', 'py', 'pz', 'pt',
-                  'charge','mass', 'has_track'])
+              'energy', 'eta', 'phi', 'px', 'py', 'pz', 'pt',
+              'charge','mass', 'has_track', 'vx', 'vy', 'vz'])
         .explode( 'particle_id', 'is_target_particle', 'pdg_id',
-                  'energy', 'eta', 'phi', 'px', 'py', 'pz', 'pt',
-                  'charge','mass', 'has_track')
+              'energy', 'eta', 'phi', 'px', 'py', 'pz', 'pt',
+              'charge','mass', 'has_track', 'vx', 'vy', 'vz')
         .filter(pl.col('is_target_particle'))
         .sort('event_id')
         .with_row_index("global_order")

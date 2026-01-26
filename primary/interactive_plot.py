@@ -261,12 +261,18 @@ def plot_calo_clusters_3d(calo_hits: pl.DataFrame,
         fig.show()
 # -----------------------------------------------------------------------------
 
+import plotly.graph_objs as go
+import ipywidgets as widgets
+import numpy as np
+import polars as pl
+from collections import defaultdict, deque
 
 def plot_3d_particle_hierarchy(particles: pl.DataFrame, calo_hits: pl.DataFrame, event_id=0):
     """
-    3D Particle Hierarchy Explorer.
+    3D Particle Hierarchy Explorer (Corrected).
+    - Fixed: Calorimeter hits now visible in global view.
+    - Fixed: IndexError crash on rapid clicking (race condition).
     - Updated: Initial Zoom = 20x, Max Zoom = 200x.
-    - Fixed: Eta cones do not stretch view.
     """
     
     # --- 1. Data Loading ---
@@ -303,7 +309,7 @@ def plot_3d_particle_hierarchy(particles: pl.DataFrame, calo_hits: pl.DataFrame,
             .collect()
         )
     
-    # Particle Data
+    # Particle Data Extraction
     all_pids = p_data["particle_id"].explode().to_numpy()
     all_pdg_ids = p_data["pdg_id"].explode().to_numpy()
     particle_energies = p_data["energy"].explode().to_numpy()
@@ -333,16 +339,29 @@ def plot_3d_particle_hierarchy(particles: pl.DataFrame, calo_hits: pl.DataFrame,
     all_py = safe_extract("py")
     all_pz = safe_extract("pz")
     all_p_mag = np.sqrt(all_px**2 + all_py**2 + all_pz**2)
-    # Safe mag for normalization
+    
+    # Safe mag for normalization (avoid div by zero)
     safe_mag = np.where(all_p_mag == 0, 1.0, all_p_mag)
     max_p_mag = float(np.max(all_p_mag)) if len(all_p_mag) > 0 else 10.0
 
-    # Calo Data Extraction
-    c_x = c_data["x"].explode().to_numpy()
-    c_y = c_data["y"].explode().to_numpy()
-    c_z = c_data["z"].explode().to_numpy()
-    c_contrib_ids = c_data["contrib_particle_ids"].explode().to_numpy()
-    c_contrib_enes = c_data["contrib_energies"].explode().to_numpy()
+    # Calo Data Extraction (preserve per-hit contributor lists)
+    if c_data.is_empty():
+        c_hits_df = c_data.select(["x", "y", "z", "contrib_particle_ids", "contrib_energies"]) if {
+            "x", "y", "z", "contrib_particle_ids", "contrib_energies"
+        }.issubset(c_data.columns) else c_data
+    else:
+        c_hits_df = (
+            c_data.lazy()
+            .select(["x", "y", "z", "contrib_particle_ids", "contrib_energies"])
+            .explode(["x", "y", "z", "contrib_particle_ids", "contrib_energies"])
+            .collect()
+        )
+
+    c_x = c_hits_df["x"].to_numpy() if "x" in c_hits_df.columns else np.array([])
+    c_y = c_hits_df["y"].to_numpy() if "y" in c_hits_df.columns else np.array([])
+    c_z = c_hits_df["z"].to_numpy() if "z" in c_hits_df.columns else np.array([])
+    c_contrib_ids = c_hits_df["contrib_particle_ids"].to_list() if "contrib_particle_ids" in c_hits_df.columns else []
+    c_contrib_enes = c_hits_df["contrib_energies"].to_list() if "contrib_energies" in c_hits_df.columns else []
 
     # Scene Bounds Calculation
     max_coord = float(max(np.max(np.abs(all_vz)), 1000.0))
@@ -376,8 +395,12 @@ def plot_3d_particle_hierarchy(particles: pl.DataFrame, calo_hits: pl.DataFrame,
     pid_to_cells = defaultdict(set)
     
     for cell_i, (contribs, energies) in enumerate(zip(c_contrib_ids, c_contrib_enes)):
-        if contribs is None:
+        if contribs is None or energies is None:
             continue
+        if not isinstance(contribs, (list, tuple, np.ndarray)):
+            contribs = [contribs]
+        if not isinstance(energies, (list, tuple, np.ndarray)):
+            energies = [energies]
         for pid, en in zip(contribs, energies):
             pid = int(pid)
             direct_energy[pid] += float(en)
@@ -398,7 +421,6 @@ def plot_3d_particle_hierarchy(particles: pl.DataFrame, calo_hits: pl.DataFrame,
     max_e = max(inclusive_energy.values()) if inclusive_energy else 10.0
 
     # --- 3. Visualization Setup ---
-    # CHANGED: Initial zoom level set to 20.0
     state = {
         'selected_pid': None, 
         'min_energy': 0.0,
@@ -410,7 +432,7 @@ def plot_3d_particle_hierarchy(particles: pl.DataFrame, calo_hits: pl.DataFrame,
         'eta_val': 2.5,
         'mom_viz_active': False,
         'min_mom': 0.0,
-        'zoom_level': 20.0  # Initial State
+        'zoom_level': 20.0  # Initial Zoom
     }
 
     layout = go.Layout(
@@ -420,11 +442,9 @@ def plot_3d_particle_hierarchy(particles: pl.DataFrame, calo_hits: pl.DataFrame,
             xaxis_title="X (mm)",
             yaxis_title="Y (mm)",
             zaxis_title="Z (mm)",
-            # FIXED: 'data' -> 'manual' to prevent reshaping when cones appear
             aspectmode='manual', 
-            # FIXED: Forces 1:1:1 geometric scaling regardless of data limits
             aspectratio=dict(x=1, y=1, z=1),
-            uirevision='constant_view_id'  # Prevents camera reset
+            uirevision='constant_view_id'
         ),
         hovermode='closest',
         clickmode='event+select',
@@ -432,15 +452,36 @@ def plot_3d_particle_hierarchy(particles: pl.DataFrame, calo_hits: pl.DataFrame,
         margin=dict(l=0, r=0, b=0, t=50)
     )
 
+    # 0. Calo Hits
+    if len(c_x) > 0:
+        c_r = np.sqrt(c_x**2 + c_y**2 + c_z**2)
+        c_r_safe = np.where(c_r == 0, 1.0, c_r)
+        c_phi = np.arctan2(c_y, c_x)
+        c_theta = np.arccos(np.clip(c_z / c_r_safe, -1.0, 1.0))
+        c_eta = -np.log(np.tan(c_theta / 2.0))
+        c_custom = np.stack((c_eta, c_phi), axis=-1)
+    else:
+        c_custom = np.empty((0, 2))
+
     trace_calo = go.Scatter3d(
         x=c_x, y=c_y, z=c_z, mode='markers',
         marker=dict(size=3, color='orange', opacity=0.3),
-        visible=False, name='Calo Hits'
+        visible=False, name='Calo Hits',
+        customdata=c_custom,
+        hovertemplate=(
+            "<b>Calo Hit</b><br>" +
+            "x: %{x:.2f}<br>y: %{y:.2f}<br>z: %{z:.2f}<br>" +
+            "eta: %{customdata[0]:.3f}<br>phi: %{customdata[1]:.3f}<br>"
+            "<extra></extra>"
+        )
     )
 
+    # 1. Link (Hierarchy)
     trace_norm = go.Scatter3d(x=[], y=[], z=[], mode='lines', line=dict(color='#888', width=3), hoverinfo='skip', name='Link')
+    # 2. Data Jump
     trace_jump = go.Scatter3d(x=[], y=[], z=[], mode='lines', line=dict(color='red', width=4, dash='dot'), hoverinfo='skip', name='Data Jump')
 
+    # 3. Particles
     trace_particles = go.Scatter3d(
         x=all_vx, y=all_vy, z=all_vz, mode='markers',
         marker=dict(size=5, color='#ccc'),
@@ -448,6 +489,7 @@ def plot_3d_particle_hierarchy(particles: pl.DataFrame, calo_hits: pl.DataFrame,
         name='Particles', hoverinfo='text'
     )
     
+    # 4. Momentum Vectors
     trace_momentum = go.Scatter3d(
         x=[], y=[], z=[],
         mode='lines',
@@ -463,6 +505,7 @@ def plot_3d_particle_hierarchy(particles: pl.DataFrame, calo_hits: pl.DataFrame,
         hoverinfo='skip'
     )
     
+    # 5. Eta Cone
     trace_eta = go.Mesh3d(x=[], y=[], z=[], i=[], j=[], k=[], color='cyan', opacity=0.15, name='Eta Cut', visible=False, hoverinfo='skip')
 
     fig = go.FigureWidget(data=[trace_calo, trace_norm, trace_jump, trace_particles, trace_momentum, trace_eta], layout=layout)
@@ -486,9 +529,6 @@ def plot_3d_particle_hierarchy(particles: pl.DataFrame, calo_hits: pl.DataFrame,
     btn_show_mom = widgets.ToggleButton(description="Show Mom.", value=False, icon='location-arrow', button_style='success', layout=widgets.Layout(width='120px'))
     slider_mom_filter = widgets.FloatSlider(value=0, min=0, max=max_p_mag, step=0.1, description='Min Mom:', layout=widgets.Layout(width='250px'), disabled=True)
 
-    # =========================================================
-    # CHANGED: Initial=20.0, Max=200.0
-    # =========================================================
     slider_zoom = widgets.FloatSlider(
         value=20.0,     # Initial Value
         min=1.0, 
@@ -498,6 +538,10 @@ def plot_3d_particle_hierarchy(particles: pl.DataFrame, calo_hits: pl.DataFrame,
         icon='search-plus', 
         layout=widgets.Layout(width='250px')
     )
+
+    btn_view_xy = widgets.Button(description="XY", icon='arrows-alt', layout=widgets.Layout(width='60px'))
+    btn_view_xz = widgets.Button(description="XZ", icon='arrows-alt', layout=widgets.Layout(width='60px'))
+    btn_view_yz = widgets.Button(description="YZ", icon='arrows-alt', layout=widgets.Layout(width='60px'))
 
     # --- Logic ---
 
@@ -567,6 +611,7 @@ def plot_3d_particle_hierarchy(particles: pl.DataFrame, calo_hits: pl.DataFrame,
 
         # A. Filtering
         if sel_pid is None:
+            # --- Global View ---
             visible = []
             for p in all_pids:
                 if inclusive_energy[p] < min_e - 1e-5:
@@ -593,6 +638,7 @@ def plot_3d_particle_hierarchy(particles: pl.DataFrame, calo_hits: pl.DataFrame,
             info_html = f"Showing {len(visible)} particles."
             
         else:
+            # --- Hierarchy View ---
             gen_map = get_gen_map(sel_pid)
             visible = []
             for p, gen in gen_map.items():
@@ -654,12 +700,18 @@ def plot_3d_particle_hierarchy(particles: pl.DataFrame, calo_hits: pl.DataFrame,
             name_sel = globals().get('PDG_ID_TO_NAME', PDG_NAMES_FALLBACK).get(pdg_sel, pdg_sel)
             title_txt = f"Hierarchy: PID {sel_pid} ({name_sel})"
             
+            sel_i = pid_to_idx.get(sel_pid)
+            vx_sel = all_vx[sel_i] if sel_i is not None else float("nan")
+            vy_sel = all_vy[sel_i] if sel_i is not None else float("nan")
+            vz_sel = all_vz[sel_i] if sel_i is not None else float("nan")
+
             info_html = f"""
             <div style="border:1px solid #ccc; padding:8px;">
                 <h3 style="color:#D62728; margin:0;">PID: {sel_pid}</h3>
                 <b>Type:</b> {name_sel} ({pdg_sel})<br>
                 Ancestors: {n_anc} | Descendants: {n_desc}<br>
-                <b>Total E:</b> {inclusive_energy[sel_pid]:.4f} GeV
+                <b>Total E:</b> {inclusive_energy[sel_pid]:.4f} GeV<br>
+                <b>Vertex:</b> ({vx_sel:.2f}, {vy_sel:.2f}, {vz_sel:.2f})
             </div>
             """
 
@@ -686,6 +738,7 @@ def plot_3d_particle_hierarchy(particles: pl.DataFrame, calo_hits: pl.DataFrame,
                 fig.data[3].x = []
                 fig.data[3].y = []
                 fig.data[3].z = []
+                fig.data[3].customdata = [] # Safety clear
             
             # 2. Links
             fig.data[1].x = xn
@@ -695,8 +748,14 @@ def plot_3d_particle_hierarchy(particles: pl.DataFrame, calo_hits: pl.DataFrame,
             fig.data[2].y = yj
             fig.data[2].z = zj
             
-            # 3. Calo
-            if visible:
+            # 3. Calo (FIXED LOGIC)
+            if sel_pid is None:
+                # Global view: Show ALL hits
+                fig.data[0].x = c_x
+                fig.data[0].y = c_y
+                fig.data[0].z = c_z
+            elif visible:
+                # Hierarchy view: Show LINKED hits
                 active_cells = set()
                 for p in visible:
                     active_cells.update(pid_to_cells[p])
@@ -781,7 +840,13 @@ def plot_3d_particle_hierarchy(particles: pl.DataFrame, calo_hits: pl.DataFrame,
     def on_click(trace, points, selector):
         if not points.point_inds:
             return
-        clicked = trace.customdata[points.point_inds[0]]
+        
+        # 1. FIXED: Boundary check to prevent IndexError during rapid updates
+        click_idx = points.point_inds[0]
+        if trace.customdata is None or click_idx >= len(trace.customdata):
+            return
+
+        clicked = trace.customdata[click_idx]
         state['selected_pid'] = None if state['selected_pid'] == clicked else clicked
         update_view()
 
@@ -801,7 +866,7 @@ def plot_3d_particle_hierarchy(particles: pl.DataFrame, calo_hits: pl.DataFrame,
 
     fig.data[3].on_click(on_click)
     slider_energy.observe(lambda c: (state.update({'min_energy': c['new']}), update_view()), names='value')
-    btn_calo.observe(lambda c: fig.data[0].update(visible=c['new']), names='value')
+    btn_calo.observe(lambda c: (fig.data[0].update(visible=c['new']), update_view()), names='value')
     btn_target_filter.observe(lambda c: (state.update({'target_filter_active': c['new']}), update_view()), names='value')
     
     def toggle_gen(change):
@@ -829,19 +894,31 @@ def plot_3d_particle_hierarchy(particles: pl.DataFrame, calo_hits: pl.DataFrame,
 
     btn_show_mom.observe(toggle_mom, names='value')
     
-    # New Sliders Listeners
     slider_mom_filter.observe(lambda c: (state.update({'min_mom': c['new']}), update_view()), names='value')
     slider_zoom.observe(lambda c: (state.update({'zoom_level': c['new']}), update_view()), names='value')
 
     btn_search.on_click(run_search)
     txt_search.on_submit(run_search)
 
+    def set_view_xy(_):
+        fig.layout.scene.camera = dict(eye=dict(x=0, y=0, z=2.5), up=dict(x=0, y=1, z=0))
+
+    def set_view_xz(_):
+        fig.layout.scene.camera = dict(eye=dict(x=0, y=2.5, z=0), up=dict(x=0, y=0, z=1))
+
+    def set_view_yz(_):
+        fig.layout.scene.camera = dict(eye=dict(x=2.5, y=0, z=0), up=dict(x=0, y=0, z=1))
+
+    btn_view_xy.on_click(set_view_xy)
+    btn_view_xz.on_click(set_view_xz)
+    btn_view_yz.on_click(set_view_yz)
+
     update_view()
     
     row1 = widgets.HBox([txt_search, btn_search, btn_calo, slider_energy])
     row2 = widgets.HBox([btn_target_filter, btn_gen_filter, txt_gen_low, txt_gen_high])
     row3 = widgets.HBox([btn_show_eta, slider_eta, btn_show_mom, slider_mom_filter])
-    row4 = widgets.HBox([slider_zoom])
+    row4 = widgets.HBox([slider_zoom, btn_view_xy, btn_view_xz, btn_view_yz])
     
     return widgets.VBox([row1, row2, row3, row4, fig, info_box])
 
