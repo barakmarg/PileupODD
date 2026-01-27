@@ -5,6 +5,6 @@ pushd /storage/agrp/barakma/PileupODD/primary
 
 
 
-qsub -o output.log -e error.log -q N -N progress -l walltime=72:00:00,mem=48gb,ncpus=32,ngpus=0,io=10.0,gputype=A5000 run.sh
+qsub -o output.log -e error.log -q N -N progress -l walltime=72:00:00,mem=16gb,ncpus=1,ngpus=0,io=0.10 run.sh
 
 popd
