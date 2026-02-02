@@ -1026,10 +1026,8 @@ def add_ms_cluster_labels_gpu(calo_hits: pl.DataFrame, bandwidth: float = 120.0)
     from primary.gpu_meanshift import MeanShiftGPU
     ms_gpu = MeanShiftGPU(
         bandwidth=bandwidth, 
-        density_subsample_ratio=0.25, 
-        seed_ratio=0.05, 
-        max_iter=60,
-        device=device
+        device=device,
+        batch_size=1024,
     )
 
     # --- A. Flatten Data ---

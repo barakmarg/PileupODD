@@ -764,6 +764,8 @@ def preprocess_for_model(particles: pl.DataFrame, tracks: pl.DataFrame, calo_hit
 
 
 
+
+
 def run_preprocessing_pipeline(r=None, event_name: str="ttbar_pu0", ):
     from huggingface_hub import HfFileSystem
     import polars as pl
@@ -793,7 +795,7 @@ def run_preprocessing_pipeline(r=None, event_name: str="ttbar_pu0", ):
 
         preprocessed_data = preprocess_for_model(particles=particles, tracks=tracks,
                                                   calo_hits=calo_hits, num_of_events=-1, 
-                                                  truth_pt_cut=1, truth_eta_cut=3.0, target_pt_cut=0.3, clusters_cutoff=0.25)
+                                                  truth_pt_cut=1, truth_eta_cut=3.0, target_pt_cut=0.3, clusters_cutoff=0.23)
         
         # write preprocessed data to local disk as parquets
         file_path_data = f"/storage/agrp/barakma/PileupODD/data/{event_name}"

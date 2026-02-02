@@ -1,109 +1,203 @@
 import torch
 import numpy as np
-from sklearn.cluster._mean_shift import get_bin_seeds
 from sklearn.base import BaseEstimator, ClusterMixin
+
 class MeanShiftGPU(BaseEstimator, ClusterMixin):
-    def __init__(self, bandwidth=None, max_iter=100, density_subsample_ratio=0.2, seed_ratio=0.05, device=None):
+    """
+    Implementation of 'GPU-accelerated Faster Mean Shift with euclidean distance metrics'
+    (Le You et al., 2021) with OOM protection via batching.
+    """
+    def __init__(self, bandwidth=None, 
+                 n_initial=128, 
+                 l_factor=8, 
+                 h_factor=32, 
+                 gamma=0.9, 
+                 max_iter=300, 
+                 tol=1e-3, 
+                 batch_size=1024,  # Added batch_size to prevent OOM
+                 device=None):
         """
         Args:
-            bandwidth: The kernel bandwidth (radius).
-            max_iter: Max iterations for convergence.
-            density_subsample_ratio: (0.0 to 1.0). Portion of points used to calculate 
-                                     the density field. Lower = Faster, slightly less accurate.
-                                     0.2 is usually indistinguishable from 1.0 for blobs.
-            seed_ratio: (0.0 to 1.0). Portion of points used as starting seeds.
+            bandwidth (float): The kernel radius (h). Required.
+            n_initial (int): Initial number of seeds (N).
+            batch_size (int): Max number of seeds to process in one GPU op.
         """
         self.bandwidth = bandwidth
+        self.n_initial = n_initial
+        self.l_factor = l_factor
+        self.h_factor = h_factor
+        self.gamma = gamma
         self.max_iter = max_iter
-        self.density_subsample_ratio = density_subsample_ratio
-        self.seed_ratio = seed_ratio
+        self.tol = tol
+        self.batch_size = batch_size
         self.device = device or torch.device("cuda" if torch.cuda.is_available() else "cpu")
+        
+        self.cluster_centers_ = None
+        self.labels_ = None
 
-    def fit(self, X_tensor):
-        # X_tensor is assumed to be on GPU and Float32
+    def fit(self, X):
+        if self.bandwidth is None:
+            raise ValueError("Bandwidth must be provided.")
+
+        # 1. Data Prep
+        if isinstance(X, np.ndarray):
+            X_tensor = torch.from_numpy(X).float()
+        else:
+            X_tensor = X.float()
+        
+        X_tensor = X_tensor.to(self.device)
         n_samples = X_tensor.shape[0]
-
-        # ---------------------------------------------------------
-        # 1. Setup Seeds and Density Reference
-        # ---------------------------------------------------------
-        # A. Seeds: Randomly select starting positions
-        n_seeds = max(10, int(n_samples * self.seed_ratio))
-        # Clamp to avoid selecting more seeds than points
-        n_seeds = min(n_seeds, n_samples)
         
-        seed_indices = torch.randint(0, n_samples, (n_seeds,), device=self.device)
-        seeds = X_tensor[seed_indices]  # Shape: (n_seeds, 3)
+        # Pre-compute X norms: ||a-b||^2 = a^2 + b^2 - 2ab
+        X_sq = torch.sum(X_tensor**2, dim=1, keepdim=True).t()
 
-        # B. Density Reference (The "Stochastic" part)
-        # We compute the weighted mean against this subset, not the full 60k
-        n_ref = max(100, int(n_samples * self.density_subsample_ratio))
-        n_ref = min(n_ref, n_samples)
+        # 2. Dynamic Seed Loop
+        n_seeds = self.n_initial
         
-        ref_indices = torch.randint(0, n_samples, (n_ref,), device=self.device)
-        X_ref = X_tensor[ref_indices]   # Shape: (n_ref, 3)
+        while True:
+            # A. Select Seeds
+            if n_seeds >= n_samples:
+                seeds = X_tensor
+                n_seeds = n_samples
+            else:
+                seed_indices = torch.randperm(n_samples, device=self.device)[:n_seeds]
+                seeds = X_tensor[seed_indices]
 
-        # Pre-compute X_ref squared norm for the distance trick
-        # ||a-b||^2 = ||a||^2 + ||b||^2 - 2ab
-        # Transpose for broadcasting: (3, n_ref)
-        X_ref_t = X_ref.t()
-        X_ref_sq = torch.sum(X_ref**2, dim=1, keepdim=True).t() # (1, n_ref)
+            # B. Parallel Mean-Shift (Batched to prevent OOM)
+            converged_seeds = self._run_parallel_mean_shift(seeds, X_tensor, X_sq)
+            
+            # C. Prune Modes
+            unique_modes = self._prune_modes(converged_seeds)
+            M = unique_modes.shape[0]
+            
+            # D. Dynamic N Adjustment Logic
+            if n_seeds < self.l_factor * M and n_seeds < n_samples:
+                n_seeds *= 2
+                continue # Redo with more seeds
+            
+            self.cluster_centers_ = unique_modes
+            break
 
+        # 3. Final Labeling
+        self.labels_ = self._assign_labels(X_tensor, self.cluster_centers_)
+        
+        # Move to CPU for sklearn compatibility
+        self.cluster_centers_ = self.cluster_centers_.cpu().numpy()
+        self.labels_ = self.labels_.cpu().numpy()
+        
+        return self
+
+    def _run_parallel_mean_shift(self, seeds, X, X_sq):
+        """
+        Iterative Mean Shift with batching to avoid OOM.
+        """
+        current_seeds = seeds.clone()
         bandwidth_sq = self.bandwidth ** 2
         
-        # ---------------------------------------------------------
-        # 2. Iterative Update Loop
-        # ---------------------------------------------------------
         for i in range(self.max_iter):
-            # Seeds Squared Norm: Shape (n_seeds, 1)
-            seeds_sq = torch.sum(seeds**2, dim=1, keepdim=True)
+            n_total_seeds = current_seeds.shape[0]
+            new_seeds_list = []
             
-            # Distance Matrix Calculation (Uses Tensor Cores)
-            # Result: (n_seeds, n_ref)
-            dist_sq = torch.addmm(seeds_sq + X_ref_sq, seeds, X_ref_t, beta=1, alpha=-2)
+            # Process seeds in batches
+            for start_idx in range(0, n_total_seeds, self.batch_size):
+                end_idx = min(start_idx + self.batch_size, n_total_seeds)
+                seed_batch = current_seeds[start_idx:end_idx]
+                
+                # 1. Distances (Batch vs All X)
+                seeds_sq_batch = torch.sum(seed_batch**2, dim=1, keepdim=True)
+                
+                # Memory efficient addmm
+                # Result shape: (batch_size, n_samples)
+                dist_sq = torch.addmm(
+                    seeds_sq_batch + X_sq, 
+                    seed_batch, 
+                    X.t(), 
+                    beta=1, 
+                    alpha=-2
+                )
+                
+                # 2. Flat Kernel
+                within_bandwidth = dist_sq <= bandwidth_sq
+                
+                # 3. Update
+                # Convert boolean mask to float for matmul
+                mask_float = within_bandwidth.float()
+                
+                points_sum = torch.mm(mask_float, X)
+                points_count = mask_float.sum(dim=1, keepdim=True)
+                
+                valid_mask = points_count.squeeze() > 0
+                points_count = points_count.clamp(min=1.0)
+                
+                new_batch_pos = points_sum / points_count
+                
+                # Handle orphans (keep old position)
+                if not valid_mask.all():
+                    # We need to broadcast the valid_mask correctly
+                    # valid_mask is (batch,), new_batch_pos is (batch, D)
+                    new_batch_pos[~valid_mask] = seed_batch[~valid_mask]
+                
+                new_seeds_list.append(new_batch_pos)
             
-            # Gaussian Kernel: exp(-0.5 * d^2 / bw^2)
-            # We do in-place operations to keep memory low
-            weights = torch.exp(dist_sq.div_(-2 * bandwidth_sq)) 
-            
-            # Normalization factor (Sum of weights)
-            normalization = weights.sum(dim=1, keepdim=True)
-            normalization.clamp_(min=1e-5) # Safety
-            
-            # Weighted Average (New Cluster Centers)
-            # (Weights @ X_ref) / Sum(Weights)
-            new_seeds = torch.mm(weights, X_ref).div_(normalization)
-            
-            # Convergence Check (every 5 iterations to save overhead)
-            if i % 5 == 0:
-                # Max movement of any seed
-                diff = torch.norm(new_seeds - seeds, dim=1).max()
-                if diff < 1e-3 * self.bandwidth:
-                    seeds = new_seeds
-                    break
-            
-            seeds = new_seeds
+            # Combine updated batches
+            new_positions = torch.cat(new_seeds_list, dim=0)
 
-        # ---------------------------------------------------------
-        # 3. Merge Duplicate Centers
-        # ---------------------------------------------------------
-        # Round to merge centers that are extremely close
-        # (Round to 10% of bandwidth)
-        rounding_factor = self.bandwidth / 10.0
-        rounded_seeds = torch.round(seeds / rounding_factor) * rounding_factor
-        unique_centers = torch.unique(rounded_seeds, dim=0)
+            # 4. Convergence Check (Paper: Early Stopping)
+            shift_dist = torch.norm(new_positions - current_seeds, dim=1)
+            
+            current_seeds = new_positions
+            
+            converged_count = (shift_dist < self.tol).sum().item()
+            convergence_ratio = converged_count / n_total_seeds
+            
+            if convergence_ratio > self.gamma:
+                break
+                
+        return current_seeds
+
+    def _prune_modes(self, modes):
+        """
+        Greedy pruning on CPU to save GPU ops overhead for sequential logic.
+        """
+        if modes.shape[0] == 0:
+            return modes
+            
+        # Move to CPU for sequential merging loop (faster for small N)
+        modes_cpu = modes.cpu().numpy()
+        n_modes = modes_cpu.shape[0]
         
-        # ---------------------------------------------------------
-        # 4. Final Label Assignment (Using ALL points)
-        # ---------------------------------------------------------
-        # Now we use the full X_tensor to assign labels to the found centers
-        self.cluster_centers_ = unique_centers
+        # Calculate distances between modes
+        from sklearn.metrics.pairwise import euclidean_distances
+        dists = euclidean_distances(modes_cpu, squared=True)
+        bw_sq = self.bandwidth ** 2
         
-        # Dist(All_Points, Centers)
-        # X: (N, 3), Centers: (C, 3)
-        c_sq = torch.sum(unique_centers**2, dim=1, keepdim=True).t()
-        x_sq = torch.sum(X_tensor**2, dim=1, keepdim=True)
+        keep = np.ones(n_modes, dtype=bool)
         
-        dist_matrix = torch.addmm(x_sq + c_sq, X_tensor, unique_centers.t(), beta=1, alpha=-2)
+        # Greedy suppression
+        for i in range(n_modes):
+            if keep[i]:
+                # Find neighbors
+                neighbors = dists[i] <= bw_sq
+                neighbors[i] = False # Don't remove self
+                keep[neighbors] = False
+                
+        # Return unique modes on GPU
+        return modes[torch.from_numpy(keep).to(self.device)]
+
+    def _assign_labels(self, X, centers):
+        if centers.shape[0] == 0:
+            return torch.zeros(X.shape[0], dtype=torch.long, device=self.device) - 1
+            
+        labels_list = []
+        c_sq = torch.sum(centers**2, dim=1, keepdim=True).t()
         
-        self.labels_ = torch.argmin(dist_matrix, dim=1)
-        return self
+        # Batch X to avoid OOM during inference
+        inference_batch = self.batch_size * 2
+        
+        for i in range(0, X.shape[0], inference_batch):
+            X_batch = X[i : i+inference_batch]
+            x_sq = torch.sum(X_batch**2, dim=1, keepdim=True)
+            dist = torch.addmm(x_sq + c_sq, X_batch, centers.t(), beta=1, alpha=-2)
+            labels_list.append(torch.argmin(dist, dim=1))
+            
+        return torch.cat(labels_list)
