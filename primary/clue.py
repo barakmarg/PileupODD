@@ -54,7 +54,7 @@ def run_clue_hybrid(points, energy, dc=2.0, rhoc=4.0, dm=4.0, max_num_neighbors=
     dist_sq = (diff * diff).sum(dim=1)
     
     t_graph = get_time()
-    print(f"[GPU] Graph Build:    {t_graph - t_start:.4f}s | Edges: {row.size(0)}")
+    #print(f"[GPU] Graph Build:    {t_graph - t_start:.4f}s | Edges: {row.size(0)}")
 
     # -----------------------------------------------------------
     # STEP 2: LOCAL DENSITY (RHO)
@@ -65,7 +65,7 @@ def run_clue_hybrid(points, energy, dc=2.0, rhoc=4.0, dm=4.0, max_num_neighbors=
     rho = scatter_add(energy[col[rho_mask]], row[rho_mask], dim=0, dim_size=N)
 
     t_rho = get_time()
-    print(f"[GPU] Rho Calc:       {t_rho - t_graph:.4f}s")
+    #print(f"[GPU] Rho Calc:       {t_rho - t_graph:.4f}s")
 
     # -----------------------------------------------------------
     # STEP 3: NEAREST HIGHER DENSITY (DELTA)
@@ -114,7 +114,7 @@ def run_clue_hybrid(points, energy, dc=2.0, rhoc=4.0, dm=4.0, max_num_neighbors=
     delta = delta_sq.sqrt()
     
     t_delta = get_time()
-    print(f"[GPU] Delta Calc:     {t_delta - t_rho:.4f}s")
+    #print(f"[GPU] Delta Calc:     {t_delta - t_rho:.4f}s")
 
     # -----------------------------------------------------------
     # STEP 4: IDENTIFY SEEDS
@@ -132,7 +132,7 @@ def run_clue_hybrid(points, energy, dc=2.0, rhoc=4.0, dm=4.0, max_num_neighbors=
     cpu_nh_idx = nearest_higher_idx.cpu().numpy() 
     
     t_transfer = get_time()
-    print(f"[Trans] GPU -> CPU:   {t_transfer - t_seeds:.4f}s")
+    #print(f"[Trans] GPU -> CPU:   {t_transfer - t_seeds:.4f}s")
 
     # Initialize Cluster IDs (-1 for noise)
     cluster_ids = np.full(N, -1, dtype=np.int32)
@@ -169,9 +169,9 @@ def run_clue_hybrid(points, energy, dc=2.0, rhoc=4.0, dm=4.0, max_num_neighbors=
     final_cluster_ids = cluster_ids[predecessor]
 
     t_end = get_time()
-    print(f"[CPU] Pointer Jump:   {t_end - t_transfer:.4f}s (Converged in {steps} steps)")
-    print(f"-------------------------------------------")
-    print(f"Total Time:           {t_end - t_start:.4f}s")
-    print(f"Found {num_seeds} clusters.")
+    #print(f"[CPU] Pointer Jump:   {t_end - t_transfer:.4f}s (Converged in {steps} steps)")
+    #print(f"-------------------------------------------")
+    #print(f"Total Time:           {t_end - t_start:.4f}s")
+    #print(f"Found {num_seeds} clusters.")
 
     return rho, delta, is_seed, final_cluster_ids
