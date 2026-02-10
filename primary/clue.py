@@ -9,7 +9,7 @@ import time
 from torch_scatter import scatter_add, scatter_min
 from torch_cluster import radius_graph
 
-def run_clue_hybrid(points, energy, dc=2.0, rhoc=4.0, dm=4.0, max_num_neighbors=400):
+def run_clue_hybrid(points, energy, batch=None, dc=2.0, rhoc=4.0, dm=4.0, max_num_neighbors=400):
     """
     Robust Hybrid CLUE Algorithm.
     - GPU: Graph building, Rho, Delta.
@@ -27,9 +27,27 @@ def run_clue_hybrid(points, energy, dc=2.0, rhoc=4.0, dm=4.0, max_num_neighbors=
     # -----------------------------------------------------------
     # PREPARATION
     # -----------------------------------------------------------
+    # Handle Batch Dimension (B, N, C) -> (B*N, C)
+    is_batched_input = False
+    if points.dim() == 3:
+        is_batched_input = True
+        B, N_per_event, D = points.size()
+        
+        # Flatten input
+        points = points.reshape(-1, D) # (B*N, D)
+        if energy.dim() == 2:
+            energy = energy.reshape(-1) # (B*N)
+            
+        # Auto-generate batch vector if not provided
+        if batch is None:
+            # Create batch index [0, 0, ..., 1, 1, ...] on the same device
+            batch = torch.arange(B, device=points.device).repeat_interleave(N_per_event)
+            
     if not points.is_cuda and torch.cuda.is_available():
         points = points.cuda()
         energy = energy.cuda()
+        if batch is not None:
+            batch = batch.cuda()
     
     # Ensure energy is 1D (N,)
     if energy.dim() > 1:
@@ -37,6 +55,15 @@ def run_clue_hybrid(points, energy, dc=2.0, rhoc=4.0, dm=4.0, max_num_neighbors=
         
     device = points.device
     N = points.size(0)
+    
+    # -----------------------------------------------------------
+    # STEP 0: MASKING PADDING
+    # -----------------------------------------------------------
+    # Assume points with negative energy are padding/invalid
+    valid_mask = energy >= 0
+    if not valid_mask.all():
+        # Set energy of invalid points to 0 to be safe for scatter_add
+        energy = energy * valid_mask.float()
     
     dc2 = dc * dc
     dm2 = dm * dm
@@ -46,8 +73,17 @@ def run_clue_hybrid(points, energy, dc=2.0, rhoc=4.0, dm=4.0, max_num_neighbors=
     # STEP 1: GRAPH BUILDING
     # -----------------------------------------------------------
     # radius_graph returns [2, E]
-    edge_index = radius_graph(points, r=max_r, max_num_neighbors=max_num_neighbors, loop=True)
+    edge_index = radius_graph(points, r=max_r, batch=batch, max_num_neighbors=max_num_neighbors, loop=True)
     row, col = edge_index
+    
+    # Filter edges regarding valid mask
+    # We only want edges where both source (row) AND target (col) are valid
+    if not valid_mask.all():
+        is_valid_edge = valid_mask[row] & valid_mask[col]
+        row = row[is_valid_edge]
+        col = col[is_valid_edge]
+    
+    # Compute squared distances
     
     # Compute squared distances
     diff = points[row] - points[col]
@@ -167,6 +203,14 @@ def run_clue_hybrid(points, energy, dc=2.0, rhoc=4.0, dm=4.0, max_num_neighbors=
     # If Root is a Seed, we get a Cluster ID.
     # If Root is a Noise Peak (rho < rhoc), it has ID -1, so we get -1.
     final_cluster_ids = cluster_ids[predecessor]
+    
+
+    # Return to original shape if input was (B, N, C)
+    if is_batched_input:
+        rho = rho.view(B, N_per_event)
+        delta = delta.view(B, N_per_event)
+        is_seed = is_seed.view(B, N_per_event)
+        final_cluster_ids = final_cluster_ids.reshape(B, N_per_event)
 
     t_end = get_time()
     #print(f"[CPU] Pointer Jump:   {t_end - t_transfer:.4f}s (Converged in {steps} steps)")
