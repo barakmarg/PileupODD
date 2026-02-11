@@ -1,3 +1,5 @@
+import polars as pl
+
 PDG_ID_TO_NAME = {
     # --- Quarks ---
     1: "d",
@@ -197,5 +199,53 @@ PDG_ID_TO_NAME = {
     -999: "residual/unknown"
 }
 PDG_ID_TO_NAME = {str(k): v for k, v in PDG_ID_TO_NAME.items()}
+
+STABLE_PDG_IDS = [
+    # --- Leptons (reach calorimeter) ---
+    11, -11,    # e-, e+
+    12, -12,    # ve, anti-ve
+    13, -13,    # mu-, mu+
+    14, -14,    # vmu, anti-vmu
+    16, -16,    # vtau, anti-vtau
+
+    # --- Gauge Bosons ---
+    22,         # gamma
+
+    # --- Long-Lived Mesons ---
+    130,        # K0L (c*tau ~ 15m)
+    211, -211,  # pi+, pi- (c*tau ~ 7.8m)
+    321, -321,  # K+, K- (c*tau ~ 3.7m)
+
+    # --- Stable Baryons ---
+    2112, -2112, # n, anti-n
+    2212, -2212, # p, anti-p
+
+    # --- Nuclei & Ions ---
+    1000010020, -1000010020, # Deuteron
+    1000010030, -1000010030, # Triton
+    1000020030, -1000020030, # He3
+    1000020040, -1000020040, # He4
+    1000030060, # Li6
+    1000030070, # Li7
+    1000040090, # Be9
+    1000050100, # B10
+    1000050110, # B11
+    1000060120, # C12
+    1000060130, # C13
+    1000070140, # N14
+    1000080160, # O16
+    1000090190, # F19
+    1000120240, # Mg24
+    1000120250, # Mg25
+    1000120260, # Mg26
+    1000130260, # Al26
+    1000130270, # Al27
+    1000140280, # Si28
+    1000140290, # Si29
+    1000140300  # Si30
+]
 # Reverse mapping: particle name to PDG ID (assuming unique names)
 particle_name_to_id = {v: int(k) for k, v in PDG_ID_TO_NAME.items()}
+
+stable_pdg_ids_df = pl.DataFrame({"pdg_id": STABLE_PDG_IDS})
+
