@@ -4,7 +4,7 @@ import yaml # type: ignore
 
 from sklearn.model_selection import train_test_split
 from primary.preprocessing import add_eta_and_phi_and_pt, add_eta_and_phi_and_pt, add_ms_cluster_labels, add_ms_cluster_labels, \
-     add_orphan_mask, add_created_inside_calo_mask, add_particle_have_track_mask, set_target_particles_maskv3, get_particles_id_parent_of_inside_calo_particles_maskv3, \
+     add_orphan_mask, add_created_inside_calo_mask, add_particle_have_track_mask, set_target_particles_maskv4, get_particles_id_parent_of_inside_calo_particles_maskv3, \
     add_eta_and_phi_and_pt, add_ms_cluster_labels, backtrack_to_target, cluster_purity, calculate_extrapolated_features_polars
 from primary.calibration import CALIBRATION
 
@@ -636,7 +636,7 @@ def preprocess_for_model(particles: pl.DataFrame, tracks: pl.DataFrame, calo_hit
     particles = add_particle_have_track_mask(particles, tracks)
     particles = add_eta_and_phi_and_pt(particles)
     particles = get_particles_id_parent_of_inside_calo_particles_maskv3(particles, calo_hits)
-    particles = set_target_particles_maskv3(particles, truth_eta_cut=truth_eta_cut, truth_pt_cut=truth_pt_cut, target_pt_cut=target_pt_cut)
+    particles = set_target_particles_maskv4(particles, truth_eta_cut=truth_eta_cut, truth_pt_cut=truth_pt_cut, target_pt_cut=target_pt_cut)
 
 
     # apply cuts, filter out tracks related to non target particles

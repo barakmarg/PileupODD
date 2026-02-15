@@ -481,6 +481,13 @@ def map_calo_depositors_to_first_outside_ancestor(
             pl.col('event_id'),
             pl.col('particle_id').cast(pl.Int64)
         ])
+        # make sure it is inside particles df (pileup stuff)
+        .join(
+            particles.lazy().select(['event_id', 'particle_id']).explode('particle_id').with_columns(pl.col('particle_id')),
+            left_on=['event_id', 'particle_id'],
+            right_on=['event_id', 'particle_id'],
+            how='inner'
+        )
     )
 
     # Initialize the active trace by joining depositors with the lookup table
@@ -2155,7 +2162,8 @@ def set_target_particles_maskv4(
 
     # Now we proceed of removing non-stable particle that appear to be in target because they have low energetic children that are not saved
     # in truth records, and the odd guys attribute the caloremeter dep to the non stable particle
-    # Logic - filter just those who appear to have also decendants in target.
+    # Logic - filter just those unstable ones
+    # drawback - if they have all decendants < 100 Mev, it will bw ignored completetly.
     unstables_series = unstable_pdg_ids_df.select('pdg_id').to_series()
     almost_target_particles = almost_target_particles.filter(
         (pl.col('has_track')) | (~pl.col('pdg_id').is_in(unstables_series))
