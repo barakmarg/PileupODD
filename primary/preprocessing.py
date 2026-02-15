@@ -18,7 +18,7 @@ from concurrent.futures import ProcessPoolExecutor
 import polars as pl
 import numpy as np
 import fastjet
-from primary.pdg_mappings import stable_pdg_ids_df
+from primary.pdg_mappings import stable_pdg_ids_df, unstable_pdg_ids_df
 
 def _fastjet_worker(payload):
     """
@@ -2155,37 +2155,11 @@ def set_target_particles_maskv4(
 
     # Now we proceed of removing non-stable particle that appear to be in target because they have low energetic children that are not saved
     # in truth records, and the odd guys attribute the caloremeter dep to the non stable particle
-    # Logic - filter just those who appear to have also children in target.
-    stables_series = stable_pdg_ids_df.select('pdg_id').to_series()
-    to_filter = (
-        almost_target_particles.lazy()
-        .select(['event_id', 'particle_id', 'has_track', 'pdg_id'])
-        .filter(~pl.col('has_track'))
-        .filter(~pl.col('pdg_id').is_in(stables_series))
-        .join(
-            particles.lazy().select(['event_id', 'particle_id', 'parent_id'])
-            .explode(['event_id', 'particle_id', 'parent_id'])
-            .rename({'particle_id':'child_particle_id'}),
-            left_on=['event_id', 'particle_id'],
-            right_on=['event_id', 'parent_id'],
-            how='inner'
-            )
-        .join(
-            almost_target_particles.lazy().select(['event_id', 'particle_id']),
-            left_on=['event_id', 'child_particle_id'],
-            right_on=['event_id', 'particle_id'],
-            how='inner'
-        )
-        .select(['event_id', 'particle_id'])
-        .unique() 
-        ).collect(streaming=True)
-    
-    almost_target_particles = almost_target_particles.lazy().join(
-        to_filter.lazy(),
-        on=['event_id', 'particle_id'],
-        how='anti'
-    ).collect(streaming=True)
-
+    # Logic - filter just those who appear to have also decendants in target.
+    unstables_series = unstable_pdg_ids_df.select('pdg_id').to_series()
+    almost_target_particles = almost_target_particles.filter(
+        (pl.col('has_track')) | (~pl.col('pdg_id').is_in(unstables_series))
+    )
     # --------------------------------
     back_track_p = (almost_target_particles
     .select(['event_id', 'particle_id', 'has_track'])
