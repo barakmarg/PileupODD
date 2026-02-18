@@ -253,15 +253,65 @@ def plot_calo_clusters_interactive(calo_hits: pl.DataFrame,
     fig.data[0].on_click(update_point)
     fig.data[1].on_click(update_point)
 
-    # --- 7. Layout ---
+    # --- 7. Distance Calculator ---
+    cluster_centers = unique_clusters.to_dict(as_series=False)
+    cluster_ids_set = set(unique_clusters["cluster_id"].to_numpy())
+
+    # Create widgets for distance calculation
+    txt_cluster1 = widgets.IntText(value=0, placeholder='Cluster ID 1', description='Cluster 1:', layout=widgets.Layout(width='200px'))
+    txt_cluster2 = widgets.IntText(value=0, placeholder='Cluster ID 2', description='Cluster 2:', layout=widgets.Layout(width='200px'))
+    btn_calc_distance = widgets.Button(description='Calculate Distance', button_style='info', layout=widgets.Layout(width='150px'))
+    result_box = widgets.HTML("<b>Distance Result:</b> Enter cluster IDs and click Calculate")
+
+    def calculate_distance(_):
+        cid1 = txt_cluster1.value
+        cid2 = txt_cluster2.value
+
+        # Check if cluster IDs are valid
+        if cid1 not in cluster_ids_set:
+            result_box.value = f"<b style='color:red'>Error: Cluster ID {cid1} not found</b>"
+            return
+        if cid2 not in cluster_ids_set:
+            result_box.value = f"<b style='color:red'>Error: Cluster ID {cid2} not found</b>"
+            return
+
+        # Get cluster centers
+        idx1 = unique_clusters.filter(pl.col("cluster_id") == cid1).select(["cx", "cy", "cz"])
+        idx2 = unique_clusters.filter(pl.col("cluster_id") == cid2).select(["cx", "cy", "cz"])
+
+        if len(idx1) == 0 or len(idx2) == 0:
+            result_box.value = "<b style='color:red'>Error: Could not retrieve cluster coordinates</b>"
+            return
+
+        x1, y1, z1 = idx1["cx"][0], idx1["cy"][0], idx1["cz"][0]
+        x2, y2, z2 = idx2["cx"][0], idx2["cy"][0], idx2["cz"][0]
+
+        # Calculate Euclidean distance
+        distance = np.sqrt((x2 - x1)**2 + (y2 - y1)**2 + (z2 - z1)**2)
+
+        # Display result
+        result_box.value = (
+            f"<div style='border:2px solid #2ca02c; padding:10px; background-color:#f0f8f0; border-radius:5px;'>"
+            f"<b>Distance between Cluster {cid1} and Cluster {cid2}:</b><br>"
+            f"<span style='font-size:18px; color:#2ca02c;'><b>{distance:.4f}</b></span> (units)<br>"
+            f"<small>Center 1: ({x1:.2f}, {y1:.2f}, {z1:.2f})<br>"
+            f"Center 2: ({x2:.2f}, {y2:.2f}, {z2:.2f})</small>"
+            f"</div>"
+        )
+
+    btn_calc_distance.on_click(calculate_distance)
+
+    distance_row = widgets.HBox([txt_cluster1, txt_cluster2, btn_calc_distance])
+
+    # --- 8. Layout ---
     fig.update_layout(
         title=f"Event {event_idx} | {len(hs_clusters)} Hard Scatter / {len(pu_clusters)} Pileup Clusters",
         scene=dict(xaxis_title="x", yaxis_title="y", zaxis_title="z"),
         template="plotly_white", margin=dict(l=0, r=0, b=0, t=50), height=700,
         legend=dict(x=0, y=1, orientation="v")
     )
-    
-    return fig
+
+    return widgets.VBox([distance_row, result_box, fig])
 # -----------------------------------------------------------------------------
 
 import plotly.graph_objs as go

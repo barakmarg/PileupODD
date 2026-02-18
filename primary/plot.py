@@ -412,17 +412,21 @@ def plot_num_contributing_clusters(
     fig, ax = plt.subplots(figsize=figsize)
     counts, bins, patches = ax.hist(data, bins=discrete_bins, color="steelblue", edgecolor="black", alpha=0.75)
     
-    # Calculate percentage of first bin
+    # Calculate percentage of first bin and second bin
+    first_bin_val = int(bins[0] + 0.5)
     first_bin_count = counts[0]
     total_count = sum(counts)
     first_bin_percentage = (first_bin_count / total_count) * 100
     
-    second_bin_count = counts[1]
+    second_bin_val = int(bins[1] + 0.5)
+    second_bin_count = counts[1] if len(counts) > 1 else 0
     second_bin_percentage = (second_bin_count / total_count) * 100
+    
     # Set labels and title with cuts information
     ax.set_xlabel("Number of contributing clusters")
     ax.set_ylabel("Count")
-    title = f"#cluster/particle distribution (First bin(0): {first_bin_percentage:.1f}%, Second bin(1): {second_bin_percentage:.1f}%)"
+    # title = f"#cluster/particle distribution (First bin(0): {first_bin_percentage:.1f}%, Second bin(1): {second_bin_percentage:.1f}%)"
+    title= f"#cluster/particle distribution (bin {first_bin_val}: {first_bin_percentage:.1f}%, bin {second_bin_val}: {second_bin_percentage:.1f}%)"
     title += f"\nCuts: pt>{pt_cut} GeV, |η|<{eta_cut}, particle_contrib_cut_off={cut_off_percent*100:.1f}%"
     ax.set_title(title)
     
@@ -489,15 +493,21 @@ def plot_num_contributing_ancestors(
     fig, ax = plt.subplots(figsize=figsize)
     counts, bins, patches = ax.hist(data, bins=discrete_bins, color="steelblue", edgecolor="black", alpha=0.75)
     
-    # Calculate percentage of first bin
-    first_bin_count = counts[0]
+    # Calculate percentage of first bin and second bin
     total_count = sum(counts)
+    
+    first_bin_val = int(bins[0] + 0.5)
+    first_bin_count = counts[0]
     first_bin_percentage = (first_bin_count / total_count) * 100
+    
+    second_bin_val = int(bins[1] + 0.5) if len(bins) > 1 else first_bin_val + 1
+    second_bin_count = counts[1] if len(counts) > 1 else 0
+    second_bin_percentage = (second_bin_count / total_count) * 100
     
     # Set labels and title with cuts information
     ax.set_xlabel("Number of particles per cluster")
     ax.set_ylabel("Count")
-    title = f"#particles/cluster distribution (First bin: {first_bin_percentage:.1f}%)"
+    title = f"#particles/cluster distribution (bin {first_bin_val}: {first_bin_percentage:.1f}%, bin {second_bin_val}: {second_bin_percentage:.1f}%)"
     title += f"\nCuts: pt>{pt_cut} GeV, |η|<{eta_cut}, cluster_contrib_cut_off={cut_off_percent*100:.1f}%"
     ax.set_title(title)
     

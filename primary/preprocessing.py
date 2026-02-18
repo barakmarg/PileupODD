@@ -1328,7 +1328,8 @@ def number_of_particles_per_cluster(calo_hits_with_clusters: pl.DataFrame, ances
         pt_cut: Transverse momentum cut in GeV (default: 1.0).
         eta_cut: Pseudorapidity cut (default: 3.0).
     """
-    
+    event_ids = calo_hits_with_clusters['event_id'].unique()
+
     ancestors_lazy = (
         ancestors.lazy()
         .select(['event_id', 'src_particle_id', 'target_particle_id'])
@@ -1349,6 +1350,7 @@ def number_of_particles_per_cluster(calo_hits_with_clusters: pl.DataFrame, ances
     # Prepare particles with cuts (Lazy)
     particles_filtered = (
         particles.lazy()
+        .filter(pl.col('event_id').is_in(event_ids)) # Only keep particles from relevant events 
         .select(['event_id', 'particle_id', 'pt', 'eta', 'is_target_particle'])
         .explode(['particle_id', 'pt', 'eta', 'is_target_particle'])
         .with_columns(pl.col('particle_id').cast(pl.Int64))
@@ -1364,7 +1366,8 @@ def number_of_particles_per_cluster(calo_hits_with_clusters: pl.DataFrame, ances
         # B. Explode Level 1: Cells
         # We need to align detector ID with the lists of energies
         .explode(['contrib_energies', 'contrib_particle_ids', 'cluster_id', 'detector'])
-        
+        .filter(pl.col('cluster_id')>=0)
+
         # C. Join Calibration (Cell Level)
         # This is more efficient than joining after the second explode
         .join(
@@ -1435,7 +1438,7 @@ def number_of_clusters_per_particle(calo_hits_with_clusters: pl.DataFrame, ances
     Computes the purity/efficiency of each cluster based on ultimate ancestors.
     Optimized for memory using lazy execution, strict column selection, and window functions.
     """
-    
+    event_ids = calo_hits_with_clusters['event_id'].unique()
     ancestors_lazy = (
         ancestors.lazy()
         .select(['event_id', 'src_particle_id', 'target_particle_id'])
@@ -1461,7 +1464,7 @@ def number_of_clusters_per_particle(calo_hits_with_clusters: pl.DataFrame, ances
         # B. Explode Level 1: Cells
         # We need to align detector ID with the lists of energies
         .explode(['contrib_energies', 'contrib_particle_ids', 'cluster_id', 'detector'])
-        
+        .filter(pl.col('cluster_id')>=0)
         # C. Join Calibration (Cell Level)
         # This is more efficient than joining after the second explode
         .join(
@@ -1516,6 +1519,7 @@ def number_of_clusters_per_particle(calo_hits_with_clusters: pl.DataFrame, ances
     return (
         particles.lazy()
         .select(['event_id', 'particle_id', 'is_target_particle', 'pt', 'eta'])
+        .filter(pl.col('event_id').is_in(event_ids))
         .explode(['particle_id', 'is_target_particle', 'pt', 'eta'])
         .filter((pl.col('is_target_particle'))
                 & (pl.col('pt') > pt_cut)
