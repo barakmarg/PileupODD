@@ -2124,6 +2124,7 @@ def set_target_particles_maskv3(
 
 def set_target_particles_maskv4(
     particles: pl.DataFrame, 
+    tracks: pl.DataFrame,
     truth_eta_cut: float = 3.0,
     truth_pt_cut: float = 1.0,
     target_pt_cut: float = 0.2
@@ -2190,6 +2191,7 @@ def set_target_particles_maskv4(
         .unique()]).with_columns(pl.lit(True).alias('is_target_particle'))
     # Now apply cuts!
     # Accept target if  truth ancestor has pt>pt_cut and target particle pt>pt_cut/3
+    # BUT if it's tracked particle than filtering logic should be applied based on track info also
     particle_roots_no_parents = (
         particles.lazy()
         .select(['event_id', 'particle_id', 'is_parent_missing'])
@@ -2216,10 +2218,19 @@ def set_target_particles_maskv4(
                         right_on=['event_id', 'truth_particle_id'],
                         how='inner',
                     )
-                    .filter(
-                        (pl.col('pt_truth') > truth_pt_cut) & (pl.col('pt_target') > target_pt_cut) &
-                        (pl.col('eta_truth').abs() < truth_eta_cut)
+                    .join(
+                        (tracks.lazy().select(['event_id', 'majority_particle_id', 'pt', 'eta']).rename({'majority_particle_id':'particle_id', 'pt':'track_pt', 'eta':'track_eta'})
+                        .explode(['particle_id', 'track_pt', 'track_eta'])),
+                        left_on=['event_id', 'target_particle_id'],
+                        right_on=['event_id', 'particle_id'],
+                        how='left'
                     )
+                    .filter(
+                        (((pl.col('pt_truth') > truth_pt_cut) & (pl.col('pt_target') > target_pt_cut) & (pl.col('eta_truth').abs() < truth_eta_cut)) |
+                         
+                         (pl.col('track_pt').is_not_null() & (pl.col('track_pt') > target_pt_cut) & (pl.col('track_eta').abs() < truth_eta_cut)))
+                    )
+                    .drop('track_pt', 'track_eta')
                     .select(['event_id', 'target_particle_id'])
                     .unique()
                     .rename({'target_particle_id':'particle_id'})
