@@ -488,7 +488,10 @@ def filter_orphans_and_reindex(
             on=['event_id', 'particle_id'],
             how='left'
         )
-        .group_by('event_id')
+        .with_columns(
+            pl.col('particle_idx').fill_null(-1) # Mark tracks that lost their particle mapping (orphans) with -1
+        )
+        .group_by('event_id', maintain_order=True)
         .agg(
             pl.col('particle_idx').sort_by('local_order')
         )
@@ -531,6 +534,7 @@ def create_calo_clusters(calo_hits: pl.DataFrame) -> pl.DataFrame:
         .select(['event_id', 'cluster_id', 'cluster_cx', 'cluster_cy', 'cluster_cz'])
         .explode(['cluster_id', 'cluster_cx', 'cluster_cy', 'cluster_cz'])
         # Deduplicate
+        .filter(pl.col('cluster_id')>=0)
         .group_by(['event_id', 'cluster_id'])
         .agg([
             pl.col('cluster_cx').first(),
@@ -643,15 +647,20 @@ def preprocess_for_model(particles: pl.DataFrame, tracks: pl.DataFrame, calo_hit
         pl.col(pl.Float64).cast(pl.Float32),
         pl.col(pl.List(pl.Float64)).cast(pl.List(pl.Float32))
     ])
-    particles_hard_scatter_ids=(particles.lazy().with_columns(
-        _indices = pl.col("vertex_primary").list.eval(
-            (pl.element() == 1).arg_true()
-        )
-    ).with_columns(
-        # 2. Use those indices to pick elements from all other list columns
-        pl.exclude("event_id", "_indices")
-        .list.gather(pl.col("_indices"))
-    ).drop("_indices").sort("event_id")
+    particles = (particles.lazy().with_columns(
+                # 1. Find the INDICES strictly inside list.eval()
+                # (pl.element() == 1) creates a boolean mask
+                # .arg_true() converts that mask to indices
+                _indices = pl.col("vertex_primary").list.eval(
+                    (pl.element() == 1).arg_true()
+                )
+            ).with_columns(
+                # 2. Use those indices to pick elements from all other list columns
+                pl.exclude("event_id", "_indices")
+                .list.gather(pl.col("_indices"))
+            ).drop("_indices").sort("event_id")
+)
+    particles_hard_scatter_ids=(particles.lazy()
     .select('event_id', 'particle_id')
     ).collect()
 
@@ -659,7 +668,7 @@ def preprocess_for_model(particles: pl.DataFrame, tracks: pl.DataFrame, calo_hit
     print("[EXTRAPOLATED FEATURES] Calculating extrapolated track features...")
     tracks = calculate_extrapolated_features_polars(tracks)
     print(f"[EXTRAPOLATED FEATURES DONE] RAM: {process.memory_info().rss / 1024 / 1024:.2f} MB")
-    
+
     print(f"[CASTING DONE] RAM: {process.memory_info().rss / 1024 / 1024:.2f} MB")
 
     print("[ORPHAN MASK] Adding orphan mask...")
@@ -674,26 +683,6 @@ def preprocess_for_model(particles: pl.DataFrame, tracks: pl.DataFrame, calo_hit
     particles = add_particle_have_track_mask(particles, tracks)
     print(f"[TRACK MASK DONE] RAM: {process.memory_info().rss / 1024 / 1024:.2f} MB")
     
-    # Now keep only hardscatter particles + pileup particles that have tracks
-    print("[FILTERING PARTICLES] Filtering hardscatter and pileup particles with tracks...")
-    particles = particles.lazy().with_columns(
-        # 1. Calculate indices where vertex_primary == 1
-        idx1 = pl.col("vertex_primary").list.eval((pl.element() == 1).arg_true()) ,
-
-        # 2. Calculate indices where has_track == True
-        idx2 = pl.col("has_track").list.eval((pl.element() == True).arg_true()) ,
-    ).with_columns(
-        # 3. Combine the indices
-        _indices = (pl.concat_list([pl.col("idx1"), pl.col("idx2")])
-                    .list.unique()
-                    .list.sort() # Important to keep the order correct
-                    ),
-    ).with_columns(
-        # 4. Use those indices to pick elements from all other list columns
-        pl.exclude("event_id", "idx1", "idx2", "_indices")
-        .list.gather(pl.col("_indices"))
-    ).drop("idx1", "idx2", "_indices").collect()
-    print(f"[FILTERING PARTICLES DONE] RAM: {process.memory_info().rss / 1024 / 1024:.2f} MB")
 
     # ---------------------
     print("[ETA PHI PT] Adding eta, phi, pt...")
@@ -708,7 +697,6 @@ def preprocess_for_model(particles: pl.DataFrame, tracks: pl.DataFrame, calo_hit
     particles = set_target_particles_maskv4(particles, truth_eta_cut=truth_eta_cut, truth_pt_cut=truth_pt_cut, target_pt_cut=target_pt_cut, tracks=tracks)
     print(f"[TARGET PARTICLES MASK DONE] RAM: {process.memory_info().rss / 1024 / 1024:.2f} MB")
 
-    # apply cuts, filter out tracks related to non target particles
     print("[PROCESSING TRACKS] Filtering and processing tracks...")
     track_cols = [c for c in tracks.columns if c != 'event_id']
     tracks = (
@@ -722,17 +710,9 @@ def preprocess_for_model(particles: pl.DataFrame, tracks: pl.DataFrame, calo_hit
         )
         .select(['event_id', 'local_order'] + track_cols)
         .explode(['local_order'] + track_cols)
+        .filter(pl.col('pt') > truth_pt_cut)
+        .filter(pl.col('eta').abs() < truth_eta_cut)
         .with_columns(pl.col('majority_particle_id').cast(pl.Int64))
-        .join(
-            particles.lazy()
-            .select(['event_id', 'particle_id', 'is_target_particle'])
-            .explode(['particle_id', 'is_target_particle'])
-            .filter(pl.col('is_target_particle'))
-            .with_columns(pl.col('particle_id').cast(pl.Int64)),
-            left_on=['event_id', 'majority_particle_id'],
-            right_on=['event_id', 'particle_id'],
-            how='left'
-        )
         .sort(['event_id', 'local_order'])
         .group_by('event_id', maintain_order=True)
         .agg([pl.col(c) for c in track_cols])
@@ -757,6 +737,7 @@ def preprocess_for_model(particles: pl.DataFrame, tracks: pl.DataFrame, calo_hit
             pl.col('hit_energy_gev').sum().over(['event_id', 'cluster_id']).alias('cluster_sum_energy')
         )
         .filter(pl.col('cluster_sum_energy') > clusters_cutoff)
+        .filter(pl.col('cluster_id') >= 0) # Remove noise hits that were not clustered
         .drop(['calib_factor', 'hit_energy_gev', 'cluster_sum_energy'])
         .group_by(['_event_idx_temp', 'event_id'], maintain_order=True)
         .agg(pl.all().exclude(['_event_idx_temp', 'event_id']))

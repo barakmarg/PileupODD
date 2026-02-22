@@ -2228,7 +2228,8 @@ def set_target_particles_maskv4(
                     .filter(
                         (((pl.col('pt_truth') > truth_pt_cut) & (pl.col('pt_target') > target_pt_cut) & (pl.col('eta_truth').abs() < truth_eta_cut)) |
                          
-                         (pl.col('track_pt').is_not_null() & (pl.col('track_pt') > target_pt_cut) & (pl.col('track_eta').abs() < truth_eta_cut)))
+                         (pl.col('track_pt').is_not_null() & (pl.col('track_pt') > target_pt_cut) & (pl.col('track_eta').abs() < truth_eta_cut))
+                         )
                     )
                     .drop('track_pt', 'track_eta')
                     .select(['event_id', 'target_particle_id'])
