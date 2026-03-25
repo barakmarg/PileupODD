@@ -647,6 +647,40 @@ def preprocess_for_model(particles: pl.DataFrame, tracks: pl.DataFrame, calo_hit
         pl.col(pl.Float64).cast(pl.Float32),
         pl.col(pl.List(pl.Float64)).cast(pl.List(pl.Float32))
     ])
+    print("[EXTRAPOLATED FEATURES] Calculating extrapolated track features...")
+    tracks = calculate_extrapolated_features_polars(tracks)
+
+    print(f"[EXTRAPOLATED FEATURES DONE] RAM: {process.memory_info().rss / 1024 / 1024:.2f} MB")
+
+    print("[PROCESSING TRACKS] Filtering and processing tracks...")
+    track_cols = [c for c in tracks.columns if c != 'event_id']
+    tracks = (
+        tracks.lazy()
+        .with_columns(
+            local_order=pl.int_ranges(
+                start=0,
+                end=pl.col('majority_particle_id').list.len(), 
+                dtype=pl.UInt32
+            )
+        )
+        .select(['event_id', 'local_order'] + track_cols)
+        .explode(['local_order'] + track_cols)
+        .filter(pl.col('pt') > truth_pt_cut)
+        .filter(pl.col('eta').abs() < truth_eta_cut)
+        .join(
+            particles.lazy().select(['event_id', 'particle_id', 'vertex_primary']).explode('particle_id', 'vertex_primary'),
+            left_on=['event_id', 'majority_particle_id'],
+            right_on=['event_id', 'particle_id'],
+            how='left'
+        )
+        .with_columns(pl.col('majority_particle_id').cast(pl.Int64))
+        .sort(['event_id', 'local_order'])
+        .group_by('event_id', maintain_order=True)
+        .agg([pl.col(c) for c in track_cols]+ [pl.col('vertex_primary')])
+        .sort('event_id')
+        .collect(streaming=True)
+    )
+
     particles = (particles.lazy().with_columns(
                 # 1. Find the INDICES strictly inside list.eval()
                 # (pl.element() == 1) creates a boolean mask
@@ -665,9 +699,6 @@ def preprocess_for_model(particles: pl.DataFrame, tracks: pl.DataFrame, calo_hit
     ).collect()
 
     # ----------------------------------------------
-    print("[EXTRAPOLATED FEATURES] Calculating extrapolated track features...")
-    tracks = calculate_extrapolated_features_polars(tracks)
-    print(f"[EXTRAPOLATED FEATURES DONE] RAM: {process.memory_info().rss / 1024 / 1024:.2f} MB")
 
     print(f"[CASTING DONE] RAM: {process.memory_info().rss / 1024 / 1024:.2f} MB")
 
@@ -697,31 +728,11 @@ def preprocess_for_model(particles: pl.DataFrame, tracks: pl.DataFrame, calo_hit
     particles = set_target_particles_maskv4(particles, truth_eta_cut=truth_eta_cut, truth_pt_cut=truth_pt_cut, target_pt_cut=target_pt_cut, tracks=tracks)
     print(f"[TARGET PARTICLES MASK DONE] RAM: {process.memory_info().rss / 1024 / 1024:.2f} MB")
 
-    print("[PROCESSING TRACKS] Filtering and processing tracks...")
-    track_cols = [c for c in tracks.columns if c != 'event_id']
-    tracks = (
-        tracks.lazy()
-        .with_columns(
-            local_order=pl.int_ranges(
-                start=0,
-                end=pl.col('majority_particle_id').list.len(), 
-                dtype=pl.UInt32
-            )
-        )
-        .select(['event_id', 'local_order'] + track_cols)
-        .explode(['local_order'] + track_cols)
-        .filter(pl.col('pt') > truth_pt_cut)
-        .filter(pl.col('eta').abs() < truth_eta_cut)
-        .with_columns(pl.col('majority_particle_id').cast(pl.Int64))
-        .sort(['event_id', 'local_order'])
-        .group_by('event_id', maintain_order=True)
-        .agg([pl.col(c) for c in track_cols])
-        .sort('event_id')
-        .collect(streaming=True)
-    )
+
     print(f"[PROCESSING TRACKS DONE] RAM: {process.memory_info().rss / 1024 / 1024:.2f} MB")
     
     print("[CLUE CLUSTERING] Running CLUE clustering...")
+    #calo_hits = clue_clustering(calo_hits, dc=75.88106168184893, rhoc=104.34315216716726, dm=87.0967630118376, ppbin=16)
     calo_hits = clue_clustering(calo_hits, dc=75.88106168184893, rhoc=104.34315216716726, dm=87.0967630118376, ppbin=16)
     gc.collect()
     # apply cutoff on calo hits, grouby by event_id and cluster_id to aggregate cell ids, if sum < 0.1 Gev drop the cells
@@ -832,7 +843,7 @@ def preprocess_for_model(particles: pl.DataFrame, tracks: pl.DataFrame, calo_hit
     print(f"[CLUSTER PURITY DONE] RAM: {process.memory_info().rss / 1024 / 1024:.2f} MB")
     
     # OPTIMIZATION: Free calo_hits after cluster purity
-    del calo_hits
+    #del calo_hits
     gc.collect()
     print(f"[CALO HITS FREED] RAM: {process.memory_info().rss / 1024 / 1024:.2f} MB")
 
@@ -853,11 +864,285 @@ def preprocess_for_model(particles: pl.DataFrame, tracks: pl.DataFrame, calo_hit
         "target_particles": filtered_data["target_particles"],
         "calo_clusters": calo_clusters,
         "tracks": filtered_data["tracks"],
-        "target_particles_deps": filtered_data["target_particles_deps"]
+        "target_particles_deps": filtered_data["target_particles_deps"], 
+        "calo_hits": calo_hits,
     }
 
 
 
+
+
+def add_vertex_info_to_target_particles(
+    target_particles: pl.DataFrame,
+    particles_raw: pl.DataFrame,
+) -> pl.DataFrame:
+    """
+    Adds vx, vy, vz columns to an existing target_particles DataFrame by joining
+    with the raw particles DataFrame (from HuggingFace) on (event_id, particle_id).
+
+    Both DataFrames may have list-type or scalar particle_id columns; this function
+    handles either format automatically.
+
+    Args:
+        target_particles: Grouped DataFrame (one row per event_id, list-type columns).
+                          Must contain 'event_id', 'particle_id', 'particle_idx'.
+        particles_raw:    Raw particles DataFrame with 'event_id', 'particle_id',
+                          'vx', 'vy', 'vz' columns (grouped or flat).
+
+    Returns:
+        target_particles with additional columns: vx (List[Float32]),
+        vy (List[Float32]), vz (List[Float32]).
+    """
+    # Flatten raw particles if they are grouped (list-type particle_id)
+    vxyz_cols = ['event_id', 'particle_id', 'vx', 'vy', 'vz']
+    raw_lf = particles_raw.lazy().select(vxyz_cols)
+    if isinstance(particles_raw.schema['particle_id'], pl.List):
+        raw_lf = raw_lf.explode(['particle_id', 'vx', 'vy', 'vz'])
+
+    # Cast particle_id to match target_particles type (UInt64)
+    raw_lf = raw_lf.with_columns(pl.col('particle_id').cast(pl.UInt64))
+
+    # Explode target_particles to flat form, preserving sort order via particle_idx
+    tp_flat = (
+        target_particles.lazy()
+        .select(['event_id', 'particle_id', 'particle_idx'])
+        .explode(['particle_id', 'particle_idx'])
+    )
+
+    # Join, sort by particle_idx within each event, then re-aggregate as lists
+    vxyz_grouped = (
+        tp_flat
+        .join(raw_lf, on=['event_id', 'particle_id'], how='left')
+        .sort(['event_id', 'particle_idx'])
+        .group_by('event_id', maintain_order=True)
+        .agg([
+            pl.col('vx').cast(pl.Float32),
+            pl.col('vy').cast(pl.Float32),
+            pl.col('vz').cast(pl.Float32),
+        ])
+        .collect()
+    )
+
+    return target_particles.join(vxyz_grouped, on='event_id', how='left')
+
+
+def add_vertex_info_to_tracks(
+    tracks: pl.DataFrame,
+    tracks_raw: pl.DataFrame,
+    particles_raw: pl.DataFrame,
+) -> pl.DataFrame:
+    """
+    Adds majority_particle_id, majority_particle_vx/vy/vz to processed tracks
+    by chaining two joins:
+      processed tracks (track_id) → raw HF tracks  (track_id → majority_particle_id)
+                                  → raw HF particles (majority_particle_id → vx, vy, vz)
+
+    Orphan tracks (no matching majority_particle_id) will have null vertex values.
+
+    Args:
+        tracks:       Processed tracks DataFrame (one row per event_id, list columns).
+                      Must contain 'event_id', 'track_id'.
+        tracks_raw:   Raw HF tracks DataFrame with 'event_id', 'track_id',
+                      'majority_particle_id' (grouped or flat).
+        particles_raw: Raw HF particles DataFrame with 'event_id', 'particle_id',
+                       'vx', 'vy', 'vz' (grouped or flat).
+
+    Returns:
+        tracks with additional columns: majority_particle_id (List[Int64]),
+        majority_particle_vx/vy/vz (List[Float32]),
+        majority_particle_vertex_primary (List[UInt16]).
+    """
+    # --- Step 1: flatten raw tracks to get track_id -> majority_particle_id ---
+    tr_lf = tracks_raw.lazy().select(['event_id', 'track_id', 'majority_particle_id'])
+    if isinstance(tracks_raw.schema['track_id'], pl.List):
+        tr_lf = tr_lf.explode(['track_id', 'majority_particle_id'])
+    tr_lf = tr_lf.with_columns(
+        pl.col('track_id').cast(pl.UInt16),
+        pl.col('majority_particle_id').cast(pl.Int64),
+    )
+
+    # --- Step 2: flatten raw particles to get particle_id -> vx, vy, vz, vertex_primary ---
+    p_lf = particles_raw.lazy().select(['event_id', 'particle_id', 'vx', 'vy', 'vz', 'vertex_primary'])
+    if isinstance(particles_raw.schema['particle_id'], pl.List):
+        p_lf = p_lf.explode(['particle_id', 'vx', 'vy', 'vz', 'vertex_primary'])
+    p_lf = p_lf.with_columns(pl.col('particle_id').cast(pl.Int64))
+
+    # track_id -> majority_particle_id -> vx, vy, vz, vertex_primary
+    track_id_to_info = (
+        tr_lf
+        .join(p_lf, left_on=['event_id', 'majority_particle_id'], right_on=['event_id', 'particle_id'], how='left')
+        .select(['event_id', 'track_id', 'majority_particle_id', 'vx', 'vy', 'vz', 'vertex_primary'])
+    )
+
+    # --- Step 3: explode processed tracks by track_id, join, re-aggregate ---
+    result_grouped = (
+        tracks.lazy()
+        .select(['event_id', 'track_id'])
+        .with_columns(
+            local_order=pl.int_ranges(0, pl.col('track_id').list.len(), dtype=pl.UInt32)
+        )
+        .explode(['track_id', 'local_order'])
+        .with_columns(pl.col('track_id').cast(pl.UInt16))
+        .join(track_id_to_info, on=['event_id', 'track_id'], how='left')
+        .sort(['event_id', 'local_order'])
+        .group_by('event_id', maintain_order=True)
+        .agg([
+            pl.col('majority_particle_id'),
+            pl.col('vx').cast(pl.Float32).alias('majority_particle_vx'),
+            pl.col('vy').cast(pl.Float32).alias('majority_particle_vy'),
+            pl.col('vz').cast(pl.Float32).alias('majority_particle_vz'),
+            pl.col('vertex_primary').alias('majority_particle_vertex_primary'),
+        ])
+        .collect()
+    )
+
+    return tracks.join(result_grouped, on='event_id', how='left')
+
+
+def update_tracks_with_vertex_info(
+    data_dir: str,
+    event_name: str = "ttbar_pu200",
+    number_of_hf_repo_files: int = 1000,
+    overwrite: bool = False,
+    file_indices=None,
+) -> None:
+    """
+    For each tracks-*.parquet in data_dir, downloads the corresponding raw tracks
+    and particles from HuggingFace, then adds majority_particle_id and
+    majority_particle_vx/vy/vz. Files are overwritten in place.
+
+    Args:
+        data_dir:                 Directory containing tracks-*.parquet files.
+        event_name:               HuggingFace dataset event name (e.g. 'ttbar_pu200').
+        number_of_hf_repo_files:  Total number of parquet shards in the HF repo.
+        overwrite:                If False (default), skip files already containing
+                                  majority_particle_id.
+        file_indices:             Optional iterable of integer file indices to process
+                                  (e.g. range(0, 10) or [0, 5, 42]). If None, all
+                                  tracks-*.parquet files in data_dir are processed.
+    """
+    from pathlib import Path
+    from huggingface_hub import HfFileSystem
+    import tqdm
+    import gc
+
+    fs = HfFileSystem()
+    data_path = Path(data_dir)
+
+    if file_indices is not None:
+        allowed = {i for i in file_indices}
+        track_files = sorted(
+            f for f in data_path.glob("tracks-*.parquet")
+            if int(f.stem.split('-')[-1]) in allowed
+        )
+    else:
+        track_files = sorted(data_path.glob("tracks-*.parquet"))
+
+    if not track_files:
+        print(f"No tracks-*.parquet files found in {data_dir}")
+        return
+
+    print(f"Found {len(track_files)} tracks files to process.")
+
+    for track_file in tqdm.tqdm(track_files, desc="Adding majority_particle_id/vx/vy/vz to tracks"):
+        idx_str = track_file.stem.split('-')[-1]
+        i = int(idx_str)
+
+        tracks = pl.read_parquet(track_file)
+
+        if not overwrite and 'majority_particle_id' in tracks.columns:
+            continue
+
+        hf_tracks_path = (
+            f"datasets/CERN/ColliderML-Release-1/data/{event_name}_tracks/"
+            f"train-{i:05d}-of-{number_of_hf_repo_files:05d}.parquet"
+        )
+        hf_particles_path = (
+            f"datasets/CERN/ColliderML-Release-1/data/{event_name}_particles/"
+            f"train-{i:05d}-of-{number_of_hf_repo_files:05d}.parquet"
+        )
+
+        if not fs.exists(hf_tracks_path):
+            print(f"Warning: HF tracks not found: {hf_tracks_path}, skipping.")
+            continue
+        if not fs.exists(hf_particles_path):
+            print(f"Warning: HF particles not found: {hf_particles_path}, skipping.")
+            continue
+
+        with fs.open(hf_tracks_path, "rb") as f:
+            tracks_raw = pl.read_parquet(f, columns=['event_id', 'track_id', 'majority_particle_id'])
+
+        with fs.open(hf_particles_path, "rb") as f:
+            particles_raw = pl.read_parquet(f, columns=['event_id', 'particle_id', 'vx', 'vy', 'vz', 'vertex_primary'])
+
+        updated = add_vertex_info_to_tracks(tracks, tracks_raw, particles_raw)
+        updated.write_parquet(track_file)
+
+        del tracks, tracks_raw, particles_raw, updated
+        gc.collect()
+
+    print("Done.")
+
+
+def update_target_particles_with_vertex_info(
+    data_dir: str,
+    event_name: str = "ttbar_pu200",
+    number_of_hf_repo_files: int = 1000,
+    overwrite: bool = False,
+) -> None:
+    """
+    Reads all target_particles-*.parquet files in data_dir, re-downloads the
+    corresponding particles file from HuggingFace, adds vx/vy/vz columns, and
+    overwrites the parquet files in place.
+
+    Args:
+        data_dir:                 Directory containing target_particles-*.parquet files.
+        event_name:               HuggingFace dataset event name (e.g. 'ttbar_pu200').
+        number_of_hf_repo_files:  Total number of parquet shards in the HF repo.
+        overwrite:                If False (default), skip files that already have vx.
+    """
+    from pathlib import Path
+    from huggingface_hub import HfFileSystem
+    import tqdm
+    import gc
+
+    fs = HfFileSystem()
+    data_path = Path(data_dir)
+
+    tp_files = sorted(data_path.glob("target_particles-*.parquet"))
+    if not tp_files:
+        print(f"No target_particles-*.parquet files found in {data_dir}")
+        return
+
+    print(f"Found {len(tp_files)} target_particles files to process.")
+
+    for tp_file in tqdm.tqdm(tp_files, desc="Adding vx/vy/vz to target_particles"):
+        idx_str = tp_file.stem.split('-')[-1]
+        i = int(idx_str)
+
+        target_particles = pl.read_parquet(tp_file)
+
+        if not overwrite and 'vx' in target_particles.columns:
+            continue
+
+        hf_path = (
+            f"datasets/CERN/ColliderML-Release-1/data/{event_name}_particles/"
+            f"train-{i:05d}-of-{number_of_hf_repo_files:05d}.parquet"
+        )
+        if not fs.exists(hf_path):
+            print(f"Warning: HF file not found: {hf_path}, skipping.")
+            continue
+
+        with fs.open(hf_path, "rb") as f:
+            particles_raw = pl.read_parquet(f, columns=['event_id', 'particle_id', 'vx', 'vy', 'vz'])
+
+        updated = add_vertex_info_to_target_particles(target_particles, particles_raw)
+        updated.write_parquet(tp_file)
+
+        del target_particles, particles_raw, updated
+        gc.collect()
+
+    print("Done.")
 
 
 def run_preprocessing_pipeline(r=None, event_name: str="ttbar_pu200", ):
@@ -910,7 +1195,7 @@ def run_preprocessing_pipeline(r=None, event_name: str="ttbar_pu200", ):
 
         preprocessed_data = preprocess_for_model(particles=particles, tracks=tracks,
                                                   calo_hits=calo_hits, num_of_events=-1, 
-                                                  truth_pt_cut=1, truth_eta_cut=3.0, target_pt_cut=0.3, clusters_cutoff=0.23)
+                                                  truth_pt_cut=1, truth_eta_cut=3.0, target_pt_cut=0.3, clusters_cutoff=0.15)
         
         # write preprocessed data to local disk as parquets
         file_path_data = f"/storage/agrp/barakma/PileupODD/data/{event_name}"

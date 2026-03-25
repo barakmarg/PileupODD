@@ -1,6 +1,6 @@
 import sys
 sys.path.insert(0, '/storage/agrp/barakma/PileupODD')
-from primary.create_trainning_dataset import run_preprocessing_pipeline
+from primary.create_trainning_dataset_pileup import run_preprocessing_pipeline
 
 if __name__ == "__main__":
     if len(sys.argv) != 4:
