@@ -1,5 +1,6 @@
 from typing import Dict
 import polars as pl
+import numpy as np
 import yaml # type: ignore
 import gc
 
@@ -70,10 +71,14 @@ def generate_normalization_yaml(data: Dict[str, pl.DataFrame]) -> str:
         "z0":         {"df": "tracks",        "col": "z0",          "transform": None,   "type": "min_max_sym"},
         "tanlambda":  {"df": "tracks",        "col": "track_tanlambda", "transform": None, "type": "min_max_sym"},
         "omega":      {"df": "tracks",        "col": "track_omega", "transform": None,   "type": "std"},
+        "cluster_time": {"df": "calo_clusters", "col": "cluster_time", "transform": None, "type": "std"},
+        "number_of_hits":  {"df": "calo_clusters", "col": "number_of_hits",  "transform": "sqrt", "type": "min_max_sym"},
+        "energy_hits_std": {"df": "calo_clusters", "col": "energy_hits_std", "transform": "sqrt", "type": "std"},
+        "max_hit_energy":  {"df": "calo_clusters", "col": "max_hit_energy",  "transform": "sqrt", "type": "min_max_sym"},
     }
-    
+
     yaml_config = {}
-    
+
     for key, schema in config_schema.items():
         df_name = schema["df"]
         col_name = schema["col"]
@@ -174,8 +179,12 @@ def generate_normalization_stats_sequential(data_dir: str) -> str:
         "z0":         {"df": "tracks",        "col": "z0",          "transform": None,   "type": "min_max_sym"},
         "tanlambda":  {"df": "tracks",        "col": "track_tanlambda", "transform": None, "type": "min_max_sym"},
         "omega":      {"df": "tracks",        "col": "track_omega", "transform": None,   "type": "std"},
+        "cluster_time": {"df": "calo_clusters", "col": "cluster_time", "transform": None, "type": "std"},
+        "number_of_hits":  {"df": "calo_clusters", "col": "number_of_hits",  "transform": "sqrt", "type": "min_max_sym"},
+        "energy_hits_std": {"df": "calo_clusters", "col": "energy_hits_std", "transform": "sqrt", "type": "std"},
+        "max_hit_energy":  {"df": "calo_clusters", "col": "max_hit_energy",  "transform": "sqrt", "type": "min_max_sym"},
     }
-    
+
     # Initialize accumulators
     stats = {}
     for key in config_schema:
@@ -492,15 +501,16 @@ def filter_orphans_and_reindex(
             pl.col('particle_idx').fill_null(-1) # Mark tracks that lost their particle mapping (orphans) with -1
         )
         .group_by('event_id', maintain_order=True)
-        .agg(
-            pl.col('particle_idx').sort_by('local_order')
-        )
+        .agg([
+            pl.col('particle_idx').sort_by('local_order'),
+            pl.col('particle_id').sort_by('local_order'),
+        ])
     )
 
     # Apply to original tracks
     tracks_updated = (
         tracks.lazy()
-        .drop('majority_particle_id') 
+        .drop('majority_particle_id')
         .join(
             tracks_mappings, 
             on='event_id', 
@@ -582,33 +592,145 @@ def create_calo_clusters(calo_hits: pl.DataFrame) -> pl.DataFrame:
         .agg([
             pl.col('cal_E').sum().alias('total_cluster_energy'),
             pl.col('cal_E').filter(pl.col('is_hcal')).sum().alias('hcal_energy'),
-            
+
             # Topological Widths
             pl.col('hit_eta').std().fill_null(0.0).alias('sigma_eta'),
             pl.col('hit_phi').std().fill_null(0.0).alias('sigma_phi'),
             pl.col('hit_rho').std().fill_null(0.0).alias('sigma_rho'),
+
+            # Hit-level features
+            pl.col('cal_E').count().alias('number_of_hits'),
+            pl.col('cal_E').std().fill_null(0.0).alias('energy_hits_std'),
+            pl.col('cal_E').max().alias('max_hit_energy'),
         ])
+    )
+
+    # --- BRANCH C: CLUSTER TIME ---
+    # Sub-chain 1: Cell-level E_total_cell from precomputed total_energy (single explode)
+    cell_energy_df = (
+        calo_hits.lazy()
+        .select(['event_id', 'cluster_id', 'detector', 'total_energy'])
+        .explode(['cluster_id', 'detector', 'total_energy'])
+        .filter(pl.col('cluster_id') >= 0)
+        .join(calib_optimized.select(['detector', 'calib_factor']), on='detector', how='left')
+        .with_columns(
+            (pl.col('total_energy') * pl.col('calib_factor')).alias('E_total_cell')
+        )
+        .with_row_index('_cell_idx')
+        .select(['event_id', 'cluster_id', '_cell_idx', 'E_total_cell'])
+    )
+
+    # Sub-chain 2: Contribution-level energy-weighted time (double explode)
+    weighted_time_df = (
+        calo_hits.lazy()
+        .select(['event_id', 'cluster_id', 'detector', 'contrib_times', 'contrib_energies'])
+        .explode(['cluster_id', 'detector', 'contrib_times', 'contrib_energies'])
+        .filter(pl.col('cluster_id') >= 0)
+        .join(calib_optimized.select(['detector', 'calib_factor']), on='detector', how='left')
+        .with_row_index('_cell_idx')
+        # Second explode: cell → contribution level
+        .explode(['contrib_times', 'contrib_energies'])
+        .with_columns(
+            (pl.col('contrib_energies') * pl.col('calib_factor')).alias('E_cal')
+        )
+        # Per-cell aggregation: energy-weighted time
+        .group_by(['event_id', 'cluster_id', '_cell_idx'])
+        .agg([
+            (pl.col('contrib_times') * pl.col('E_cal')).sum().alias('tE_sum'),
+            pl.col('E_cal').sum().alias('sum_E_cal'),
+        ])
+        .with_columns(
+            (pl.col('tE_sum') / pl.col('sum_E_cal'))
+            .fill_nan(0.0).fill_null(0.0)
+            .alias('t_true_cell')
+        )
+        .select(['event_id', 'cluster_id', '_cell_idx', 't_true_cell'])
+    )
+
+    # Merge sub-chains at cell level
+    time_df = (
+        cell_energy_df
+        .join(weighted_time_df, on=['event_id', 'cluster_id', '_cell_idx'], how='left')
+        .with_columns(pl.col('t_true_cell').fill_null(0.0))
+        .drop('_cell_idx')
+        .collect(streaming=True)
+    )
+
+    # ATLAS TileCal resolution + Gaussian smear (NumPy vectorized)
+    n_cells = len(time_df)
+    cell_E = time_df['E_total_cell'].to_numpy()
+    cell_E_safe = np.maximum(cell_E, 1e-9)
+
+    sigma_t = np.sqrt(
+        (1.45 / np.sqrt(cell_E_safe))**2 +
+        (0.38 / cell_E_safe)**2 +
+        0.07**2
+    ).astype(np.float32)
+
+    rng = np.random.default_rng(seed=42)
+    z_cells = rng.standard_normal(n_cells).astype(np.float32)
+    cell_noise = z_cells * sigma_t
+
+    # Per-event shift: N(0,1) * 0.17 ns, drawn once per event
+    unique_events = time_df['event_id'].unique()
+    z_events = rng.standard_normal(len(unique_events)).astype(np.float32)
+    event_shifts = pl.DataFrame({
+        'event_id': unique_events,
+        'event_shift': z_events * np.float32(0.17),
+    })
+
+    time_df = (
+        time_df
+        .with_columns(pl.Series('cell_noise', cell_noise))
+        .join(event_shifts, on='event_id', how='left')
+        .with_columns(
+            (pl.col('t_true_cell') + pl.col('cell_noise') + pl.col('event_shift'))
+            .alias('t_NN_input')
+        )
+        .drop(['cell_noise', 'event_shift', 't_true_cell'])
+    )
+
+    # Cluster-level energy-weighted aggregation
+    time_df = (
+        time_df.lazy()
+        .group_by(['event_id', 'cluster_id'])
+        .agg([
+            (pl.col('t_NN_input') * pl.col('E_total_cell')).sum().alias('tE_cluster_sum'),
+            pl.col('E_total_cell').sum().alias('cluster_E_total'),
+        ])
+        .with_columns(
+            (pl.col('tE_cluster_sum') / pl.col('cluster_E_total'))
+            .fill_nan(0.0).fill_null(0.0)
+            .alias('cluster_time')
+        )
+        .select(['event_id', 'cluster_id', 'cluster_time'])
     )
 
     # --- FINAL MERGE ---
     calo_clusters = (
         physics_df
         .join(
-            centroids_df, 
-            on=['event_id', 'cluster_id'], 
+            centroids_df,
+            on=['event_id', 'cluster_id'],
             how='left'
         )
-        .with_columns(
+        .join(
+            time_df,
+            on=['event_id', 'cluster_id'],
+            how='left'
+        )
+        .with_columns([
             (pl.col('hcal_energy') / pl.col('total_cluster_energy'))
             .fill_nan(0.0)
-            .alias('hcal_fraction')
-        )
+            .alias('hcal_fraction'),
+            pl.col('cluster_time'),
+        ])
         .sort(['event_id', 'cluster_id'])
         .group_by('event_id', maintain_order=True)
         .agg(pl.all())
         .collect(streaming=True)
     )
-    
+
     return calo_clusters
 
 
@@ -659,7 +781,7 @@ def preprocess_for_model(particles: pl.DataFrame, tracks: pl.DataFrame, calo_hit
         .with_columns(
             local_order=pl.int_ranges(
                 start=0,
-                end=pl.col('majority_particle_id').list.len(), 
+                end=pl.col('majority_particle_id').list.len(),
                 dtype=pl.UInt32
             )
         )
@@ -676,7 +798,7 @@ def preprocess_for_model(particles: pl.DataFrame, tracks: pl.DataFrame, calo_hit
         .with_columns(pl.col('majority_particle_id').cast(pl.Int64))
         .sort(['event_id', 'local_order'])
         .group_by('event_id', maintain_order=True)
-        .agg([pl.col(c) for c in track_cols]+ [pl.col('vertex_primary')])
+        .agg([pl.col(c) for c in track_cols] + [pl.col('vertex_primary')])
         .sort('event_id')
         .collect(streaming=True)
     )
@@ -719,7 +841,42 @@ def preprocess_for_model(particles: pl.DataFrame, tracks: pl.DataFrame, calo_hit
     print("[ETA PHI PT] Adding eta, phi, pt...")
     particles = add_eta_and_phi_and_pt(particles)
     print(f"[ETA PHI PT DONE] RAM: {process.memory_info().rss / 1024 / 1024:.2f} MB")
-    
+
+    # Join particle vertex info + pt onto tracks (particles now has pt)
+    print("[TRACK PARTICLE INFO] Joining particle vertex info to tracks...")
+    particle_info_lf = (
+        particles.lazy()
+        .select(['event_id', 'particle_id', 'vx', 'vy', 'vz', 'pt'])
+        .explode('particle_id', 'vx', 'vy', 'vz', 'pt')
+        .rename({'pt': 'particle_pt'})
+    )
+    track_particle_cols = (
+        tracks.lazy()
+        .select(['event_id', 'majority_particle_id'])
+        .with_columns(
+            _local_order=pl.int_ranges(start=0, end=pl.col('majority_particle_id').list.len(), dtype=pl.UInt32)
+        )
+        .explode(['majority_particle_id', '_local_order'])
+        .join(
+            particle_info_lf,
+            left_on=['event_id', 'majority_particle_id'],
+            right_on=['event_id', 'particle_id'],
+            how='left'
+        )
+        .sort(['event_id', '_local_order'])
+        .group_by('event_id', maintain_order=True)
+        .agg([
+            pl.col('vx').cast(pl.Float32),
+            pl.col('vy').cast(pl.Float32),
+            pl.col('vz').cast(pl.Float32),
+            pl.col('particle_pt').cast(pl.Float32),
+        ])
+        .collect(streaming=True)
+    )
+    tracks = tracks.join(track_particle_cols, on='event_id', how='left')
+    del track_particle_cols, particle_info_lf
+    print(f"[TRACK PARTICLE INFO DONE] RAM: {process.memory_info().rss / 1024 / 1024:.2f} MB")
+
     print("[PARENT MASK] Getting particles id parent of inside calo particles...")
     particles = get_particles_id_parent_of_inside_calo_particles_maskv3(particles, calo_hits)
     print(f"[PARENT MASK DONE] RAM: {process.memory_info().rss / 1024 / 1024:.2f} MB")
@@ -782,10 +939,11 @@ def preprocess_for_model(particles: pl.DataFrame, tracks: pl.DataFrame, calo_hit
     target_particles = (
         particles.lazy()
         .select(['event_id', 'particle_id', 'is_target_particle', 'pdg_id',
-              'energy', 'eta', 'phi', 'px', 'py', 'pz', 'pt', 'has_track', 'vertex_primary'])
+              'energy', 'eta', 'phi', 'px', 'py', 'pz', 'pt', 'has_track', 'vertex_primary',
+              'vx', 'vy', 'vz'])
         .explode( 'particle_id', 'is_target_particle', 'pdg_id',
               'energy', 'eta', 'phi', 'px', 'py', 'pz', 'pt',
-              'has_track', 'vertex_primary')
+              'has_track', 'vertex_primary', 'vx', 'vy', 'vz')
         .filter(pl.col('is_target_particle'))
         .sort('event_id')
         .with_row_index("global_order")
@@ -843,7 +1001,7 @@ def preprocess_for_model(particles: pl.DataFrame, tracks: pl.DataFrame, calo_hit
     print(f"[CLUSTER PURITY DONE] RAM: {process.memory_info().rss / 1024 / 1024:.2f} MB")
     
     # OPTIMIZATION: Free calo_hits after cluster purity
-    #del calo_hits
+    del calo_hits
     gc.collect()
     print(f"[CALO HITS FREED] RAM: {process.memory_info().rss / 1024 / 1024:.2f} MB")
 
@@ -865,7 +1023,6 @@ def preprocess_for_model(particles: pl.DataFrame, tracks: pl.DataFrame, calo_hit
         "calo_clusters": calo_clusters,
         "tracks": filtered_data["tracks"],
         "target_particles_deps": filtered_data["target_particles_deps"], 
-        "calo_hits": calo_hits,
     }
 
 
@@ -894,7 +1051,7 @@ def add_vertex_info_to_target_particles(
         vy (List[Float32]), vz (List[Float32]).
     """
     # Flatten raw particles if they are grouped (list-type particle_id)
-    vxyz_cols = ['event_id', 'particle_id', 'vx', 'vy', 'vz']
+    vxyz_cols = ['event_id', 'particle_id', 'vx', 'vy', 'vz', 'pt']
     raw_lf = particles_raw.lazy().select(vxyz_cols)
     if isinstance(particles_raw.schema['particle_id'], pl.List):
         raw_lf = raw_lf.explode(['particle_id', 'vx', 'vy', 'vz'])
@@ -919,6 +1076,7 @@ def add_vertex_info_to_target_particles(
             pl.col('vx').cast(pl.Float32),
             pl.col('vy').cast(pl.Float32),
             pl.col('vz').cast(pl.Float32),
+            pl.col('pt').cast(pl.Float32),
         ])
         .collect()
     )
@@ -1186,7 +1344,8 @@ def run_preprocessing_pipeline(r=None, event_name: str="ttbar_pu200", ):
     'y',
     'z',
     'contrib_particle_ids',
-    'contrib_energies'
+    'contrib_energies',
+     'contrib_times',
 ])
 
         file_path = f"datasets/CERN/ColliderML-Release-1/data/{event_name}_tracks/train-{i:05d}-of-{number_of_hf_repo_files:05d}.parquet"
