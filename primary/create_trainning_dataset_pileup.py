@@ -156,7 +156,7 @@ def generate_normalization_yaml(data: Dict[str, pl.DataFrame]) -> str:
     return yaml.dump(yaml_config, sort_keys=False, default_flow_style=False)
 
 
-def generate_normalization_stats_sequential(data_dir: str) -> str:
+def generate_normalization_stats_sequential(data_dir: str, max_files: int = 40) -> str:
     """
     Generates normalization stats sequentially from parquet files in a directory.
     Memory-efficient alternative to generate_normalization_yaml.
@@ -180,7 +180,7 @@ def generate_normalization_stats_sequential(data_dir: str) -> str:
         "tanlambda":  {"df": "tracks",        "col": "track_tanlambda", "transform": None, "type": "min_max_sym"},
         "omega":      {"df": "tracks",        "col": "track_omega", "transform": None,   "type": "std"},
         "cluster_time": {"df": "calo_clusters", "col": "cluster_time", "transform": None, "type": "std"},
-        "number_of_hits":  {"df": "calo_clusters", "col": "number_of_hits",  "transform": "sqrt", "type": "min_max_sym"},
+        "number_of_hits":  {"df": "calo_clusters", "col": "number_of_hits",  "transform": None, "type": "min_max_sym"},
         "energy_hits_std": {"df": "calo_clusters", "col": "energy_hits_std", "transform": "sqrt", "type": "std"},
         "max_hit_energy":  {"df": "calo_clusters", "col": "max_hit_energy",  "transform": "sqrt", "type": "min_max_sym"},
     }
@@ -213,6 +213,9 @@ def generate_normalization_stats_sequential(data_dir: str) -> str:
             indices.append(f.name.split('-')[-1].split('.')[0])
         except Exception:
             pass
+
+    if max_files > 0:
+        indices = indices[:max_files]
 
     # Process files sequentially
     for idx_str in tqdm(indices, desc="Computing Normalization Stats"):
