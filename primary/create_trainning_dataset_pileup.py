@@ -156,12 +156,13 @@ def generate_normalization_yaml(data: Dict[str, pl.DataFrame]) -> str:
     return yaml.dump(yaml_config, sort_keys=False, default_flow_style=False)
 
 
-def generate_normalization_stats_sequential(data_dir: str, max_files: int = 40) -> str:
+def generate_normalization_stats_sequential(data_dir: str, max_files: int = 40, kll_k: int = 200) -> str:
     """
     Generates normalization stats sequentially from parquet files in a directory.
     Memory-efficient alternative to generate_normalization_yaml.
     """
     from pathlib import Path
+    from datasketches import kll_floats_sketch
     from tqdm import tqdm
     import numpy as np
     
@@ -196,6 +197,46 @@ def generate_normalization_stats_sequential(data_dir: str, max_files: int = 40) 
             "max": float('-inf')
         }
 
+    # One KLL sketch per feature for streaming quantile estimation.
+    quantile_sketches = {
+        key: kll_floats_sketch(kll_k)
+        for key in config_schema
+    }
+
+    def _extract_values(df: pl.DataFrame, key: str, schema: Dict[str, str]) -> np.ndarray:
+        """
+        Extracts and transforms a single feature into a finite NumPy array.
+        """
+        col_name = schema["col"]
+        transform = schema["transform"]
+
+        series = None
+
+        if key == "cluster_pt":
+            if "total_cluster_energy" in df.columns and "cluster_eta" in df.columns:
+                e = df.select(pl.col("total_cluster_energy").explode()).get_column("total_cluster_energy")
+                eta = df.select(pl.col("cluster_eta").explode()).get_column("cluster_eta")
+                series = e / eta.cosh()
+        else:
+            if col_name not in df.columns:
+                return np.array([], dtype=np.float64)
+
+            dtype = df.schema[col_name]
+            if isinstance(dtype, pl.List):
+                series = df.select(pl.col(col_name).explode()).get_column(col_name)
+            else:
+                series = df.get_column(col_name)
+
+        if series is None or len(series) == 0:
+            return np.array([], dtype=np.float64)
+
+        if transform == "sqrt":
+            series = series.sqrt()
+
+        arr = series.to_numpy()
+        arr = arr[np.isfinite(arr)]
+        return arr
+
     path = Path(data_dir)
     # Search for track files to determine chunks
     # Assuming standard naming: tracks-{index}.parquet
@@ -217,7 +258,7 @@ def generate_normalization_stats_sequential(data_dir: str, max_files: int = 40) 
     if max_files > 0:
         indices = indices[:max_files]
 
-    # Process files sequentially
+    # Single pass: moments + min/max + KLL quantiles.
     for idx_str in tqdm(indices, desc="Computing Normalization Stats"):
         
         # Identify which dataframes we need for the schema
@@ -233,47 +274,22 @@ def generate_normalization_stats_sequential(data_dir: str, max_files: int = 40) 
         # Compute stats for each schema entry
         for key, schema in config_schema.items():
             df_name = schema["df"]
-            col_name = schema["col"]
-            transform = schema["transform"]
             
             if df_name not in loaded_dfs:
                 continue
                 
             df = loaded_dfs[df_name]
             
-            series = None
-            
-            # Special handling for cluster_pt
-            if key == "cluster_pt":
-                if "total_cluster_energy" in df.columns and "cluster_eta" in df.columns:
-                    e = df.select(pl.col("total_cluster_energy").explode()).get_column("total_cluster_energy")
-                    eta = df.select(pl.col("cluster_eta").explode()).get_column("cluster_eta")
-                    series = e / eta.cosh()
-            else:
-                if col_name not in df.columns:
-                    continue
-                
-                # Check if list and explode
-                dtype = df.schema[col_name]
-                if isinstance(dtype, pl.List):
-                    series = df.select(pl.col(col_name).explode()).get_column(col_name)
-                else:
-                    series = df.get_column(col_name)
-
-            if series is None or len(series) == 0:
-                continue
-                
-            if transform == "sqrt":
-                series = series.sqrt()
-            
-            # Convert to numpy for accumulation
-            arr = series.to_numpy()
-            
-            # Remove NaNs / Infs
-            arr = arr[np.isfinite(arr)]
-            
+            arr = _extract_values(df, key, schema)
             if len(arr) == 0:
                 continue
+
+            # Update streaming quantile sketch.
+            try:
+                quantile_sketches[key].update(arr)
+            except TypeError:
+                for x in arr:
+                    quantile_sketches[key].update(float(x))
                 
             n = len(arr)
             s = np.sum(arr)
@@ -310,11 +326,47 @@ def generate_normalization_stats_sequential(data_dir: str, max_files: int = 40) 
         var_val = (s["sum_sq"] - (s["sum"]**2 / N)) / (N - 1) if N > 1 else 0.0
         if var_val < 0: var_val = 0.0
         std_val = np.sqrt(var_val)
+
+        if s["max"] <= s["min"]:
+            q25_val = float(s["min"])
+            q75_val = float(s["max"])
+            q95_val = float(s["max"])
+            q99_val = float(s["max"])
+        else:
+            sketch = quantile_sketches.get(key)
+            if sketch is None:
+                q25_val = float(s["min"])
+                q75_val = float(s["max"])
+                q95_val = float(s["max"])
+                q99_val = float(s["max"])
+            else:
+                # datasketches API differs slightly across builds.
+                if hasattr(sketch, "is_empty"):
+                    sketch_empty = bool(sketch.is_empty())
+                elif hasattr(sketch, "n"):
+                    sketch_empty = int(sketch.n) == 0
+                else:
+                    sketch_empty = False
+
+                if sketch_empty:
+                    q25_val = float(s["min"])
+                    q75_val = float(s["max"])
+                    q95_val = float(s["max"])
+                    q99_val = float(s["max"])
+                else:
+                    q25_val = float(sketch.get_quantile(0.25))
+                    q75_val = float(sketch.get_quantile(0.75))
+                    q95_val = float(sketch.get_quantile(0.95))
+                    q99_val = float(sketch.get_quantile(0.99))
         
         entry = {
             "type": schema["type"],
             "mean": float(f"{mean_val:.4f}"),
             "std": float(f"{std_val:.4f}"),
+            "q25": smart_fmt(q25_val),
+            "q75": smart_fmt(q75_val),
+            "q95": smart_fmt(q95_val),
+            "q99": smart_fmt(q99_val),
             "min": smart_fmt(s["min"]),
             "max": smart_fmt(s["max"])
         }
@@ -328,6 +380,10 @@ def generate_normalization_stats_sequential(data_dir: str, max_files: int = 40) 
         if "fn" in entry: ordered["fn"] = entry["fn"]
         ordered["mean"] = entry["mean"]
         ordered["std"] = entry["std"]
+        ordered["q25"] = entry["q25"]
+        ordered["q75"] = entry["q75"]
+        ordered["q95"] = entry["q95"]
+        ordered["q99"] = entry["q99"]
         ordered["min"] = entry["min"]
         ordered["max"] = entry["max"]
         

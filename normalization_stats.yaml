@@ -1,104 +1,168 @@
 eta:
   type: min_max_sym
-  mean: 0.0001
-  std: 1.7589
-  min: -3.3981
-  max: 3.4111
+  mean: 0.0003
+  std: 1.759
+  q25: -1.5527
+  q75: 1.5555
+  q95: 2.651
+  q99: 3.0481
+  min: -3.4188
+  max: 3.513
 rho:
   type: min_max_sym
-  mean: 1195.6835
-  std: 389.039
-  min: 324.5341
+  mean: 1195.5863
+  std: 389.1428
+  q25: 925.1108
+  q75: 1385.2108
+  q95: 1796.2634
+  q99: 2142.2981
+  min: 298.2659
   max: 3495.3765
 e:
   type: min_max_sym
   fn: sqrt
-  mean: 1.4692
-  std: 1.7912
+  mean: 1.4689
+  std: 1.7904
+  q25: 0.5941
+  q75: 1.6361
+  q95: 4.079
+  q99: 8.2604
   min: 0.3873
-  max: 50.9484
+  max: 56.2825
 pt:
   type: min_max_sym
   fn: sqrt
-  mean: 1.2922
-  std: 0.4906
+  mean: 1.2925
+  std: 0.465
+  q25: 1.0727
+  q75: 1.3661
+  q95: 1.8555
+  q99: 2.8064
   min: 1.0
-  max: 378.0875
+  max: 614.7784
 cluster_pt:
   type: min_max_sym
   fn: sqrt
-  mean: 0.8589
-  std: 0.7991
-  min: 0.1074
-  max: 24.4144
+  mean: 0.8588
+  std: 0.7989
+  q25: 0.3779
+  q75: 1.1145
+  q95: 2.0807
+  q99: 3.4481
+  min: 0.1013
+  max: 34.6402
 sigma_eta:
   type: std
   fn: sqrt
   mean: 0.1618
   std: 0.0893
+  q25: 0.1139
+  q75: 0.203
+  q95: 0.3441
+  q99: 0.4232
   min: 0.0
-  max: 0.614
+  max: 0.6425
 sigma_phi:
   type: std
   fn: sqrt
   mean: 0.1959
-  std: 0.216
+  std: 0.2159
+  q25: 0.1195
+  q75: 0.214
+  q95: 0.4054
+  q99: 1.4309
   min: 0.0
   max: 2.1078
 sigma_rho:
   type: std
   fn: sqrt
-  mean: 5.3042
-  std: 2.2654
+  mean: 5.3044
+  std: 2.2649
+  q25: 4.4903
+  q75: 6.7119
+  q95: 8.3241
+  q99: 9.6015
   min: 0.0
-  max: 15.4403
+  max: 16.0959
 d0:
   type: min_max_sym
-  mean: 0.0002
-  std: 0.5351
-  min: -15.4933
+  mean: 0.0004
+  std: 0.5346
+  q25: -0.0406
+  q75: 0.0404
+  q95: 0.3856
+  q99: 2.0945
+  min: -17.8558
   max: 17.0398
 z0:
   type: min_max_sym
-  mean: -0.007
-  std: 65.4561
-  min: -343.8257
-  max: 341.7008
+  mean: 0.011
+  std: 65.5346
+  q25: -39.522
+  q75: 40.4218
+  q95: 104.3381
+  q99: 186.9008
+  min: -355.9535
+  max: 368.545
 tanlambda:
   type: min_max_sym
-  mean: -0.0058
-  std: 3.7729
+  mean: -0.0026
+  std: 3.7711
+  q25: -1.9783
+  q75: 1.9688
+  q95: 6.9132
+  q99: 9.4516
   min: -10.0179
-  max: 10.0178
+  max: 10.0179
 omega:
   type: std
   mean: -0.0
   std: 0.0006
+  q25: -0.0006
+  q75: 0.0006
+  q95: 0.0009
+  q99: 0.0009
   min: -0.0009
   max: 0.0009
 cluster_time:
   type: std
-  mean: 0.0413
-  std: 3.3287
-  min: -44.6871
-  max: 45.861
+  mean: 0.0274
+  std: 3.2833
+  q25: -1.4243
+  q75: 1.4807
+  q95: 5.2707
+  q99: 9.3475
+  min: -48.3783
+  max: 50.1776
 number_of_hits:
   type: min_max_sym
-  mean: 187.3859
-  std: 1322.466
+  mean: 187.2477
+  std: 1322.5149
+  q25: 5.0
+  q75: 88
+  q95: 345
+  q99: 1757
   min: 1.0
-  max: 76064
+  max: 99802
 energy_hits_std:
   type: std
   fn: sqrt
   mean: 0.2317
   std: 0.1599
+  q25: 0.1297
+  q75: 0.3077
+  q95: 0.5314
+  q99: 0.6973
   min: 0.0
-  max: 3.1407
+  max: 4.1171
 max_hit_energy:
   type: min_max_sym
   fn: sqrt
   mean: 0.5516
   std: 0.3184
-  min: 0.0879
-  max: 10.6855
+  q25: 0.327
+  q75: 0.6841
+  q95: 1.2363
+  q99: 1.6661
+  min: 0.0846
+  max: 13.6194
