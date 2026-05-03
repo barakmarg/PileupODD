@@ -7,7 +7,7 @@ import gc
 from sklearn.model_selection import train_test_split
 from primary.preprocessing import add_eta_and_phi_and_pt, add_eta_and_phi_and_pt, \
      add_orphan_mask, add_created_inside_calo_mask, add_particle_have_track_mask, set_target_particles_maskv4, get_particles_id_parent_of_inside_calo_particles_maskv3, \
-    add_eta_and_phi_and_pt, backtrack_to_target, cluster_purity, calculate_extrapolated_features_polars
+    add_eta_and_phi_and_pt, backtrack_to_target, cluster_purity, cluster_contrib_energy, cluster_vertex_primary_deps, calculate_extrapolated_features_polars
 from primary.calibration import CALIBRATION
 from primary.clue_clustering import clue_clustering
 
@@ -862,6 +862,19 @@ def preprocess_for_model(particles: pl.DataFrame, tracks: pl.DataFrame, calo_hit
         .collect(streaming=True)
     )
 
+    # Capture pid -> vertex_primary for ALL particles (incl. pileup) BEFORE
+    # the hard-scatter filter below. Used later by cluster_vertex_primary_deps.
+    particles_pid_to_vertex = (
+        particles.lazy()
+        .select(['event_id', 'particle_id', 'vertex_primary'])
+        .explode('particle_id', 'vertex_primary')
+        .with_columns(
+            pl.col('particle_id').cast(pl.Int64),
+            pl.col('vertex_primary').cast(pl.UInt16),
+        )
+        .collect(streaming=True)
+    )
+
     particles = (particles.lazy().with_columns(
                 # 1. Find the INDICES strictly inside list.eval()
                 # (pl.element() == 1) creates a boolean mask
@@ -1055,14 +1068,36 @@ def preprocess_for_model(particles: pl.DataFrame, tracks: pl.DataFrame, calo_hit
     gc.collect()
     print(f"[INTERMEDIATES FREED] RAM: {process.memory_info().rss / 1024 / 1024:.2f} MB")
     
-    print("[CLUSTER PURITY] Computing cluster purity...")
-    target_particles_deps = cluster_purity(calo_hits_with_clusters=calo_hits, ancestors=points_to_target)
-    print(f"[CLUSTER PURITY DONE] RAM: {process.memory_info().rss / 1024 / 1024:.2f} MB")
-    
-    # OPTIMIZATION: Free calo_hits after cluster purity
+    # Heavy double-explode of contrib_particle_ids x contrib_energies happens once
+    # here; both cluster_purity and cluster_vertex_primary_deps consume the result.
+    print("[CONTRIB ENERGY] Building shared per-(event, cluster, particle) energies...")
+    contrib_energy = cluster_contrib_energy(calo_hits_with_clusters=calo_hits)
     del calo_hits
     gc.collect()
-    print(f"[CALO HITS FREED] RAM: {process.memory_info().rss / 1024 / 1024:.2f} MB")
+    print(f"[CONTRIB ENERGY DONE] RAM: {process.memory_info().rss / 1024 / 1024:.2f} MB")
+
+    print("[CLUSTER VERTEX DEPS] Aggregating calibrated energy by vertex_primary...")
+    cluster_vertex_deps = cluster_vertex_primary_deps(
+        contrib_energy=contrib_energy,
+        pid_to_vertex=particles_pid_to_vertex,
+        cluster_to_cluster_idx=cluster_to_cluster_idx,
+    )
+    del particles_pid_to_vertex
+    gc.collect()
+    print(f"[CLUSTER VERTEX DEPS DONE] RAM: {process.memory_info().rss / 1024 / 1024:.2f} MB")
+
+    calo_clusters = calo_clusters.join(cluster_vertex_deps, on='event_id', how='left')
+    del cluster_vertex_deps
+    gc.collect()
+
+    print("[CLUSTER PURITY] Computing cluster purity...")
+    target_particles_deps = cluster_purity(
+        contrib_energy=contrib_energy,
+        ancestors=points_to_target,
+    )
+    del contrib_energy
+    gc.collect()
+    print(f"[CLUSTER PURITY DONE] RAM: {process.memory_info().rss / 1024 / 1024:.2f} MB")
 
 
 

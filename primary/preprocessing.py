@@ -1228,88 +1228,137 @@ def particle_energy_calo_deposits_ratio(
     # This is the only time RAM is heavily used, but streaming manages it in batches.
     return final_query.collect(streaming=True)
 
-def cluster_purity(calo_hits_with_clusters: pl.DataFrame, ancestors: pl.DataFrame) -> pl.DataFrame:
+def cluster_contrib_energy(calo_hits_with_clusters: pl.DataFrame) -> pl.DataFrame:
+    """
+    Per-(event, cluster, contributing_particle) calibrated energy.
+
+    Performs the heavy double-explode of `contrib_particle_ids` and
+    `contrib_energies` once, applies the cell-level calibration via
+    CALIBRATION, then immediately collapses to per-(event, cluster, particle)
+    sums so the result is far smaller than the per-contribution flat form.
+
+    Both `cluster_purity` and `cluster_vertex_primary_deps` consume this so
+    the explode runs only once.
+
+    Returns:
+        Flat DataFrame: event_id, cluster_id, particle_id (Int64), cal_E (Float32, GeV).
+    """
+    calib_lazy = CALIBRATION.lazy().select(['detector', 'calib_factor'])
+
+    return (
+        calo_hits_with_clusters.lazy()
+        .select(['event_id', 'cluster_id', 'detector',
+                 'contrib_particle_ids', 'contrib_energies'])
+        # Level-1 explode: per cell
+        .explode(['cluster_id', 'detector',
+                  'contrib_particle_ids', 'contrib_energies'])
+        .filter(pl.col('cluster_id') >= 0)
+        # Calibration at cell level (cheaper than after the second explode)
+        .join(calib_lazy, on='detector', how='left')
+        # Level-2 explode: per contributor
+        .explode(['contrib_particle_ids', 'contrib_energies'])
+        .with_columns([
+            (pl.col('contrib_energies') * pl.col('calib_factor'))
+                .cast(pl.Float32).alias('cal_E'),
+            pl.col('contrib_particle_ids').cast(pl.Int64).alias('particle_id'),
+        ])
+        # Reduce immediately — sum cal_E per (event, cluster, particle)
+        .group_by(['event_id', 'cluster_id', 'particle_id'])
+        .agg(pl.col('cal_E').sum().alias('cal_E'))
+        .collect(streaming=True)
+    )
+
+
+def cluster_purity(contrib_energy: pl.DataFrame, ancestors: pl.DataFrame) -> pl.DataFrame:
     """
     Computes the purity/efficiency of each cluster based on ultimate ancestors.
-    Optimized for memory using lazy execution, strict column selection, and window functions.
+
+    Consumes the shared `cluster_contrib_energy` intermediate so the heavy
+    double-explode is not repeated.
     """
-    
     ancestors_lazy = (
         ancestors.lazy()
         .select(['event_id', 'src_particle_id', 'target_particle_id'])
         .rename({
-            'src_particle_id': 'particle_id', 
-            'target_particle_id': 'ultimate_ancestor_id'
+            'src_particle_id': 'particle_id',
+            'target_particle_id': 'ultimate_ancestor_id',
         })
-        .with_columns(pl.col("particle_id").cast(pl.Int64))
-    )
-
-    # 2. Prepare Calibration (Lazy)
-    calib_lazy = (
-        CALIBRATION.lazy()
-        .select(['detector', 'calib_factor'])
-        # Handle cases where a detector might be missing from the map (default to 1.0)
+        .with_columns(pl.col('particle_id').cast(pl.Int64))
     )
 
     return (
-        calo_hits_with_clusters.lazy()
-        # A. Select required columns (Include 'detector' for calibration)
-        .select(['event_id', 'contrib_energies', 'contrib_particle_ids', 'cluster_id', 'detector'])
-        
-        # B. Explode Level 1: Cells
-        # We need to align detector ID with the lists of energies
-        .explode(['contrib_energies', 'contrib_particle_ids', 'cluster_id', 'detector'])
-        
-        # C. Join Calibration (Cell Level)
-        # This is more efficient than joining after the second explode
-        .join(
-            calib_lazy,
-            on="detector",
-            how="left"
-        )
-
-        # D. Explode Level 2: Contributors
-        .explode(['contrib_energies', 'contrib_particle_ids'])
-        
-        # E. Apply Calibration & Type Cast
-        .with_columns([
-            (pl.col('contrib_energies') * pl.col('calib_factor')).alias('energy'),
-            pl.col('contrib_particle_ids').cast(pl.Int64).alias('particle_id')
-        ])
-        
-        # F. Drop heavy columns immediately
-        .select(['event_id', 'cluster_id', 'particle_id', 'energy'])
-        
-        # G. Join with Ancestors (Strict on Event + Particle)
-        .join(
-            ancestors_lazy,
-            on=["event_id", "particle_id"],
-            how="left"
-        )
-
-        # H. Aggregation (Sum Energies)
+        contrib_energy.lazy()
+        .join(ancestors_lazy, on=['event_id', 'particle_id'], how='left')
         .group_by(['event_id', 'cluster_id', 'ultimate_ancestor_id'])
-        .agg(
-            pl.col('energy').sum().alias('total_energy_deps_in_cluster')
-        )
-
-        # I. Window Function for Denominator (Efficiency)
-        # Calculates: "Total Calibrated Energy of this Ancestor in the Event"
+        .agg(pl.col('cal_E').sum().alias('total_energy_deps_in_cluster'))
         .with_columns(
             pl.col('total_energy_deps_in_cluster')
             .sum()
             .over(['event_id', 'ultimate_ancestor_id'])
             .alias('total_energy_deps')
         )
-        
-        # J. Purity Calculation
         .select([
             pl.col('event_id'),
             pl.col('cluster_id'),
             pl.col('ultimate_ancestor_id'),
             pl.col('total_energy_deps_in_cluster'),
             pl.col('total_energy_deps'),
-            (pl.col('total_energy_deps_in_cluster') / pl.col('total_energy_deps')).alias('purity')
+            (pl.col('total_energy_deps_in_cluster') / pl.col('total_energy_deps'))
+            .alias('purity'),
+        ])
+        .collect(streaming=True)
+    )
+
+
+def cluster_vertex_primary_deps(
+    contrib_energy: pl.DataFrame,
+    pid_to_vertex: pl.DataFrame,
+    cluster_to_cluster_idx: pl.DataFrame,
+) -> pl.DataFrame:
+    """
+    Per-(event, cluster) calibrated energy aggregated by primary vertex.
+
+    Args:
+        contrib_energy: output of `cluster_contrib_energy`.
+        pid_to_vertex:  flat DataFrame [event_id, particle_id (Int64),
+                        vertex_primary (UInt16)].
+        cluster_to_cluster_idx: flat DataFrame [event_id, cluster_id, cluster_idx]
+                        matching the cluster ordering used in calo_clusters.
+
+    Returns:
+        One row per event with columns:
+            vertex_primary_indices   List[List[UInt16]]
+            vertex_primary_energies  List[List[Float32]]   # GeV, calibrated
+        Outer list position i corresponds to cluster i in calo_clusters
+        (same cluster ordering via cluster_to_cluster_idx).
+        Inner lists are sorted by vertex_primary so the two lists pair
+        unambiguously: vp_indices[i][j] deposited vp_energies[i][j] GeV
+        in cluster i.
+    """
+    return (
+        contrib_energy.lazy()
+        .join(pid_to_vertex.lazy(),
+              on=['event_id', 'particle_id'], how='left')
+        # Sum calibrated energy per (event, cluster, vertex)
+        .group_by(['event_id', 'cluster_id', 'vertex_primary'])
+        .agg(pl.col('cal_E').sum().alias('vertex_energy'))
+        # Map cluster_id -> cluster_idx so order matches calo_clusters
+        .join(cluster_to_cluster_idx.lazy(),
+              on=['event_id', 'cluster_id'], how='left')
+        .drop('cluster_id')
+        # Inner agg: per (event, cluster) -> two parallel lists
+        .sort(['event_id', 'cluster_idx', 'vertex_primary'])
+        .group_by(['event_id', 'cluster_idx'], maintain_order=True)
+        .agg([
+            pl.col('vertex_primary').alias('vertex_primary_indices'),
+            pl.col('vertex_energy').cast(pl.Float32).alias('vertex_primary_energies'),
+        ])
+        # Outer agg: per event -> list of clusters, ordered by cluster_idx
+        .sort(['event_id', 'cluster_idx'])
+        .group_by('event_id', maintain_order=True)
+        .agg([
+            pl.col('vertex_primary_indices'),
+            pl.col('vertex_primary_energies'),
         ])
         .collect(streaming=True)
     )
