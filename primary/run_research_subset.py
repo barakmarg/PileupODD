@@ -53,7 +53,7 @@ def main() -> None:
     run_preprocessing_pipeline_all_vertices_chunked(
         #r=indices,
         event_name="dihiggs_pu200",
-        r=range(20),  # Run on all files, but only extract the specified indices
+        r=range(10,20),  # Run on all files, but only extract the specified indices
         chunk_size=100,
     )
 
