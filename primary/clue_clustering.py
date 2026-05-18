@@ -1,9 +1,54 @@
 import numpy as np
+import os
 import polars as pl
 from primary.calibration import CALIBRATION
 import CLUEstering as clue
 from primary.downsample import voxel_config, voxelize_hits
 import tqdm
+
+
+# Per-worker clusterer cache (one clusterer per worker process).
+_worker_clusterer = None
+
+
+def _worker_init(omp_threads: int):
+    """Pool initializer: limit each worker's OpenMP fanout to avoid oversubscription."""
+    import os
+    os.environ['OMP_NUM_THREADS'] = str(omp_threads)
+    os.environ['MKL_NUM_THREADS'] = str(omp_threads)
+
+
+def _cluster_one_event(args):
+    """Cluster one event's points; returns (idx, c_ids, cx, cy, cz)."""
+    idx, points, dc, rhoc, dm, ppbin, backend = args
+    global _worker_clusterer
+    if _worker_clusterer is None:
+        # Local import inside worker so spawn-start workers pick up sys.path edits.
+        import sys
+        if '/storage/agrp/barakma/CLUEstering' not in sys.path:
+            sys.path.insert(0, '/storage/agrp/barakma/CLUEstering')
+        import CLUEstering as _clue
+        _worker_clusterer = _clue.clusterer(dc=dc, rhoc=rhoc, dm=dm, ppbin=ppbin)
+
+    clusterer = _worker_clusterer
+    clusterer.read_data(points.T)
+    clusterer.run_clue(backend=backend, verbose=False, block_size=1024)
+
+    c_ids = clusterer.cluster_ids
+    centroids = clusterer.cluster_centroids()
+
+    n_points = len(c_ids)
+    cx = np.full(n_points, float('inf'), dtype=np.float32)
+    cy = np.full(n_points, float('inf'), dtype=np.float32)
+    cz = np.full(n_points, float('inf'), dtype=np.float32)
+    valid_mask = c_ids != -1
+    if np.any(valid_mask):
+        valid_ids = c_ids[valid_mask]
+        cx[valid_mask] = centroids[valid_ids, 0]
+        cy[valid_mask] = centroids[valid_ids, 1]
+        cz[valid_mask] = centroids[valid_ids, 2]
+    return idx, c_ids, cx, cy, cz
+
 
 def clue_clustering(calo_hits: pl.DataFrame, dc=75.88106168184893, rhoc=104.34315216716726, dm=87.0967630118376, ppbin=16, backend='gpu cuda') -> pl.DataFrame:
     # --------------------------------------------------------------------------------
@@ -46,52 +91,60 @@ def clue_clustering(calo_hits: pl.DataFrame, dc=75.88106168184893, rhoc=104.3431
     #   rhoc      : 104.34315216716726
     #   dm        : 87.0967630118376
     #   ppbin     : 16
-    clusterer = clue.clusterer(dc=dc, rhoc=rhoc, dm=dm, ppbin=ppbin)
+    # Lists to store results for all events (indexed by event order).
+    n_events = len(points_list)
+    res_cluster_ids = [None] * n_events
+    res_cx = [None] * n_events
+    res_cy = [None] * n_events
+    res_cz = [None] * n_events
 
-    # Lists to store results for all events
-    res_cluster_ids = []
-    res_cx = []
-    res_cy = []
-    res_cz = []
+    use_parallel = backend.strip().lower() == 'cpu omp' and n_events > 1
+    if use_parallel:
+        import multiprocessing as mp
+        n_cores = os.cpu_count() or 1
+        n_workers = max(1, n_cores // 2)
+        n_workers = min(n_workers, n_events)
+        omp_threads = max(1, n_cores // max(n_workers, 1))
+        print(f"[CLUE PARALLEL] cpu omp on {n_workers} workers x {omp_threads} OMP threads "
+              f"(cores={n_cores}, events={n_events})")
 
-    for points in tqdm.tqdm(points_list, desc="Clustering events"):
-        # 1. Run CLUE
-        clusterer.read_data(points.T)
-        clusterer.run_clue(backend=backend, verbose=False, block_size=1024)
-        
-        # 2. Extract IDs and Centroids
-        # shape: (N_hits,)
-        c_ids = clusterer.cluster_ids 
-        # shape: (N_clusters, 4) - typically [x, y, z, energy]
-        centroids = clusterer.cluster_centroids() 
-        
-        # 3. Vectorized Centroid Mapping (Replaces the slow 'for i' loop)
-        # Initialize arrays with INF (noise value)
-        n_points = len(c_ids)
-        cx = np.full(n_points, float('inf'), dtype=np.float32)
-        cy = np.full(n_points, float('inf'), dtype=np.float32)
-        cz = np.full(n_points, float('inf'), dtype=np.float32)
-        
-        # Create a mask for valid clusters (assuming -1 is noise)
-        valid_mask = c_ids != -1
-        
-        # If there are any valid clusters in this event
-        if np.any(valid_mask):
-            # Get the IDs of valid points
-            valid_ids = c_ids[valid_mask]
-            
-            # Map centroids directly using Numpy fancy indexing
-            # centroids array is indexed by the cluster ID
-            cx[valid_mask] = centroids[valid_ids, 0]
-            cy[valid_mask] = centroids[valid_ids, 1]
-            cz[valid_mask] = centroids[valid_ids, 2]
-            
+        args_iter = ((i, points_list[i], dc, rhoc, dm, ppbin, backend) for i in range(n_events))
+        ctx = mp.get_context('spawn')
+        with ctx.Pool(processes=n_workers,
+                       initializer=_worker_init,
+                       initargs=(omp_threads,)) as pool:
+            for idx, c_ids, cx, cy, cz in tqdm.tqdm(
+                    pool.imap_unordered(_cluster_one_event, args_iter, chunksize=1),
+                    total=n_events, desc="Clustering events (parallel)"):
+                res_cluster_ids[idx] = c_ids
+                res_cx[idx] = cx
+                res_cy[idx] = cy
+                res_cz[idx] = cz
+    else:
+        # Sequential path: reuse a single clusterer for all events.
+        clusterer = clue.clusterer(dc=dc, rhoc=rhoc, dm=dm, ppbin=ppbin)
+        for i, points in enumerate(tqdm.tqdm(points_list, desc="Clustering events")):
+            clusterer.read_data(points.T)
+            clusterer.run_clue(backend=backend, verbose=False, block_size=1024)
 
-        # 4. Append results
-        res_cluster_ids.append(c_ids)
-        res_cx.append(cx)
-        res_cy.append(cy)
-        res_cz.append(cz)
+            c_ids = clusterer.cluster_ids
+            centroids = clusterer.cluster_centroids()
+
+            n_points = len(c_ids)
+            cx = np.full(n_points, float('inf'), dtype=np.float32)
+            cy = np.full(n_points, float('inf'), dtype=np.float32)
+            cz = np.full(n_points, float('inf'), dtype=np.float32)
+            valid_mask = c_ids != -1
+            if np.any(valid_mask):
+                valid_ids = c_ids[valid_mask]
+                cx[valid_mask] = centroids[valid_ids, 0]
+                cy[valid_mask] = centroids[valid_ids, 1]
+                cz[valid_mask] = centroids[valid_ids, 2]
+
+            res_cluster_ids[i] = c_ids
+            res_cx[i] = cx
+            res_cy[i] = cy
+            res_cz[i] = cz
 
     # --------------------------------------------------------------------------------
     # 4. MERGE RESULTS BACK TO POLARS

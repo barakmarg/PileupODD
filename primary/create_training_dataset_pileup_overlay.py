@@ -1012,52 +1012,21 @@ def _overlay_tracks(
     return tracks
 
 
-def preprocess_for_model(
-    hs_particles: pl.DataFrame,
-    hs_tracks: pl.DataFrame,
-    hs_calo_hits: pl.DataFrame,
-    pu_particles: pl.DataFrame,
-    pu_tracks: pl.DataFrame,
-    pu_calo_hits: pl.DataFrame,
-    pileup_level: int = 200,
-    seed: int = 42,
-    num_of_events: int = -1,
-    truth_eta_cut: float = 3.0,
-    truth_pt_cut: float = 1.0,
-    target_pt_cut: float = 0.3,
-    clusters_cutoff: float = 0.1,
+def _run_overlay_and_aggregate(
+    hs: Dict[str, pl.DataFrame],
+    pu: Dict[str, pl.DataFrame],
+    pileup_level: int,
+    seed: int,
+    clusters_cutoff: float,
+    clue_backend: str,
+    process,
 ) -> Dict[str, pl.DataFrame]:
     """
-    Build a synthetic PU<pileup_level> dataset by overlaying ~Poisson(pileup_level)
-    pileup events on each PU0 hard-scatter event, then run clustering and the
-    full target/cluster aggregation pipeline.
+    Overlay HS+PU calo hits, cluster, and run the full target/cluster
+    aggregation. Consumes (and progressively `del`s) entries inside `hs`;
+    leaves `pu` untouched (caller owns it — useful for chunked reuse).
     """
-    import psutil
-    import os
-    process = psutil.Process(os.getpid())
-
-    print("\n[PREPROCESS START]")
-    print(f"RAM: {process.memory_info().rss / 1024 / 1024:.2f} MB")
-
-    # 1. Per-source preprocessing.
-    hs = _preprocess_source(hs_particles, hs_tracks, hs_calo_hits, kind='hs',
-                             num_of_events=num_of_events,
-                             truth_eta_cut=truth_eta_cut,
-                             truth_pt_cut=truth_pt_cut,
-                             target_pt_cut=target_pt_cut)
-    del hs_particles, hs_tracks
-    gc.collect()
-
-    pu = _preprocess_source(pu_particles, pu_tracks, pu_calo_hits, kind='pu',
-                             num_of_events=num_of_events,
-                             truth_eta_cut=truth_eta_cut,
-                             truth_pt_cut=truth_pt_cut,
-                             target_pt_cut=target_pt_cut)
-    del pu_particles, pu_tracks
-    gc.collect()
-    print(f"[PER-SOURCE DONE] RAM: {process.memory_info().rss / 1024 / 1024:.2f} MB")
-
-    # 2. Poisson sample map (per HS event -> list of pileup event_ids).
+    # 1. Poisson sample map.
     hs_event_ids = hs['calo_hits']['event_id'].to_numpy()
     pu_event_ids = pu['calo_hits']['event_id'].unique(maintain_order=True).to_numpy()
     sample_map = _build_sample_map(hs_event_ids, pu_event_ids, pileup_level, seed)
@@ -1066,28 +1035,29 @@ def preprocess_for_model(
     print(f"[SAMPLE MAP] {len(sample_map_flat)} HS-PU pairs across {len(hs_event_ids)} HS events. "
           f"RAM: {process.memory_info().rss / 1024 / 1024:.2f} MB")
 
-    # 3. Overlay+merge calo_hits (HS contribs untouched; pileup adds energy only).
+    # 2. Overlay calo hits.
     print("[OVERLAY CALO HITS] Merging HS and pileup hits per cell...")
     merged_calo_hits = _overlay_calo_hits(hs['calo_hits'], pu['calo_hits'], sample_map_flat)
-    del hs['calo_hits'], pu['calo_hits']
+    del hs['calo_hits']
     gc.collect()
     print(f"[OVERLAY CALO HITS DONE] RAM: {process.memory_info().rss / 1024 / 1024:.2f} MB")
 
-    # 4. Overlay tracks (HS first, pileup second per event).
+    # 3. Overlay tracks.
     print("[OVERLAY TRACKS] Merging HS and pileup tracks...")
     tracks = _overlay_tracks(hs['tracks'], pu['tracks'], sample_map_flat)
-    del hs['tracks'], pu['tracks'], pu, sample_map_flat
+    del hs['tracks'], sample_map_flat
     gc.collect()
     print(f"[OVERLAY TRACKS DONE] RAM: {process.memory_info().rss / 1024 / 1024:.2f} MB")
 
-    # 5. CLUE clustering on the merged frame.
+    # 4. CLUE clustering.
     print("[CLUE CLUSTERING] Running CLUE clustering on overlaid hits...")
     calo_hits = clue_clustering(merged_calo_hits, dc=75.88106168184893,
-                                rhoc=104.34315216716726, dm=87.0967630118376, ppbin=16)
+                                rhoc=104.34315216716726, dm=87.0967630118376, ppbin=16,
+                                backend=clue_backend)
     del merged_calo_hits
     gc.collect()
 
-    # 6. Cluster energy cutoff filter.
+    # 5. Cluster energy cutoff filter.
     calo_hits = (
         calo_hits.lazy()
         .with_row_index('_event_idx_temp')
@@ -1109,11 +1079,11 @@ def preprocess_for_model(
     )
     print(f"[CLUE CLUSTERING DONE] RAM: {process.memory_info().rss / 1024 / 1024:.2f} MB")
 
-    # 7. depositors_list (HS particles only — inner-join filters out pileup contribs).
-    particles = hs['particles']
-    particles_pid_to_vertex = hs['particles_pid_to_vertex']
-    particles_hard_scatter_ids = hs['particles_hard_scatter_ids']
-    del hs
+    # 6. depositors_list (HS particles only).
+    # .pop() so the dict no longer holds these refs — `del` below truly frees them.
+    particles = hs.pop('particles')
+    particles_pid_to_vertex = hs.pop('particles_pid_to_vertex')
+    particles_hard_scatter_ids = hs.pop('particles_hard_scatter_ids')
 
     print("[DEPOSITORS LIST] Creating depositors list...")
     depositors_list = (
@@ -1133,9 +1103,11 @@ def preprocess_for_model(
             pl.col('particle_id').cast(pl.Int64),
         ])
     ).collect(streaming=True)
+    del particles_hard_scatter_ids
+    gc.collect()
     print(f"[DEPOSITORS LIST DONE] RAM: {process.memory_info().rss / 1024 / 1024:.2f} MB")
 
-    # 8. Target particles aggregation.
+    # 7. Target particles aggregation.
     target_particles = (
         particles.lazy()
         .select(['event_id', 'particle_id', 'is_target_particle', 'pdg_id',
@@ -1220,7 +1192,6 @@ def preprocess_for_model(
         cluster_to_cluster_idx=cluster_to_cluster_idx,
     )
     print(f"[FILTER ORPHANS DONE] RAM: {process.memory_info().rss / 1024 / 1024:.2f} MB")
-    print("[PREPROCESS COMPLETE]\n")
 
     return {
         'target_particles': filtered_data['target_particles'],
@@ -1228,6 +1199,146 @@ def preprocess_for_model(
         'tracks': filtered_data['tracks'],
         'target_particles_deps': filtered_data['target_particles_deps'],
     }
+
+
+def preprocess_for_model(
+    hs_particles: pl.DataFrame,
+    hs_tracks: pl.DataFrame,
+    hs_calo_hits: pl.DataFrame,
+    pu_particles: pl.DataFrame,
+    pu_tracks: pl.DataFrame,
+    pu_calo_hits: pl.DataFrame,
+    pileup_level: int = 200,
+    seed: int = 42,
+    num_of_events: int = -1,
+    truth_eta_cut: float = 3.0,
+    truth_pt_cut: float = 1.0,
+    target_pt_cut: float = 0.3,
+    clusters_cutoff: float = 0.1,
+    clue_backend: str = 'gpu cuda',
+    chunk_size: int = -1,
+    chunk_tmp_dir: str = "/storage/agrp/barakma/PileupODD/data/tmp",
+) -> Dict[str, pl.DataFrame]:
+    """
+    Build a synthetic PU<pileup_level> dataset by overlaying ~Poisson(pileup_level)
+    pileup events on each PU0 hard-scatter event, then run clustering and the
+    full target/cluster aggregation pipeline.
+
+    clue_backend: backend passed to CLUEstering. Use 'gpu cuda' (default) for
+    NVIDIA GPUs, or 'cpu serial' / 'cpu tbb' for CPU-only nodes. Example:
+        preprocess_for_model(..., clue_backend='cpu serial')
+
+    chunk_size: if > 0, process HS events in chunks of this size through the
+    overlay->cluster->aggregate pipeline, then concatenate. The PU pool is
+    NOT chunked (it's the shared sampling pool). Reduces peak RAM but slightly
+    increases wall time. <=0 means no chunking (process all HS events at once).
+
+    chunk_tmp_dir: parent directory under which a per-run temp dir is created
+    for spilling chunk outputs to disk. Defaults to a path under PileupODD/data
+    (large shared storage). Only used when chunk_size > 0.
+    """
+    import psutil
+    import os
+    process = psutil.Process(os.getpid())
+
+    print("\n[PREPROCESS START]")
+    print(f"RAM: {process.memory_info().rss / 1024 / 1024:.2f} MB")
+
+    # 1. Per-source preprocessing.
+    hs = _preprocess_source(hs_particles, hs_tracks, hs_calo_hits, kind='hs',
+                             num_of_events=num_of_events,
+                             truth_eta_cut=truth_eta_cut,
+                             truth_pt_cut=truth_pt_cut,
+                             target_pt_cut=target_pt_cut)
+    del hs_particles, hs_tracks
+    gc.collect()
+
+    pu = _preprocess_source(pu_particles, pu_tracks, pu_calo_hits, kind='pu',
+                             num_of_events=num_of_events,
+                             truth_eta_cut=truth_eta_cut,
+                             truth_pt_cut=truth_pt_cut,
+                             target_pt_cut=target_pt_cut)
+    del pu_particles, pu_tracks
+    gc.collect()
+    print(f"[PER-SOURCE DONE] RAM: {process.memory_info().rss / 1024 / 1024:.2f} MB")
+
+    hs_event_ids_all = hs['calo_hits']['event_id'].to_numpy()
+    n_hs = len(hs_event_ids_all)
+
+    if chunk_size is None or chunk_size <= 0 or n_hs <= chunk_size:
+        # Single pass (no chunking).
+        result = _run_overlay_and_aggregate(hs, pu, pileup_level, seed,
+                                            clusters_cutoff, clue_backend, process)
+        del hs, pu
+        gc.collect()
+        print("[PREPROCESS COMPLETE]\n")
+        return result
+
+    # Chunked pass: slice HS by event_id, share PU pool across chunks.
+    # Each chunk's 4 output frames are spilled to disk immediately so we don't
+    # accumulate them in memory. Sources (hs, pu) are freed before reading back.
+    import tempfile
+    from pathlib import Path
+
+    n_chunks = (n_hs + chunk_size - 1) // chunk_size
+    print(f"[CHUNKING] Splitting {n_hs} HS events into {n_chunks} chunks of <= {chunk_size}")
+
+    keys = ['target_particles', 'calo_clusters', 'tracks', 'target_particles_deps']
+
+    Path(chunk_tmp_dir).mkdir(parents=True, exist_ok=True)
+    with tempfile.TemporaryDirectory(prefix='clue_chunks_', dir=chunk_tmp_dir) as tmpdir:
+        tmp = Path(tmpdir)
+        for ci in range(n_chunks):
+            chunk_ids_np = hs_event_ids_all[ci * chunk_size:(ci + 1) * chunk_size]
+            chunk_ids = pl.Series('event_id', chunk_ids_np)
+            print(f"\n[CHUNK {ci+1}/{n_chunks}] {len(chunk_ids_np)} HS events. "
+                  f"RAM: {process.memory_info().rss / 1024 / 1024:.2f} MB")
+
+            hs_chunk = {
+                'particles':                 hs['particles'].filter(pl.col('event_id').is_in(chunk_ids)),
+                'tracks':                    hs['tracks'].filter(pl.col('event_id').is_in(chunk_ids)),
+                'calo_hits':                 hs['calo_hits'].filter(pl.col('event_id').is_in(chunk_ids)),
+                'particles_pid_to_vertex':   hs['particles_pid_to_vertex'].filter(pl.col('event_id').is_in(chunk_ids)),
+                'particles_hard_scatter_ids':hs['particles_hard_scatter_ids'].filter(pl.col('event_id').is_in(chunk_ids)),
+            }
+
+            out = _run_overlay_and_aggregate(
+                hs_chunk, pu,
+                pileup_level=pileup_level,
+                seed=seed + ci,  # distinct sampling per chunk
+                clusters_cutoff=clusters_cutoff,
+                clue_backend=clue_backend,
+                process=process,
+            )
+            del hs_chunk
+            gc.collect()
+
+            # Spill this chunk's outputs to disk and free them from memory.
+            for k in keys:
+                out[k].write_parquet(tmp / f'chunk_{ci:04d}_{k}.parquet')
+            del out
+            gc.collect()
+            print(f"[CHUNK {ci+1}/{n_chunks} SPILLED] RAM: {process.memory_info().rss / 1024 / 1024:.2f} MB")
+
+        # All chunks processed: free per-source data BEFORE reading chunks back.
+        del hs, pu
+        gc.collect()
+        print(f"\n[ALL CHUNKS DONE / SOURCES FREED] RAM: {process.memory_info().rss / 1024 / 1024:.2f} MB")
+
+        # Read chunks per-key, concat, then delete files to release disk early.
+        final: Dict[str, pl.DataFrame] = {}
+        for k in keys:
+            parts = sorted(tmp.glob(f'chunk_*_{k}.parquet'))
+            final[k] = pl.concat([pl.read_parquet(p) for p in parts])
+            for p in parts:
+                p.unlink()
+            gc.collect()
+            print(f"[CONCAT {k}] {len(parts)} chunks merged. "
+                  f"RAM: {process.memory_info().rss / 1024 / 1024:.2f} MB")
+
+    print(f"[CHUNKS MERGED] RAM: {process.memory_info().rss / 1024 / 1024:.2f} MB")
+    print("[PREPROCESS COMPLETE]\n")
+    return final
 
 
 
@@ -1516,6 +1627,9 @@ def run_preprocessing_pipeline(
     num_of_events: int = -1,
     clusters_cutoff: float = 0.15,
     pu_files_per_batch: int = 3,
+    clue_backend: str = 'gpu cuda',
+    chunk_size: int = -1,
+    chunk_tmp_dir: str = "/storage/agrp/barakma/PileupODD/data/tmp",
 ):
     """
     Synthetic PU<pileup_level>: load PU0 HS and pileup-only triplets from
@@ -1534,6 +1648,12 @@ def run_preprocessing_pipeline(
       pu_files_per_batch: number of PU files concatenated into a shared pool per batch
                           of HS files.  Each HS file in the batch samples from the full
                           combined pool, giving better combinatorics across files.
+      clue_backend: backend for CLUEstering. Default 'gpu cuda' (NVIDIA GPU).
+                    Use 'cpu serial' or 'cpu tbb' for CPU-only nodes. Example:
+                        run_preprocessing_pipeline(r=[0], clue_backend='cpu serial')
+      chunk_size: if > 0, process HS events of each file in chunks of this size
+                  through the overlay->cluster->aggregate stages to cap peak RAM
+                  (PU pool stays shared across chunks). <=0 disables chunking.
     """
     from huggingface_hub import HfFileSystem
     from pathlib import Path
@@ -1611,6 +1731,9 @@ def run_preprocessing_pipeline(
                 num_of_events=num_of_events,
                 truth_pt_cut=1, truth_eta_cut=3.0, target_pt_cut=0.3,
                 clusters_cutoff=clusters_cutoff,
+                clue_backend=clue_backend,
+                chunk_size=chunk_size,
+                chunk_tmp_dir=chunk_tmp_dir,
             )
 
             for key, df in preprocessed_data.items():
