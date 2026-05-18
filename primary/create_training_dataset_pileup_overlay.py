@@ -1056,28 +1056,47 @@ def _run_overlay_and_aggregate(
                                 backend=clue_backend)
     del merged_calo_hits
     gc.collect()
-
+    print(f"[CLUE CLUSTERING DONE] RAM: {process.memory_info().rss / 1024 / 1024:.2f} MB")
     # 5. Cluster energy cutoff filter.
+    # Compute kept hit positions on a NARROW side-frame (3 hit cols + position),
+    # then apply with `list.gather` to ALL wide list columns in one pass — no
+    # wide explode of contrib_particle_ids / contrib_energies and no regroup.
+    import time as _time
+    _t0 = _time.time()
+    keep_idx = (
+        calo_hits.lazy()
+        .select(['cluster_id', 'total_energy', 'detector'])
+        .with_row_index('_rid')
+        .with_columns(
+            _pos=pl.int_ranges(0, pl.col('cluster_id').list.len(), dtype=pl.UInt32)
+        )
+        .explode(['cluster_id', 'total_energy', 'detector', '_pos'])
+        .join(CALIBRATION.lazy().select(['detector', 'calib_factor']),
+              on='detector', how='left')
+        .with_columns(_cal_e=pl.col('total_energy') * pl.col('calib_factor'))
+        .with_columns(_clu_sum=pl.col('_cal_e').sum().over(['_rid', 'cluster_id']))
+        .filter((pl.col('_clu_sum') > clusters_cutoff) & (pl.col('cluster_id') >= 0))
+        .group_by('_rid', maintain_order=True)
+        .agg(_indices=pl.col('_pos').sort())
+        .select(['_rid', '_indices'])
+    )
+
     calo_hits = (
         calo_hits.lazy()
-        .with_row_index('_event_idx_temp')
-        .explode(pl.all().exclude(['event_id', '_event_idx_temp']))
-        .join(CALIBRATION.lazy().select(['detector', 'calib_factor']), on='detector', how='left')
+        .with_row_index('_rid')
+        .join(keep_idx, on='_rid', how='left')
         .with_columns(
-            (pl.col('total_energy') * pl.col('calib_factor')).alias('hit_energy_gev')
+            pl.col('_indices').fill_null(pl.lit([], dtype=pl.List(pl.UInt32)))
         )
         .with_columns(
-            pl.col('hit_energy_gev').sum().over(['event_id', 'cluster_id']).alias('cluster_sum_energy')
+            pl.exclude('event_id', '_rid', '_indices').list.gather(pl.col('_indices'))
         )
-        .filter(pl.col('cluster_sum_energy') > clusters_cutoff)
-        .filter(pl.col('cluster_id') >= 0)
-        .drop(['calib_factor', 'hit_energy_gev', 'cluster_sum_energy'])
-        .group_by(['_event_idx_temp', 'event_id'], maintain_order=True)
-        .agg(pl.all().exclude(['_event_idx_temp', 'event_id']))
-        .drop('_event_idx_temp')
+        .drop(['_rid', '_indices'])
         .collect(streaming=True)
     )
-    print(f"[CLUE CLUSTERING DONE] RAM: {process.memory_info().rss / 1024 / 1024:.2f} MB")
+    _dt = _time.time() - _t0
+    print(f"[CLUE CLUSTERING DONE hits cut off] {_dt:.2f}s. "
+          f"RAM: {process.memory_info().rss / 1024 / 1024:.2f} MB")
 
     # 6. depositors_list (HS particles only).
     # .pop() so the dict no longer holds these refs — `del` below truly frees them.

@@ -8,4 +8,4 @@ from primary.create_training_dataset_pileup_overlay import run_preprocessing_pip
 if __name__ == "__main__":
 
     
-    run_preprocessing_pipeline(range(0, 1), num_of_events=1000, clue_backend='cpu omp', chunk_size=100)
+    run_preprocessing_pipeline(range(0, 1), num_of_events=100, clue_backend='gpu cuda', chunk_size=100)
