@@ -727,10 +727,12 @@ def _preprocess_source(
 
     # num_of_events is an HS-only debug limiter: shrinking the pileup pool too
     # would starve the Poisson sampler. Pileup keeps its full event pool.
+    # Filter by the first N unique event_ids (files have global ids, not 0-based).
     if num_of_events >= 0 and kind == 'hs':
-        particles = particles.filter(pl.col('event_id') < num_of_events)
-        tracks = tracks.filter(pl.col('event_id') < num_of_events)
-        calo_hits = calo_hits.filter(pl.col('event_id') < num_of_events)
+        first_n_ids = particles['event_id'].unique().sort()[:num_of_events]
+        particles = particles.filter(pl.col('event_id').is_in(first_n_ids))
+        tracks = tracks.filter(pl.col('event_id').is_in(first_n_ids))
+        calo_hits = calo_hits.filter(pl.col('event_id').is_in(first_n_ids))
 
     # Float32 cast
     particles = particles.with_columns([
@@ -1513,6 +1515,7 @@ def run_preprocessing_pipeline(
     seed: int = 42,
     num_of_events: int = -1,
     clusters_cutoff: float = 0.15,
+    pu_files_per_batch: int = 3,
 ):
     """
     Synthetic PU<pileup_level>: load PU0 HS and pileup-only triplets from
@@ -1526,8 +1529,11 @@ def run_preprocessing_pipeline(
       pileup_level: mean of the Poisson sampler for pileup events per HS event.
       pu_event_name: pileup-only dataset prefix on HF.
       seed: RNG seed for the sample map.
-      num_of_events: if >= 0, restrict per-source preprocessing to this many events.
+      num_of_events: if >= 0, restrict HS events (pileup pool is never truncated).
       clusters_cutoff: drop clusters whose calibrated energy sum is below this (GeV).
+      pu_files_per_batch: number of PU files concatenated into a shared pool per batch
+                          of HS files.  Each HS file in the batch samples from the full
+                          combined pool, giving better combinatorics across files.
     """
     from huggingface_hub import HfFileSystem
     from pathlib import Path
@@ -1565,32 +1571,54 @@ def run_preprocessing_pipeline(
         with fs.open(path, "rb") as f:
             return pl.read_parquet(f, columns=columns)
 
-    for i in tqdm.tqdm(r):
-        print(f"\n=== File index {i:05d} ===")
+    def _load_pu_batch(file_indices) -> tuple:
+        """Load and concatenate PU files, offsetting event_ids to be unique."""
+        p_list, c_list, t_list = [], [], []
+        offset = 0
+        for idx in file_indices:
+            p = _read(pu_event_name, 'particles', idx, columns=particle_cols)
+            c = _read(pu_event_name, 'calo_hits', idx, columns=calo_cols)
+            t = _read(pu_event_name, 'tracks', idx)
+            # Offset so event_ids don't collide across files.
+            max_eid = int(max(p['event_id'].max(), c['event_id'].max(), t['event_id'].max())) + 1
+            p_list.append(p.with_columns(pl.col('event_id') + offset))
+            c_list.append(c.with_columns(pl.col('event_id') + offset))
+            t_list.append(t.with_columns(pl.col('event_id') + offset))
+            offset += max_eid
+        return pl.concat(p_list), pl.concat(c_list), pl.concat(t_list)
 
-        hs_particles = _read(event_name, 'particles', i, columns=particle_cols)
-        hs_calo_hits = _read(event_name, 'calo_hits', i, columns=calo_cols)
-        hs_tracks = _read(event_name, 'tracks', i)
+    r_list = list(r)
+    batches = [r_list[i:i + pu_files_per_batch] for i in range(0, len(r_list), pu_files_per_batch)]
 
-        pu_particles = _read(pu_event_name, 'particles', i, columns=particle_cols)
-        pu_calo_hits = _read(pu_event_name, 'calo_hits', i, columns=calo_cols)
-        pu_tracks = _read(pu_event_name, 'tracks', i)
+    for batch in tqdm.tqdm(batches, desc="Batches"):
+        print(f"\n=== Loading PU pool from files {batch} ===")
+        pu_particles, pu_calo_hits, pu_tracks = _load_pu_batch(batch)
+        n_pu = pu_calo_hits['event_id'].n_unique()
+        print(f"    PU pool: {n_pu} unique pileup events from {len(batch)} file(s).")
 
-        preprocessed_data = preprocess_for_model(
-            hs_particles=hs_particles, hs_tracks=hs_tracks, hs_calo_hits=hs_calo_hits,
-            pu_particles=pu_particles, pu_tracks=pu_tracks, pu_calo_hits=pu_calo_hits,
-            pileup_level=pileup_level,
-            seed=seed + i,  # different sampling per file index
-            num_of_events=num_of_events,
-            truth_pt_cut=1, truth_eta_cut=3.0, target_pt_cut=0.3,
-            clusters_cutoff=clusters_cutoff,
-        )
+        for i in tqdm.tqdm(batch, desc="HS files in batch", leave=False):
+            print(f"\n=== File index {i:05d} ===")
 
-        for key, df in preprocessed_data.items():
-            df.write_parquet(out_dir / f"{key}-{i:05d}.parquet")
+            hs_particles = _read(event_name, 'particles', i, columns=particle_cols)
+            hs_calo_hits = _read(event_name, 'calo_hits', i, columns=calo_cols)
+            hs_tracks = _read(event_name, 'tracks', i)
 
-        del hs_particles, hs_tracks, hs_calo_hits
-        del pu_particles, pu_tracks, pu_calo_hits
-        del preprocessed_data
+            preprocessed_data = preprocess_for_model(
+                hs_particles=hs_particles, hs_tracks=hs_tracks, hs_calo_hits=hs_calo_hits,
+                pu_particles=pu_particles, pu_tracks=pu_tracks, pu_calo_hits=pu_calo_hits,
+                pileup_level=pileup_level,
+                seed=seed + i,  # different sampling per file index
+                num_of_events=num_of_events,
+                truth_pt_cut=1, truth_eta_cut=3.0, target_pt_cut=0.3,
+                clusters_cutoff=clusters_cutoff,
+            )
+
+            for key, df in preprocessed_data.items():
+                df.write_parquet(out_dir / f"{key}-{i:05d}.parquet")
+
+            del hs_particles, hs_tracks, hs_calo_hits, preprocessed_data
+            gc.collect()
+
+        del pu_particles, pu_calo_hits, pu_tracks
         gc.collect()
 
