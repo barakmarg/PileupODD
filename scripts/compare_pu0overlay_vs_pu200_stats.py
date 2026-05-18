@@ -27,7 +27,7 @@ DIR_A = DATA_ROOT / "ttbar_pu0_overlay_pu200"   # 1 file, 1000 events
 DIR_B = DATA_ROOT / "ttbar_pu200"               # many files, 100 ev each
 
 N_FILES_A = 1     # read all
-N_FILES_B = 1    # 10 * 100 = 1000 events
+N_FILES_B = 10    # 10 * 100 = 1000 events
 
 OUT_DIR = Path("/storage/agrp/barakma/PileupODD/scripts/out_pu0overlay_vs_pu200")
 OUT_DIR.mkdir(parents=True, exist_ok=True)
@@ -59,6 +59,10 @@ def n_clusters_per_event(calo: pl.DataFrame) -> np.ndarray:
 
 def cluster_energy(calo: pl.DataFrame) -> np.ndarray:
     return calo["total_cluster_energy"].explode().drop_nulls().to_numpy()
+
+
+def sum_cluster_energy_per_event(calo: pl.DataFrame) -> np.ndarray:
+    return calo["total_cluster_energy"].list.sum().to_numpy()
 
 
 def track_energy(tracks: pl.DataFrame) -> np.ndarray:
@@ -117,7 +121,8 @@ def overlay_hist(
     elif integer:
         lo = int(min(a.min(), b.min()))
         hi = int(max(a.max(), b.max()))
-        edges = np.arange(lo, hi + 2) - 0.5
+        step = max(1, int(np.ceil((hi - lo + 1) / bins)))
+        edges = np.arange(lo - 0.5, hi + 0.5 + step, step)
     else:
         lo = min(a.min(), b.min())
         hi = max(a.max(), b.max())
@@ -170,6 +175,10 @@ def main() -> None:
             clusters_per_particle(A["target_particles_deps"]),
             clusters_per_particle(B["target_particles_deps"]),
         ),
+        "sum_cluster_energy_per_event_gev": (
+            sum_cluster_energy_per_event(A["calo_clusters"]),
+            sum_cluster_energy_per_event(B["calo_clusters"]),
+        ),
     }
 
     for name, (a, b) in stats.items():
@@ -208,7 +217,12 @@ def main() -> None:
         xlabel="# clusters touched by target particle",
         title="# clusters per particle",
     )
-    axes[5].axis("off")
+    overlay_hist(
+        axes[5], *stats["sum_cluster_energy_per_event_gev"],
+        bins=60, log_y=True,
+        xlabel="sum cluster energy / event [GeV]",
+        title="Sum cluster energy per event",
+    )
 
     fig.suptitle("ttbar_pu0_overlay_pu200  vs  ttbar_pu200   (1000 events each)",
                  fontsize=13)

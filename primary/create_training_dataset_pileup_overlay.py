@@ -880,17 +880,28 @@ def _preprocess_source(
 
 
 def _build_sample_map(hs_event_ids: np.ndarray, pu_event_ids: np.ndarray,
-                       pileup_level: int, seed: int) -> pl.DataFrame:
+                       pileup_level: int, seed: int,
+                       invisible_pu_prob: float = 0.0) -> pl.DataFrame:
     """
     Per HS event: N ~ Poisson(pileup_level), then choose N distinct pileup
     event_ids (no repeat within an HS event). Replacement allowed across HS
     events. Returns a DataFrame with columns hs_event_id (u32) and
     pu_event_id (list[u32]).
+
+    If invisible_pu_prob > 0, each of the N draws is independently "invisible"
+    (contributes nothing — simulates diffractive events missing the detector)
+    with that probability. Equivalent to drawing K ~ Binomial(N, 1-p) and
+    sampling K events from the pool — done that way for efficiency (no wasted
+    sampling on rolls that would be discarded).
     """
+    if not 0.0 <= invisible_pu_prob < 1.0:
+        raise ValueError(f"invisible_pu_prob must be in [0, 1), got {invisible_pu_prob}")
     rng = np.random.default_rng(seed=seed)
     pool = pu_event_ids
     pool_size = len(pool)
     ns = rng.poisson(pileup_level, size=len(hs_event_ids))
+    if invisible_pu_prob > 0.0:
+        ns = rng.binomial(ns, 1.0 - invisible_pu_prob)
     ns = np.minimum(ns, pool_size).astype(np.int64)
     pu_per_hs = [rng.choice(pool, size=int(n), replace=False).astype(pool.dtype) for n in ns]
     return pl.DataFrame({
@@ -1020,6 +1031,7 @@ def _run_overlay_and_aggregate(
     clusters_cutoff: float,
     clue_backend: str,
     process,
+    invisible_pu_prob: float = 0.0,
 ) -> Dict[str, pl.DataFrame]:
     """
     Overlay HS+PU calo hits, cluster, and run the full target/cluster
@@ -1029,7 +1041,8 @@ def _run_overlay_and_aggregate(
     # 1. Poisson sample map.
     hs_event_ids = hs['calo_hits']['event_id'].to_numpy()
     pu_event_ids = pu['calo_hits']['event_id'].unique(maintain_order=True).to_numpy()
-    sample_map = _build_sample_map(hs_event_ids, pu_event_ids, pileup_level, seed)
+    sample_map = _build_sample_map(hs_event_ids, pu_event_ids, pileup_level, seed,
+                                   invisible_pu_prob=invisible_pu_prob)
     sample_map_flat = sample_map.explode('pu_event_id')
     del sample_map
     print(f"[SAMPLE MAP] {len(sample_map_flat)} HS-PU pairs across {len(hs_event_ids)} HS events. "
@@ -1237,6 +1250,7 @@ def preprocess_for_model(
     clue_backend: str = 'gpu cuda',
     chunk_size: int = -1,
     chunk_tmp_dir: str = "/storage/agrp/barakma/PileupODD/data/tmp",
+    invisible_pu_prob: float = 0.0,
 ) -> Dict[str, pl.DataFrame]:
     """
     Build a synthetic PU<pileup_level> dataset by overlaying ~Poisson(pileup_level)
@@ -1287,7 +1301,8 @@ def preprocess_for_model(
     if chunk_size is None or chunk_size <= 0 or n_hs <= chunk_size:
         # Single pass (no chunking).
         result = _run_overlay_and_aggregate(hs, pu, pileup_level, seed,
-                                            clusters_cutoff, clue_backend, process)
+                                            clusters_cutoff, clue_backend, process,
+                                            invisible_pu_prob=invisible_pu_prob)
         del hs, pu
         gc.collect()
         print("[PREPROCESS COMPLETE]\n")
@@ -1328,6 +1343,7 @@ def preprocess_for_model(
                 clusters_cutoff=clusters_cutoff,
                 clue_backend=clue_backend,
                 process=process,
+                invisible_pu_prob=invisible_pu_prob,
             )
             del hs_chunk
             gc.collect()
@@ -1646,9 +1662,11 @@ def run_preprocessing_pipeline(
     num_of_events: int = -1,
     clusters_cutoff: float = 0.15,
     pu_files_per_batch: int = 3,
+    pu_indices=None,
     clue_backend: str = 'gpu cuda',
     chunk_size: int = -1,
     chunk_tmp_dir: str = "/storage/agrp/barakma/PileupODD/data/tmp",
+    invisible_pu_prob: float = 0.0,
 ):
     """
     Synthetic PU<pileup_level>: load PU0 HS and pileup-only triplets from
@@ -1667,18 +1685,29 @@ def run_preprocessing_pipeline(
       pu_files_per_batch: number of PU files concatenated into a shared pool per batch
                           of HS files.  Each HS file in the batch samples from the full
                           combined pool, giving better combinatorics across files.
+                          Ignored when `pu_indices` is provided.
+      pu_indices: explicit iterable of PU file indices to load into a single shared
+                  pool used by ALL HS files in `r` (decouples PU pool from HS files).
+                  When None (default), PU pool is derived from `r` in batches of
+                  `pu_files_per_batch` (legacy behavior).
       clue_backend: backend for CLUEstering. Default 'gpu cuda' (NVIDIA GPU).
                     Use 'cpu serial' or 'cpu tbb' for CPU-only nodes. Example:
                         run_preprocessing_pipeline(r=[0], clue_backend='cpu serial')
       chunk_size: if > 0, process HS events of each file in chunks of this size
                   through the overlay->cluster->aggregate stages to cap peak RAM
                   (PU pool stays shared across chunks). <=0 disables chunking.
+      invisible_pu_prob: per-PU-draw probability of contributing nothing
+                  (simulates diffractive events missing the detector). Drawn
+                  efficiently via Binomial — no wasted sampling on rolls that
+                  would be discarded. Default 0.0 (no change to legacy behavior).
+                  Reasonable value: 0.19.
     """
     from huggingface_hub import HfFileSystem
     from pathlib import Path
     import polars as pl
     import tqdm
     import gc
+    import time
 
     fs = HfFileSystem()
     if r is None:
@@ -1727,16 +1756,23 @@ def run_preprocessing_pipeline(
         return pl.concat(p_list), pl.concat(c_list), pl.concat(t_list)
 
     r_list = list(r)
-    batches = [r_list[i:i + pu_files_per_batch] for i in range(0, len(r_list), pu_files_per_batch)]
+    if pu_indices is not None:
+        batches = [(list(pu_indices), r_list)]
+    else:
+        batches = [
+            (r_list[i:i + pu_files_per_batch], r_list[i:i + pu_files_per_batch])
+            for i in range(0, len(r_list), pu_files_per_batch)
+        ]
 
-    for batch in tqdm.tqdm(batches, desc="Batches"):
-        print(f"\n=== Loading PU pool from files {batch} ===")
-        pu_particles, pu_calo_hits, pu_tracks = _load_pu_batch(batch)
+    for pu_batch, hs_batch in tqdm.tqdm(batches, desc="Batches"):
+        print(f"\n=== Loading PU pool from files {pu_batch} ===")
+        pu_particles, pu_calo_hits, pu_tracks = _load_pu_batch(pu_batch)
         n_pu = pu_calo_hits['event_id'].n_unique()
-        print(f"    PU pool: {n_pu} unique pileup events from {len(batch)} file(s).")
+        print(f"    PU pool: {n_pu} unique pileup events from {len(pu_batch)} file(s).")
 
-        for i in tqdm.tqdm(batch, desc="HS files in batch", leave=False):
+        for i in tqdm.tqdm(hs_batch, desc="HS files in batch", leave=False):
             print(f"\n=== File index {i:05d} ===")
+            _t0 = time.perf_counter()
 
             hs_particles = _read(event_name, 'particles', i, columns=particle_cols)
             hs_calo_hits = _read(event_name, 'calo_hits', i, columns=calo_cols)
@@ -1753,6 +1789,7 @@ def run_preprocessing_pipeline(
                 clue_backend=clue_backend,
                 chunk_size=chunk_size,
                 chunk_tmp_dir=chunk_tmp_dir,
+                invisible_pu_prob=invisible_pu_prob,
             )
 
             for key, df in preprocessed_data.items():
@@ -1760,6 +1797,8 @@ def run_preprocessing_pipeline(
 
             del hs_particles, hs_tracks, hs_calo_hits, preprocessed_data
             gc.collect()
+            _dt = time.perf_counter() - _t0
+            print(f"=== File index {i:05d} done in {_dt:.1f} s ({_dt/60:.2f} min) ===")
 
         del pu_particles, pu_calo_hits, pu_tracks
         gc.collect()
