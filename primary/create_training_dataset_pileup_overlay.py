@@ -874,6 +874,13 @@ def _preprocess_source(
         print(f"[{tag} MASKS DONE] RAM: {process.memory_info().rss / 1024 / 1024:.2f} MB")
     else:
         # Pileup particles are not part of the dataset; release them.
+        # Keep a tiny event_ids snapshot first: particles is the canonical
+        # source of "which PU vertices exist" — used by the sampler so that
+        # vertices with no calo hits (invisible vertices) still get sampled
+        # at their Poisson rate and contribute zero cells.
+        out['particle_event_ids'] = (
+            particles.lazy().select('event_id').unique(maintain_order=True).collect()
+        )
         del particles
         gc.collect()
     return out
@@ -927,6 +934,12 @@ def _overlay_calo_hits(
         pu_calo_hits.lazy()
         .select(['event_id', 'detector', 'total_energy', 'x', 'y', 'z'])
         .explode(['detector', 'total_energy', 'x', 'y', 'z'])
+        # Drop the phantom null row that polars produces when an empty calo_hits
+        # list is exploded. The PU event itself is still in the sampler pool
+        # (enumerated from unique event_id of pu_calo_hits) so empty-calo
+        # vertices still get sampled and just contribute zero cells, which
+        # correctly imitates an "invisible" pileup vertex.
+        .filter(pl.col('detector').is_not_null())
         .with_columns([
             pl.col('x').round(3),
             pl.col('y').round(3),
@@ -1040,7 +1053,15 @@ def _run_overlay_and_aggregate(
     """
     # 1. Poisson sample map.
     hs_event_ids = hs['calo_hits']['event_id'].to_numpy()
-    pu_event_ids = pu['calo_hits']['event_id'].unique(maintain_order=True).to_numpy()
+    # Enumerate the PU pool from PARTICLES (canonical "vertex exists" set), so
+    # vertices with no calo hits / no tracks still get sampled at their
+    # Poisson rate — they correctly contribute zero cells / zero tracks
+    # (imitates the real PU200 distribution where some vertices are invisible).
+    # Fallback to calo_hits.event_id for callers that don't set particle_event_ids.
+    if 'particle_event_ids' in pu:
+        pu_event_ids = pu['particle_event_ids']['event_id'].to_numpy()
+    else:
+        pu_event_ids = pu['calo_hits']['event_id'].unique(maintain_order=True).to_numpy()
     sample_map = _build_sample_map(hs_event_ids, pu_event_ids, pileup_level, seed,
                                    invisible_pu_prob=invisible_pu_prob)
     sample_map_flat = sample_map.explode('pu_event_id')

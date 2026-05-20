@@ -23,13 +23,13 @@ import numpy as np
 import polars as pl
 
 DATA_ROOT = Path("/storage/agrp/barakma/PileupODD/data")
-DIR_A = DATA_ROOT / "ttbar_pu0_overlay_pu200"   # 1 file, 1000 events
+DIR_A = DATA_ROOT / "ttbar_pu0_overlay_pu200_from_ttbar"   # 1 file, 1000 events
 DIR_B = DATA_ROOT / "ttbar_pu200"               # many files, 100 ev each
 
 N_FILES_A = 1     # read all
 N_FILES_B = 10    # 10 * 100 = 1000 events
 
-OUT_DIR = Path("/storage/agrp/barakma/PileupODD/scripts/out_pu0overlay_vs_pu200")
+OUT_DIR = Path("/storage/agrp/barakma/PileupODD/scripts/out_pu200fullsimoverlay_vs_pu200")
 OUT_DIR.mkdir(parents=True, exist_ok=True)
 
 
