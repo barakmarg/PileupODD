@@ -22,6 +22,16 @@ from primary.calibration import CALIBRATION
 from primary.clue_clustering import clue_clustering
 
 
+# --- Time-of-Flight cut for PU hits (Dan's fix for the +8% PU energy excess) ---
+# In real PU200, pileup interactions are spread in time (sigma = 185 ps), so
+# "late" pileup hits fall outside the detector's read-out window and are
+# trimmed during simulation. We model this only on the PU side (HS hits are
+# at t=0 in sim and were already cut).
+TOF_TIME_SIGMA_NS = 0.185          # per-PU-vertex Gaussian shift sigma
+TOF_C_MM_NS = 299.792458           # speed of light in mm/ns
+TOF_WINDOW_NS = (-1.0, 10.0)       # [t_min, t_max] for the corrected hit time
+
+
 
 def split_train_val_test(datasets: Dict[str, pl.DataFrame], train_frac=0.7, val_frac=0.15, test_frac=0.15, seed=42)->Dict[str, Dict[str, pl.DataFrame]]:
     """
@@ -703,6 +713,7 @@ def _preprocess_source(
     truth_eta_cut: float = 3.0,
     truth_pt_cut: float = 1.0,
     target_pt_cut: float = 0.3,
+    tof_enabled: bool = True,
 ) -> Dict[str, pl.DataFrame]:
     """
     Per-source preprocessing (HS or PU), run independently before overlay.
@@ -747,6 +758,72 @@ def _preprocess_source(
         pl.col(pl.Float64).cast(pl.Float32),
         pl.col(pl.List(pl.Float64)).cast(pl.List(pl.Float32)),
     ])
+
+    # PU only: precompute per-hit `t_hit` (energy-weighted mean of contrib_times)
+    # once. Used by _overlay_calo_hits for the ToF window cut. We then drop
+    # `contrib_times` because nothing downstream consumes it.
+    #
+    # CHUNKED: the level-2 contrib explode of the full PU pool peaks at ~1B rows
+    # (~30 GB) which the OS doesn't return after the regroup. We process the
+    # pool in micro-batches and concat the small per-event t_hit Series so peak
+    # RAM during this step is bounded by the batch (a few GB).
+    if kind != 'hs' and tof_enabled and 'contrib_times' in calo_hits.columns:
+        n_pu = calo_hits.height
+        t_hit_batch = 1000  # PU events per double-explode batch
+        print(f"[{tag} T_HIT PRECOMPUTE] energy-weighted hit time "
+              f"({n_pu} events in batches of {t_hit_batch})...")
+        t_hit_parts = []
+        for start in range(0, n_pu, t_hit_batch):
+            sub = calo_hits.slice(start, t_hit_batch)
+            part = (
+                sub.lazy()
+                .select(['total_energy', 'contrib_energies', 'contrib_times'])
+                .with_row_index('_ev')
+                .with_columns(
+                    _hit_pos=pl.int_ranges(
+                        0, pl.col('total_energy').list.len(), dtype=pl.UInt32
+                    )
+                )
+                .drop('total_energy')
+                # Level-1: per-hit row.
+                .explode(['contrib_energies', 'contrib_times', '_hit_pos'])
+                .with_row_index('_hit')
+                # Level-2: per-contributor row.
+                .explode(['contrib_energies', 'contrib_times'])
+                .group_by('_hit', maintain_order=True)
+                .agg([
+                    pl.col('_ev').first(),
+                    pl.col('_hit_pos').first(),
+                    (
+                        (pl.col('contrib_times') * pl.col('contrib_energies')).sum()
+                        / pl.col('contrib_energies').sum().clip(lower_bound=1e-30)
+                    ).cast(pl.Float32).alias('t_hit'),
+                ])
+                # Restore within-event hit order before re-aggregating.
+                .sort(['_ev', '_hit_pos'])
+                .group_by('_ev', maintain_order=True)
+                .agg(pl.col('t_hit'))
+                .collect(streaming=True)
+            )
+            t_hit_parts.append(part.select('t_hit'))
+            del sub, part
+            gc.collect()
+        # Concat preserves the original PU event order (chunks are consecutive slices).
+        t_hit_col = pl.concat(t_hit_parts)
+        del t_hit_parts
+        gc.collect()
+        # Stitch the t_hit column back onto calo_hits by position (same row order
+        # as the slices we processed). hstack avoids a join + row-index round-trip.
+        calo_hits = calo_hits.drop('contrib_times').hstack(t_hit_col)
+        del t_hit_col
+        gc.collect()
+        # Force the allocator to return the contrib-explode arena to the OS.
+        try:
+            import ctypes
+            ctypes.CDLL("libc.so.6").malloc_trim(0)
+        except (OSError, AttributeError):
+            pass
+        print(f"[{tag} T_HIT DONE] RAM: {process.memory_info().rss / 1024 / 1024:.2f} MB")
 
     tracks = calculate_extrapolated_features_polars(tracks)
     print(f"[{tag} EXTRAPOLATED] RAM: {process.memory_info().rss / 1024 / 1024:.2f} MB")
@@ -921,6 +998,7 @@ def _overlay_calo_hits(
     hs_calo_hits: pl.DataFrame,
     pu_calo_hits: pl.DataFrame,
     sample_map_flat: pl.DataFrame,
+    tof_enabled: bool = True,
 ) -> pl.DataFrame:
     """
     Merge HS + sampled pileup calo hits cell-by-cell on (event_id, detector,
@@ -928,12 +1006,19 @@ def _overlay_calo_hits(
     add pileup energy. HS contrib lists pass through untouched; pileup-only
     cells get empty contrib lists. Returns list-per-event frame suitable
     for clue_clustering.
+
+    When `tof_enabled=True`, per-PU-vertex Gaussian time shifts in
+    `sample_map_flat['time_shift']` and per-hit `pu_calo_hits['t_hit']` are
+    used to apply the read-out time-window cut to pileup hits before summing.
     """
     # Pileup hits: select-explode-round, join sample_map (replicates per HS event), sum per cell.
+    pu_select_cols = ['event_id', 'detector', 'total_energy', 'x', 'y', 'z']
+    if tof_enabled:
+        pu_select_cols.append('t_hit')
     pu_cells = (
         pu_calo_hits.lazy()
-        .select(['event_id', 'detector', 'total_energy', 'x', 'y', 'z'])
-        .explode(['detector', 'total_energy', 'x', 'y', 'z'])
+        .select(pu_select_cols)
+        .explode([c for c in pu_select_cols if c != 'event_id'])
         # Drop the phantom null row that polars produces when an empty calo_hits
         # list is exploded. The PU event itself is still in the sampler pool
         # (enumerated from unique event_id of pu_calo_hits) so empty-calo
@@ -946,9 +1031,25 @@ def _overlay_calo_hits(
             pl.col('z').round(3),
         ])
     )
+    pu_cell_energy = sample_map_flat.lazy().join(pu_cells, left_on='pu_event_id', right_on='event_id')
+    if tof_enabled:
+        # ToF cut: shift the energy-weighted hit time by the per-PU-vertex
+        # bunch-crossing offset, subtract the speed-of-light flight time, and
+        # drop hits outside the read-out window [-1, 10] ns.
+        t_min, t_max = TOF_WINDOW_NS
+        pu_cell_energy = (
+            pu_cell_energy
+            .with_columns(
+                t_corr=(
+                    pl.col('t_hit') + pl.col('time_shift')
+                    - (pl.col('x').pow(2) + pl.col('y').pow(2) + pl.col('z').pow(2)).sqrt()
+                      / TOF_C_MM_NS
+                )
+            )
+            .filter((pl.col('t_corr') >= t_min) & (pl.col('t_corr') <= t_max))
+        )
     pu_cell_energy = (
-        sample_map_flat.lazy()
-        .join(pu_cells, left_on='pu_event_id', right_on='event_id')
+        pu_cell_energy
         .group_by([pl.col('hs_event_id').alias('event_id'), 'detector', 'x', 'y', 'z'])
         .agg(pl.col('total_energy').sum().alias('pu_energy'))
     )
@@ -1045,6 +1146,7 @@ def _run_overlay_and_aggregate(
     clue_backend: str,
     process,
     invisible_pu_prob: float = 0.0,
+    tof_enabled: bool = True,
 ) -> Dict[str, pl.DataFrame]:
     """
     Overlay HS+PU calo hits, cluster, and run the full target/cluster
@@ -1066,12 +1168,24 @@ def _run_overlay_and_aggregate(
                                    invisible_pu_prob=invisible_pu_prob)
     sample_map_flat = sample_map.explode('pu_event_id')
     del sample_map
+
+    if tof_enabled:
+        # One Gaussian time shift per sampled PU vertex (per HS-PU pair).
+        # Modelled as N(0, 0.185 ns) — the bunch-crossing spread Dan called out.
+        rng = np.random.default_rng(seed)
+        time_shifts = rng.normal(loc=0.0, scale=TOF_TIME_SIGMA_NS,
+                                 size=len(sample_map_flat)).astype(np.float32)
+        sample_map_flat = sample_map_flat.with_columns(
+            pl.Series('time_shift', time_shifts, dtype=pl.Float32)
+        )
+
     print(f"[SAMPLE MAP] {len(sample_map_flat)} HS-PU pairs across {len(hs_event_ids)} HS events. "
           f"RAM: {process.memory_info().rss / 1024 / 1024:.2f} MB")
 
     # 2. Overlay calo hits.
-    print("[OVERLAY CALO HITS] Merging HS and pileup hits per cell...")
-    merged_calo_hits = _overlay_calo_hits(hs['calo_hits'], pu['calo_hits'], sample_map_flat)
+    print(f"[OVERLAY CALO HITS] Merging HS and pileup hits per cell (tof_enabled={tof_enabled})...")
+    merged_calo_hits = _overlay_calo_hits(hs['calo_hits'], pu['calo_hits'], sample_map_flat,
+                                          tof_enabled=tof_enabled)
     del hs['calo_hits']
     gc.collect()
     print(f"[OVERLAY CALO HITS DONE] RAM: {process.memory_info().rss / 1024 / 1024:.2f} MB")
@@ -1272,6 +1386,7 @@ def preprocess_for_model(
     chunk_size: int = -1,
     chunk_tmp_dir: str = "/storage/agrp/barakma/PileupODD/data/tmp",
     invisible_pu_prob: float = 0.0,
+    tof_enabled: bool = True,
 ) -> Dict[str, pl.DataFrame]:
     """
     Build a synthetic PU<pileup_level> dataset by overlaying ~Poisson(pileup_level)
@@ -1303,7 +1418,8 @@ def preprocess_for_model(
                              num_of_events=num_of_events,
                              truth_eta_cut=truth_eta_cut,
                              truth_pt_cut=truth_pt_cut,
-                             target_pt_cut=target_pt_cut)
+                             target_pt_cut=target_pt_cut,
+                             tof_enabled=tof_enabled)
     del hs_particles, hs_tracks
     gc.collect()
 
@@ -1311,7 +1427,8 @@ def preprocess_for_model(
                              num_of_events=num_of_events,
                              truth_eta_cut=truth_eta_cut,
                              truth_pt_cut=truth_pt_cut,
-                             target_pt_cut=target_pt_cut)
+                             target_pt_cut=target_pt_cut,
+                             tof_enabled=tof_enabled)
     del pu_particles, pu_tracks
     gc.collect()
     print(f"[PER-SOURCE DONE] RAM: {process.memory_info().rss / 1024 / 1024:.2f} MB")
@@ -1323,7 +1440,8 @@ def preprocess_for_model(
         # Single pass (no chunking).
         result = _run_overlay_and_aggregate(hs, pu, pileup_level, seed,
                                             clusters_cutoff, clue_backend, process,
-                                            invisible_pu_prob=invisible_pu_prob)
+                                            invisible_pu_prob=invisible_pu_prob,
+                                            tof_enabled=tof_enabled)
         del hs, pu
         gc.collect()
         print("[PREPROCESS COMPLETE]\n")
@@ -1365,6 +1483,7 @@ def preprocess_for_model(
                 clue_backend=clue_backend,
                 process=process,
                 invisible_pu_prob=invisible_pu_prob,
+                tof_enabled=tof_enabled,
             )
             del hs_chunk
             gc.collect()
@@ -1688,6 +1807,7 @@ def run_preprocessing_pipeline(
     chunk_size: int = -1,
     chunk_tmp_dir: str = "/storage/agrp/barakma/PileupODD/data/tmp",
     invisible_pu_prob: float = 0.0,
+    tof_enabled: bool = True,
 ):
     """
     Synthetic PU<pileup_level>: load PU0 HS and pileup-only triplets from
@@ -1739,10 +1859,16 @@ def run_preprocessing_pipeline(
         'event_id', 'particle_id', 'vertex_primary', 'pdg_id',
         'energy', 'px', 'py', 'pz', 'vx', 'vy', 'vz', 'parent_id',
     ]
-    calo_cols = [
+    hs_calo_cols = [
         'event_id', 'detector', 'total_energy', 'x', 'y', 'z',
         'contrib_particle_ids', 'contrib_energies',
     ]
+    # PU calo loader picks up contrib_times only when the ToF cut is on; it's
+    # consumed by _preprocess_source to compute the energy-weighted hit time
+    # and dropped immediately after.
+    pu_calo_cols = list(hs_calo_cols)
+    if tof_enabled:
+        pu_calo_cols.append('contrib_times')
 
     out_dir = Path(f"/storage/agrp/barakma/PileupODD/data/{event_name}_overlay_pu{pileup_level}")
     out_dir.mkdir(parents=True, exist_ok=True)
@@ -1766,7 +1892,7 @@ def run_preprocessing_pipeline(
         offset = 0
         for idx in file_indices:
             p = _read(pu_event_name, 'particles', idx, columns=particle_cols)
-            c = _read(pu_event_name, 'calo_hits', idx, columns=calo_cols)
+            c = _read(pu_event_name, 'calo_hits', idx, columns=pu_calo_cols)
             t = _read(pu_event_name, 'tracks', idx)
             # Offset so event_ids don't collide across files.
             max_eid = int(max(p['event_id'].max(), c['event_id'].max(), t['event_id'].max())) + 1
@@ -1796,7 +1922,7 @@ def run_preprocessing_pipeline(
             _t0 = time.perf_counter()
 
             hs_particles = _read(event_name, 'particles', i, columns=particle_cols)
-            hs_calo_hits = _read(event_name, 'calo_hits', i, columns=calo_cols)
+            hs_calo_hits = _read(event_name, 'calo_hits', i, columns=hs_calo_cols)
             hs_tracks = _read(event_name, 'tracks', i)
 
             preprocessed_data = preprocess_for_model(
@@ -1811,6 +1937,7 @@ def run_preprocessing_pipeline(
                 chunk_size=chunk_size,
                 chunk_tmp_dir=chunk_tmp_dir,
                 invisible_pu_prob=invisible_pu_prob,
+                tof_enabled=tof_enabled,
             )
 
             for key, df in preprocessed_data.items():

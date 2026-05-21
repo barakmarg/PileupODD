@@ -40,10 +40,12 @@ PARTICLE_COLS = [
     'event_id', 'particle_id', 'vertex_primary', 'pdg_id',
     'energy', 'px', 'py', 'pz', 'vx', 'vy', 'vz', 'parent_id',
 ]
-CALO_COLS = [
+HS_CALO_COLS = [
     'event_id', 'detector', 'total_energy', 'x', 'y', 'z',
     'contrib_particle_ids', 'contrib_energies',
 ]
+# PU adds contrib_times for the ToF hit-time precompute in _preprocess_source.
+PU_CALO_COLS = HS_CALO_COLS + ['contrib_times']
 
 
 def _load_local_pu(pu_file_indices: list[int]) -> tuple[pl.DataFrame, pl.DataFrame, pl.DataFrame]:
@@ -62,7 +64,7 @@ def _load_local_pu(pu_file_indices: list[int]) -> tuple[pl.DataFrame, pl.DataFra
                 raise FileNotFoundError(fp)
 
         p = pl.read_parquet(p_path, columns=PARTICLE_COLS)
-        c = pl.read_parquet(c_path, columns=CALO_COLS)
+        c = pl.read_parquet(c_path, columns=PU_CALO_COLS)
         t = pl.read_parquet(t_path)
         if 'orig_event_id' in t.columns:
             t = t.drop('orig_event_id')
@@ -119,7 +121,7 @@ def run(
         t0 = time.perf_counter()
 
         hs_particles = _load_hs(fs, 'particles', i, columns=PARTICLE_COLS)
-        hs_calo_hits = _load_hs(fs, 'calo_hits', i, columns=CALO_COLS)
+        hs_calo_hits = _load_hs(fs, 'calo_hits', i, columns=HS_CALO_COLS)
         hs_tracks = _load_hs(fs, 'tracks', i)
 
         result = preprocess_for_model(
