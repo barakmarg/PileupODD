@@ -1,7 +1,7 @@
 """
 Download HepMC truth files for runs 0..2098 of the ColliderML full_pileup/ggf/v1
-dataset, parse each event's Higgs decay channel, and save all results to a
-single parquet using polars.
+dataset, parse each event's Higgs decay channel and truth kinematics, and save 
+all results to a single parquet using polars.
 
 - HepMC files are NOT cached: download to a temp file, parse, delete.
 - Every 50 successful runs the parquet is checkpointed so an interrupted run
@@ -10,6 +10,7 @@ single parquet using polars.
 """
 
 import argparse
+import math
 import tempfile
 from pathlib import Path
 
@@ -22,18 +23,22 @@ URL_TEMPLATE = (
     "https://portal.nersc.gov/cfs/m4958/ColliderML/full_pileup/ggf/v1/"
     "runs/{run}/events.hepmc"
 )
-OUT_PATH = Path("/storage/agrp/barakma/PileupODD/data/higgs_decays.parquet")
+OUT_PATH = Path("/storage/agrp/barakma/PileupODD/data/higgs_decays_enriched.parquet")
 
 PDG_NAMES = {
     5: "b", 22: "gamma", 23: "Z", 24: "W", 15: "tau", 21: "g",
     13: "mu", 11: "e", 12: "nu_e", 14: "nu_mu", 16: "nu_tau",
 }
 
+# Added kinematics to the parquet schema
 PARQUET_SCHEMA = {
     "run": pl.UInt32,
     "event_id": pl.UInt32,
     "decay": pl.String,
     "out_pids": pl.List(pl.Int64),
+    "out_pt": pl.List(pl.Float32),
+    "out_eta": pl.List(pl.Float32),
+    "out_phi": pl.List(pl.Float32),
 }
 
 
@@ -60,20 +65,52 @@ def _parse_run(run: int, path: Path) -> list[dict]:
         for event in f:
             eid = event.event_number
             decay_str = "Unknown"
+            
+            # Initialize empty lists for the event
             out_pids: list[int] = []
+            out_pt: list[float] = []
+            out_eta: list[float] = []
+            out_phi: list[float] = []
+            
             for p in event.particles:
                 if p.pid == 25 and p.end_vertex:
-                    out_pids = [part.pid for part in p.end_vertex.particles_out
-                                if part.pid != 25]
-                    if out_pids:
+                    out_particles = [part for part in p.end_vertex.particles_out if part.pid != 25]
+                    if out_particles:
+                        for part in out_particles:
+                            out_pids.append(part.pid)
+                            
+                            # Extract Momentum components safely
+                            px = part.momentum.px
+                            py = part.momentum.py
+                            pz = part.momentum.pz
+                            
+                            # Calculate pT
+                            pt = math.hypot(px, py)
+                            out_pt.append(pt)
+                            
+                            # Calculate phi (between -pi and pi)
+                            out_phi.append(math.atan2(py, px))
+                            
+                            # Calculate pseudorapidity (eta)
+                            p_mag = math.hypot(pt, pz)
+                            if p_mag == abs(pz): # Beamline particles (rare for Higgs daughters, but safe)
+                                eta = float('inf') if pz > 0 else float('-inf')
+                            else:
+                                eta = 0.5 * math.log((p_mag + pz) / (p_mag - pz))
+                            out_eta.append(eta)
+
                         names = [PDG_NAMES.get(abs(pid), str(pid)) for pid in out_pids]
                         decay_str = " -> ".join(names)
-                        break
+                        break # Found the Higgs decay, move to next event
+            
             rows.append({
                 "run": run,
                 "event_id": int(eid),
                 "decay": decay_str,
                 "out_pids": out_pids,
+                "out_pt": out_pt,
+                "out_eta": out_eta,
+                "out_phi": out_phi,
             })
     return rows
 
@@ -101,7 +138,7 @@ def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--run-start", type=int, default=0)
     parser.add_argument("--run-end", type=int, default=2098, help="inclusive")
-    parser.add_argument("--checkpoint-every", type=int, default=50)
+    parser.add_argument("--checkpoint-every", type=int, default=5)
     args = parser.parse_args()
 
     OUT_PATH.parent.mkdir(parents=True, exist_ok=True)
