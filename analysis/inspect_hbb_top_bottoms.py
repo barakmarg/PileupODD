@@ -244,6 +244,75 @@ def sum_leaf_b_hadrons_in_cone(raw_row: dict, eta0: float, phi0: float,
     }
 
 
+def b_plus_brothers_in_cone(raw_row: dict, eta0: float, phi0: float,
+                            dR: float = JET_R) -> dict:
+    """Extend `sum_leaf_b_hadrons_in_cone` with each leaf-B's brothers
+    (particles sharing the same `parent_id` as a leaf B in cone). Returns
+    the 4-momentum sum AND the *set of particle indices* contributing —
+    callers union the indices across the two matched jets so the dijet
+    sum never double-counts the same particle (relevant when two leaf B's
+    in the same cone share a parent → they're each other's brothers, and
+    the full sibling group is collected only once)."""
+    pdg = np.asarray(raw_row["pdg_id"], dtype=np.int64)
+    vp  = np.asarray(raw_row["vertex_primary"], dtype=np.int64)
+    particle_id = np.asarray(raw_row["particle_id"], dtype=np.int64)
+    parent_id   = np.asarray(raw_row["parent_id"],   dtype=np.int64)
+    px  = np.asarray(raw_row["px"], dtype=np.float64)
+    py  = np.asarray(raw_row["py"], dtype=np.float64)
+    pz  = np.asarray(raw_row["pz"], dtype=np.float64)
+    E   = np.asarray(raw_row["energy"], dtype=np.float64)
+    pt = np.hypot(px, py)
+    eta_all = np.arcsinh(pz / np.maximum(pt, 1e-30))
+    phi_all = np.arctan2(py, px)
+
+    empty = {"n_b": 0, "n_bro": 0, "px": 0.0, "py": 0.0, "pz": 0.0,
+             "E": 0.0, "pt": 0.0, "indices": set()}
+    b_mask = (vp == 1) & np.isin(np.abs(pdg), list(B_HADRON_PDGS))
+    if not b_mask.any():
+        return empty
+
+    dphi = phi_all - phi0
+    dphi = np.where(dphi >  math.pi, dphi - 2 * math.pi, dphi)
+    dphi = np.where(dphi < -math.pi, dphi + 2 * math.pi, dphi)
+    in_cone = (eta_all - eta0) ** 2 + dphi ** 2 < dR ** 2
+    sel = b_mask & in_cone
+    if not sel.any():
+        return empty
+
+    # Same leaf cut as sum_leaf_b_hadrons_in_cone: drop a B-hadron whose
+    # particle_id is the parent_id of another selected B-hadron.
+    sel_idx = np.where(sel)[0]
+    parents_of_other = {int(parent_id[j]) for j in sel_idx}
+    keep_idx = [i for i in sel_idx
+                if int(particle_id[i]) not in parents_of_other]
+    if not keep_idx:
+        keep_idx = [int(sel_idx[np.argmax(pt[sel_idx])])]
+
+    # Expand: collect every particle whose parent_id matches the parent
+    # of a kept leaf B. That's "B + its brothers" for each kept B; using
+    # a set over indices makes shared-parent leaf B's contribute the
+    # sibling group exactly once.
+    unique_parents = np.fromiter(
+        {int(parent_id[i]) for i in keep_idx}, dtype=np.int64
+    )
+    sibling_mask = np.isin(parent_id, unique_parents)
+    indices = set(int(i) for i in np.where(sibling_mask)[0])
+    if not indices:
+        return empty
+
+    idx_arr = np.fromiter(indices, dtype=int)
+    pxs = float(px[idx_arr].sum()); pys = float(py[idx_arr].sum())
+    return {
+        "n_b":   len(keep_idx),
+        "n_bro": len(indices) - len(keep_idx),
+        "px": pxs, "py": pys,
+        "pz": float(pz[idx_arr].sum()),
+        "E":  float(E[idx_arr].sum()),
+        "pt": float(math.hypot(pxs, pys)),
+        "indices": indices,
+    }
+
+
 def get_neutrinos_vp1(raw_row: dict) -> dict:
     """Pull all vp==1 neutrinos as a vectorized record (px,py,pz,E,eta,phi,pt)
     so we can sum their 4-momentum within any cone direction."""
@@ -328,7 +397,8 @@ def _diagnose_list_column_lengths(df: pl.DataFrame, label: str) -> None:
 def process_chunk(file_to_events: dict[int, list[int]],
                   truth_pt_cut: float, truth_eta_cut: float,
                   target_pt_cut: float, clusters_cutoff: float
-                  ) -> tuple[list[float], list[float], list[float]]:
+                  ) -> tuple[list[float], list[float], list[float], list[float],
+                             list[float], list[float], list[float], list[float]]:
     """One subprocess's worth of work: process all events in the chunk,
     one HF file at a time. Particle_ids are local to each HF file, so
     concatenating events across files would break the joins inside
@@ -336,16 +406,27 @@ def process_chunk(file_to_events: dict[int, list[int]],
     masses_vis: list[float] = []
     masses_corr: list[float] = []
     masses_bsum: list[float] = []
+    masses_bpbr: list[float] = []
+    masses_top2: list[float] = []
+    lead_pt: list[float] = []
+    sublead_pt: list[float] = []
+    delta_r_top2: list[float] = []
     for fi in sorted(file_to_events):
         eids = file_to_events[fi]
-        v, c, b = _process_single_file(
+        v, c, b, bb, t, lp, slp, dr = _process_single_file(
             fi, eids,
             truth_pt_cut, truth_eta_cut, target_pt_cut, clusters_cutoff,
         )
         masses_vis.extend(v)
         masses_corr.extend(c)
         masses_bsum.extend(b)
-    return masses_vis, masses_corr, masses_bsum
+        masses_bpbr.extend(bb)
+        masses_top2.extend(t)
+        lead_pt.extend(lp)
+        sublead_pt.extend(slp)
+        delta_r_top2.extend(dr)
+    return (masses_vis, masses_corr, masses_bsum, masses_bpbr, masses_top2,
+            lead_pt, sublead_pt, delta_r_top2)
 
 
 def _process_single_file(file_idx: int, event_ids: list[int],
@@ -383,6 +464,11 @@ def _process_single_file(file_idx: int, event_ids: list[int],
     masses_vis: list[float] = []
     masses_corr: list[float] = []
     masses_bsum: list[float] = []
+    masses_bpbr: list[float] = []
+    masses_top2: list[float] = []
+    lead_pt: list[float] = []
+    sublead_pt: list[float] = []
+    delta_r_top2: list[float] = []
     for tp in target_particles.iter_rows(named=True):
         eid = int(tp["event_id"])
         pt  = np.asarray(tp["pt"],  dtype=np.float64)
@@ -435,18 +521,41 @@ def _process_single_file(file_idx: int, event_ids: list[int],
             print(f"    j#{k}  pT={j['pt']:7.2f}  η={j['eta']:+.2f}  "
                   f"φ={j['phi']:+.2f}  m={j['m']:6.2f}  nconst={j['nconst']}")
 
+        # Top-2 leading-pT dijet mass — b-tag agnostic baseline.
+        # jets are pT-sorted (fastjet sorted_by_pt at cluster_jets_event).
+        # Always record leading/sub-leading pT and ΔR for distributions;
+        # only record the dijet mass when ΔR>0.4.
+        if len(jets) >= 2:
+            ja, jb = jets[0], jets[1]
+            dr_ab = _delta_r(ja["eta"], ja["phi"], jb["eta"], jb["phi"])
+            lead_pt.append(float(ja["pt"]))
+            sublead_pt.append(float(jb["pt"]))
+            delta_r_top2.append(float(dr_ab))
+            if dr_ab > 0.4:
+                m2_top2 = ((ja["E"] + jb["E"]) ** 2
+                           - (ja["px"] + jb["px"]) ** 2
+                           - (ja["py"] + jb["py"]) ** 2
+                           - (ja["pz"] + jb["pz"]) ** 2)
+                m_top2 = float(math.sqrt(max(m2_top2, 0.0)))
+                masses_top2.append(m_top2)
+                print(f"  → top-2 leading dijet mass  M(j1,j2)      = {m_top2:7.2f} GeV  "
+                      f"(ΔR={dr_ab:.3f})")
+
         nus = get_neutrinos_vp1(raw_by_eid[eid])
         matches = match_b_to_jets(bhads, jets, dr_cut=DR_MATCH)
         print(f"  ghost-association (ΔR<{DR_MATCH}), with in-cone ν sums:")
 
-        nu_sums: list[dict] = []   # in-cone ν sum per matched jet (or zero)
-        b_sums:  list[dict] = []   # in-cone leaf-B-hadron sum per matched jet
+        nu_sums:   list[dict] = []   # in-cone ν sum per matched jet (or zero)
+        b_sums:    list[dict] = []   # in-cone leaf-B-hadron sum per matched jet
+        bpbr_sums: list[dict] = []   # leaf-B + brothers (by parent_id) per jet
         for k, (b, ji) in enumerate(zip(bhads, matches), 1):
             zero4 = {"n": 0, "px": 0.0, "py": 0.0, "pz": 0.0, "E": 0.0, "pt": 0.0}
+            zero_bpbr = {**zero4, "n_b": 0, "n_bro": 0, "indices": set()}
             if ji is None:
                 print(f"    bH#{k} → NO MATCHED JET within ΔR<{DR_MATCH}")
                 nu_sums.append(dict(zero4))
                 b_sums.append(dict(zero4))
+                bpbr_sums.append(dict(zero_bpbr))
                 continue
             j = jets[ji]
             dr = _delta_r(b["eta"], b["phi"], j["eta"], j["phi"])
@@ -458,6 +567,9 @@ def _process_single_file(file_idx: int, event_ids: list[int],
             bsum = sum_leaf_b_hadrons_in_cone(raw_by_eid[eid],
                                               j["eta"], j["phi"], dR=JET_R)
             b_sums.append(bsum)
+            bpbr = b_plus_brothers_in_cone(raw_by_eid[eid],
+                                           j["eta"], j["phi"], dR=JET_R)
+            bpbr_sums.append(bpbr)
             E_b = bsum["E"]
             dE = j["E"] - E_b
             rel_E = dE / E_b if E_b > 0 else 0.0
@@ -466,6 +578,8 @@ def _process_single_file(file_idx: int, event_ids: list[int],
             print(f"        E_jet={j['E']:7.2f}  E_b_leaves={E_b:7.2f}  "
                   f"ΔE={dE:+6.2f} ({rel_E:+.0%})  "
                   f"(n_B_in_cone={bsum['n_in_cone']}, n_leaf={bsum['n_leaf']}, pdgs={bsum['pdgs']})")
+            print(f"        B+brothers: n_B={bpbr['n_b']}  n_bro={bpbr['n_bro']}  "
+                  f"E={bpbr['E']:7.2f}  pT={bpbr['pt']:7.2f}")
             print(f"        in-cone ν: n={nu['n']}  pT_ν={nu['pt']:6.2f}  "
                   f"E_ν={nu['E']:6.2f}  (ν/jet pT = {nu_frac:+.0%})")
 
@@ -502,32 +616,69 @@ def _process_single_file(file_idx: int, event_ids: list[int],
             else:
                 mjj_b = 0.0
             masses_bsum.append(mjj_b)
+            # (Leaf-B + brothers) dijet mass: sum 4-momentum over the UNION
+            # of the two jets' index sets, so any particle in both cones
+            # (or any sibling shared between leaf B's) is counted exactly
+            # once. Falls back to 0.0 if no B's were found in either cone.
+            bb1, bb2 = bpbr_sums[0], bpbr_sums[1]
+            union_idx = bb1["indices"] | bb2["indices"]
+            if union_idx:
+                raw = raw_by_eid[eid]
+                px_r = np.asarray(raw["px"], dtype=np.float64)
+                py_r = np.asarray(raw["py"], dtype=np.float64)
+                pz_r = np.asarray(raw["pz"], dtype=np.float64)
+                E_r  = np.asarray(raw["energy"], dtype=np.float64)
+                u = np.fromiter(union_idx, dtype=int)
+                E_u  = float(E_r[u].sum())
+                px_u = float(px_r[u].sum())
+                py_u = float(py_r[u].sum())
+                pz_u = float(pz_r[u].sum())
+                mjj_bpbr = float(math.sqrt(max(
+                    E_u * E_u - (px_u * px_u + py_u * py_u + pz_u * pz_u), 0.0
+                )))
+            else:
+                mjj_bpbr = 0.0
+            masses_bpbr.append(mjj_bpbr)
             print(f"  → visible dijet mass        M(bj,b̄j)     = {mjj_vis:7.2f} GeV")
             print(f"  → ν-corrected dijet mass    M(bj+ν,b̄j+ν) = {mjj_corr:7.2f} GeV  "
                   f"(in-cone ν pT: {nu1['pt']:.2f} + {nu2['pt']:.2f})")
             print(f"  → leaf-B-hadron dijet mass  M(ΣB,ΣB̄)     = {mjj_b:7.2f} GeV  "
                   f"(E_b: {b1['E']:.1f} + {b2['E']:.1f})")
+            print(f"  → B+brothers dijet mass     M(ΣB+bro,…)  = {mjj_bpbr:7.2f} GeV  "
+                  f"(n_particles_union={len(union_idx)})")
         else:
             print("  → could not form b-tagged dijet (one or both b-jets missing)")
 
-    return masses_vis, masses_corr, masses_bsum
+    return (masses_vis, masses_corr, masses_bsum, masses_bpbr, masses_top2,
+            lead_pt, sublead_pt, delta_r_top2)
 
 
 def print_running_summary(masses_vis: list[float],
                           masses_corr: list[float],
-                          masses_bsum: list[float]) -> None:
-    if not masses_vis:
+                          masses_bsum: list[float],
+                          masses_bpbr: list[float] | None = None,
+                          masses_top2: list[float] | None = None) -> None:
+    if not masses_vis and not masses_top2:
         print("(no events reconstructed yet)")
         return
     vis = np.array(masses_vis)
     cor = np.array(masses_corr)
     bsm = np.array(masses_bsum) if masses_bsum else np.array([])
-    print(f"\n=== running aggregate across {len(vis)} reconstructed events ===")
-    print(f"{'':<20}  {'jet visible':>12}  {'jet+ν':>10}  {'leaf-B':>10}")
-    print("-" * 60)
+    bpr = np.array(masses_bpbr) if masses_bpbr else np.array([])
+    top = np.array(masses_top2) if masses_top2 else np.array([])
+    print(f"\n=== running aggregate across {len(vis)} reconstructed events "
+          f"(top-2 jets: {len(top)} events) ===")
+    print(f"{'':<20}  {'jet visible':>12}  {'jet+ν':>10}  {'leaf-B':>10}  "
+          f"{'leaf-B+bro':>11}  {'top-2 jets':>11}")
+    print("-" * 86)
     def _row(label, get):
-        a = get(vis); b = get(cor); c = get(bsm) if bsm.size else float('nan')
-        print(f"  {label:<20}  {a:>12.2f}  {b:>10.2f}  {c:>10.2f}")
+        a = get(vis) if vis.size else float('nan')
+        b = get(cor) if cor.size else float('nan')
+        c = get(bsm) if bsm.size else float('nan')
+        d = get(bpr) if bpr.size else float('nan')
+        e = get(top) if top.size else float('nan')
+        print(f"  {label:<20}  {a:>12.2f}  {b:>10.2f}  {c:>10.2f}  "
+              f"{d:>11.2f}  {e:>11.2f}")
     _row("mean M(bb̄)",  lambda x: float(x.mean()))
     _row("median",      lambda x: float(np.median(x)))
     _row("std",         lambda x: float(x.std()))
@@ -538,11 +689,17 @@ def print_running_summary(masses_vis: list[float],
         return f"{int((np.abs(arr - HIGGS_MASS) < w).sum())}/{len(arr)} " \
                f"({(np.abs(arr - HIGGS_MASS) < w).mean():.0%})"
     print(f"  within ±5  of 125    {_hits(vis, 5):>12}  {_hits(cor, 5):>10}  "
-          f"{_hits(bsm, 5) if bsm.size else '—':>10}")
+          f"{_hits(bsm, 5) if bsm.size else '—':>10}  "
+          f"{_hits(bpr, 5) if bpr.size else '—':>11}  "
+          f"{_hits(top, 5) if top.size else '—':>11}")
     print(f"  within ±10 of 125    {_hits(vis, 10):>12}  {_hits(cor, 10):>10}  "
-          f"{_hits(bsm, 10) if bsm.size else '—':>10}")
+          f"{_hits(bsm, 10) if bsm.size else '—':>10}  "
+          f"{_hits(bpr, 10) if bpr.size else '—':>11}  "
+          f"{_hits(top, 10) if top.size else '—':>11}")
     print(f"  within ±20 of 125    {_hits(vis, 20):>12}  {_hits(cor, 20):>10}  "
-          f"{_hits(bsm, 20) if bsm.size else '—':>10}")
+          f"{_hits(bsm, 20) if bsm.size else '—':>10}  "
+          f"{_hits(bpr, 20) if bpr.size else '—':>11}  "
+          f"{_hits(top, 20) if top.size else '—':>11}")
 
 
 def get_chunk_file_to_events(label_dir: Path, n_bb_events: int,
@@ -572,18 +729,105 @@ def worker_main(label_dir: Path, n_bb_events: int, chunk_size: int,
     flat = sorted((fi, eid) for fi, eids in file_to_events.items() for eid in eids)
     print(f"[chunk {chunk_idx}] {len(flat)} events: {flat}")
 
-    masses_vis, masses_corr, masses_bsum = process_chunk(
+    (masses_vis, masses_corr, masses_bsum, masses_bpbr, masses_top2,
+     lead_pt, sublead_pt, delta_r_top2) = process_chunk(
         file_to_events,
         truth_pt_cut=truth_pt_cut, truth_eta_cut=truth_eta_cut,
         target_pt_cut=target_pt_cut, clusters_cutoff=clusters_cutoff,
     )
-    payload = {"vis": masses_vis, "corr": masses_corr, "bsum": masses_bsum}
+    payload = {"vis": masses_vis, "corr": masses_corr,
+               "bsum": masses_bsum, "bpbr": masses_bpbr,
+               "top2": masses_top2,
+               "lead_pt": lead_pt, "sublead_pt": sublead_pt,
+               "dr_top2": delta_r_top2}
     print(f"{RESULT_SENTINEL}{json.dumps(payload)}")
+
+
+def plot_histograms(masses_vis: list[float],
+                    masses_corr: list[float],
+                    masses_bsum: list[float],
+                    masses_bpbr: list[float],
+                    masses_top2: list[float],
+                    lead_pt: list[float],
+                    sublead_pt: list[float],
+                    delta_r_top2: list[float],
+                    out_dir: Path) -> None:
+    """Write PNGs of the four dijet-mass distributions plus leading/
+    sub-leading jet pT and ΔR(j1, j2). Overwrites on each call so the
+    plots track the running aggregate."""
+    import matplotlib
+    matplotlib.use("Agg")
+    import matplotlib.pyplot as plt
+
+    out_dir.mkdir(parents=True, exist_ok=True)
+
+    def _mass_hist(values: list[float], title: str, fname: str) -> None:
+        if not values:
+            return
+        arr = np.asarray(values)
+        fig, ax = plt.subplots(figsize=(7, 4.5))
+        ax.hist(arr, bins=np.linspace(0, 250, 51),
+                color="steelblue", edgecolor="black", linewidth=0.4)
+        ax.axvline(HIGGS_MASS, color="crimson", linestyle="--",
+                   linewidth=1.2, label=f"M_H = {HIGGS_MASS:.1f} GeV")
+        ax.set_xlabel("M(j,j) [GeV]")
+        ax.set_ylabel("events / 5 GeV")
+        ax.set_title(f"{title}  (N = {len(arr)}, "
+                     f"mean = {arr.mean():.1f}, median = {np.median(arr):.1f})")
+        ax.legend(loc="upper right")
+        fig.tight_layout()
+        fig.savefig(out_dir / fname, dpi=120)
+        plt.close(fig)
+
+    _mass_hist(masses_vis,  "jet visible — M(bj, b̄j)",        "mass_jet_visible.png")
+    _mass_hist(masses_corr, "jet + in-cone ν — M(bj+ν, b̄j+ν)", "mass_jet_plus_nu.png")
+    _mass_hist(masses_bsum, "leaf-B-hadron sum — M(ΣB, ΣB̄)",   "mass_leaf_b.png")
+    _mass_hist(masses_bpbr, "leaf-B + brothers — M(ΣB+bro, ΣB̄+bro)",
+               "mass_b_plus_brothers.png")
+    _mass_hist(masses_top2, "top-2 leading-pT jets — M(j1, j2)", "mass_top2_jets.png")
+
+    def _pt_hist(values: list[float], title: str, fname: str) -> None:
+        if not values:
+            return
+        arr = np.asarray(values)
+        upper = max(300.0, float(np.percentile(arr, 99)) * 1.05)
+        fig, ax = plt.subplots(figsize=(7, 4.5))
+        ax.hist(arr, bins=np.linspace(0, upper, 41),
+                color="darkorange", edgecolor="black", linewidth=0.4)
+        ax.set_xlabel("p_T [GeV]")
+        ax.set_ylabel("events")
+        ax.set_title(f"{title}  (N = {len(arr)}, "
+                     f"mean = {arr.mean():.1f}, median = {np.median(arr):.1f})")
+        fig.tight_layout()
+        fig.savefig(out_dir / fname, dpi=120)
+        plt.close(fig)
+
+    _pt_hist(lead_pt,    "leading jet pT",     "pt_leading_jet.png")
+    _pt_hist(sublead_pt, "sub-leading jet pT", "pt_subleading_jet.png")
+
+    if delta_r_top2:
+        arr = np.asarray(delta_r_top2)
+        fig, ax = plt.subplots(figsize=(7, 4.5))
+        ax.hist(arr, bins=np.linspace(0, 6.0, 41),
+                color="seagreen", edgecolor="black", linewidth=0.4)
+        ax.axvline(0.4, color="crimson", linestyle="--", linewidth=1.0,
+                   label="ΔR = 0.4 (jet R)")
+        ax.set_xlabel("ΔR(j1, j2)")
+        ax.set_ylabel("events")
+        ax.set_title(f"ΔR between top-2 leading jets  (N = {len(arr)}, "
+                     f"mean = {arr.mean():.2f}, median = {np.median(arr):.2f})")
+        ax.legend(loc="upper right")
+        fig.tight_layout()
+        fig.savefig(out_dir / "deltaR_top2_jets.png", dpi=120)
+        plt.close(fig)
+
+    print(f"  [plots] wrote PNGs to {out_dir}")
 
 
 def manager_loop(label_dir: Path, n_bb_events: int, chunk_size: int,
                  truth_pt_cut: float, truth_eta_cut: float,
-                 target_pt_cut: float, clusters_cutoff: float) -> None:
+                 target_pt_cut: float, clusters_cutoff: float,
+                 plots_dir: Path) -> None:
     """Spawn one subprocess per chunk, sequentially. After each chunk
     completes, parse its results from stdout and print the running aggregate.
     Memory from each chunk is fully returned to the OS at subprocess exit."""
@@ -599,6 +843,11 @@ def manager_loop(label_dir: Path, n_bb_events: int, chunk_size: int,
     cum_vis:  list[float] = []
     cum_corr: list[float] = []
     cum_bsum: list[float] = []
+    cum_bpbr: list[float] = []
+    cum_top2: list[float] = []
+    cum_lead_pt:    list[float] = []
+    cum_sublead_pt: list[float] = []
+    cum_dr_top2:    list[float] = []
     for ci in range(n_chunks):
         cmd = [
             sys.executable, "-u", script,
@@ -638,12 +887,22 @@ def manager_loop(label_dir: Path, n_bb_events: int, chunk_size: int,
         chunk_vis:  list[float] | None = None
         chunk_corr: list[float] | None = None
         chunk_bsum: list[float] | None = None
+        chunk_bpbr: list[float] | None = None
+        chunk_top2: list[float] | None = None
+        chunk_lead_pt:    list[float] | None = None
+        chunk_sublead_pt: list[float] | None = None
+        chunk_dr_top2:    list[float] | None = None
         if result_line is not None:
             try:
                 payload = json.loads(result_line[len(RESULT_SENTINEL):])
                 chunk_vis  = payload["vis"]
                 chunk_corr = payload["corr"]
                 chunk_bsum = payload.get("bsum", [])
+                chunk_bpbr = payload.get("bpbr", [])
+                chunk_top2 = payload.get("top2", [])
+                chunk_lead_pt    = payload.get("lead_pt", [])
+                chunk_sublead_pt = payload.get("sublead_pt", [])
+                chunk_dr_top2    = payload.get("dr_top2", [])
             except (json.JSONDecodeError, KeyError) as e:
                 print(f"  ! could not parse worker result: {e}")
         if chunk_vis is None:
@@ -654,23 +913,40 @@ def manager_loop(label_dir: Path, n_bb_events: int, chunk_size: int,
         cum_corr.extend(chunk_corr)
         if chunk_bsum:
             cum_bsum.extend(chunk_bsum)
+        if chunk_bpbr:
+            cum_bpbr.extend(chunk_bpbr)
+        if chunk_top2:
+            cum_top2.extend(chunk_top2)
+        if chunk_lead_pt:
+            cum_lead_pt.extend(chunk_lead_pt)
+        if chunk_sublead_pt:
+            cum_sublead_pt.extend(chunk_sublead_pt)
+        if chunk_dr_top2:
+            cum_dr_top2.extend(chunk_dr_top2)
         print(f"  ✓ chunk {ci+1}/{n_chunks} done in {dt:.1f}s "
               f"({len(chunk_vis)} dijet masses recovered)")
-        print_running_summary(cum_vis, cum_corr, cum_bsum)
+        print_running_summary(cum_vis, cum_corr, cum_bsum, cum_bpbr, cum_top2)
+        plot_histograms(cum_vis, cum_corr, cum_bsum, cum_bpbr, cum_top2,
+                        cum_lead_pt, cum_sublead_pt, cum_dr_top2,
+                        out_dir=plots_dir)
 
 
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--label-dir", type=str, default=str(DEFAULT_LABEL_DIR),
                         help=f"Where the bb̄ labels live (default: {DEFAULT_LABEL_DIR})")
-    parser.add_argument("--n-bb-events", type=int, default=50,
+    parser.add_argument("--n-bb-events", type=int, default=300,
                         help="Total bb̄ events to analyse (default: 300)")
-    parser.add_argument("--chunk-size", type=int, default=70,
-                        help="Events per subprocess chunk (default: 50)")
+    parser.add_argument("--chunk-size", type=int, default=75,
+                        help="Events per subprocess chunk (default: 75)")
     parser.add_argument("--truth-pt-cut", type=float, default=1.0)
     parser.add_argument("--truth-eta-cut", type=float, default=3.0)
     parser.add_argument("--target-pt-cut", type=float, default=0.3)
     parser.add_argument("--clusters-cutoff", type=float, default=0.15)
+    parser.add_argument("--plots-dir", type=str,
+                        default=str(Path(__file__).resolve().parent
+                                    / "plots_inspect_hbb"),
+                        help="Where to write histogram PNGs")
     parser.add_argument("--worker", action="store_true",
                         help="(internal) worker mode: process --chunk-idx and exit")
     parser.add_argument("--chunk-idx", type=int, default=None,
@@ -695,6 +971,7 @@ def main():
         chunk_size=args.chunk_size,
         truth_pt_cut=args.truth_pt_cut, truth_eta_cut=args.truth_eta_cut,
         target_pt_cut=args.target_pt_cut, clusters_cutoff=args.clusters_cutoff,
+        plots_dir=Path(args.plots_dir),
     )
 
 
