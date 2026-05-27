@@ -379,7 +379,7 @@ def worker_main(file_idx: int, n_events: int | None,
 
 def main():
     parser = argparse.ArgumentParser()
-    parser.add_argument("--files", type=int, nargs="+", default=list(range(20)),
+    parser.add_argument("--files", type=int, nargs="+", default=list(range(1000)),
                         help="HF file indices to classify (default: 0..59)")
     parser.add_argument("--n-events", type=int, default=None,
                         help="Cap events per file (default: all)")

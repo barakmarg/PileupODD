@@ -18,13 +18,20 @@ Pipeline (truth-level, no detector, no external PU contamination):
 """
 
 import argparse
+import json
 import math
+import subprocess
 import sys
+import time
 from collections import defaultdict
 from pathlib import Path
 
 import numpy as np
 import polars as pl
+
+# Sentinel the worker prints on its last line so the manager can pick up
+# the per-chunk mass arrays from the subprocess stdout.
+RESULT_SENTINEL = "RESULT::"
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 sys.path.insert(0, "/storage/agrp/barakma/PileupODD")
@@ -44,7 +51,10 @@ MIN_CONSTITUENTS = 2
 MIN_JET_PT = 10.0
 JET_ETA_CUT = 4.0  # Kept exactly as original
 DR_MATCH = 0.4
-B_HAD_MIN_PT = 5.0  
+B_HAD_MIN_PT = 5.0
+B_HAD_ETA_CUT = 3.5            # drop forward B-hadrons (beam remnants / ISR fakes)
+B_HAD_PAIR_DR_MIN = 0.4        # require the chosen pair be ΔR-separated
+HIGGS_MASS = 125.0             # target for the closest-mass pair selection
 
 
 def cluster_jets_event(pt, eta, phi,
@@ -138,7 +148,15 @@ def get_all_b_hadrons(raw_row: dict, cluster_dR: float = 0.4) -> list[dict]:
     eta = np.arcsinh(pz / np.maximum(pt, 1e-30))
     phi = np.arctan2(py, px)
 
-    b_mask = np.isin(np.abs(pdg), list(B_HADRON_PDGS)) & (vp == 1) & (pt > B_HAD_MIN_PT)
+    # vp=1, pT>min, AND central (|η|<B_HAD_ETA_CUT) — forward B-hadrons at
+    # |η|>3.5 are essentially never Higgs daughters; they are beam-remnant
+    # / ISR fakes that carry the entire ~TeV proton momentum forward.
+    b_mask = (
+        np.isin(np.abs(pdg), list(B_HADRON_PDGS))
+        & (vp == 1)
+        & (pt > B_HAD_MIN_PT)
+        & (np.abs(eta) < B_HAD_ETA_CUT)
+    )
     idx = np.where(b_mask)[0]
     if len(idx) == 0:
         return []
@@ -162,6 +180,68 @@ def get_all_b_hadrons(raw_row: dict, cluster_dR: float = 0.4) -> list[dict]:
          "E": float(E[k])}
         for k in leads
     ]
+
+
+def sum_leaf_b_hadrons_in_cone(raw_row: dict, eta0: float, phi0: float,
+                               dR: float = JET_R) -> dict:
+    """Pick all vp=1 B-hadrons within ΔR<dR of (eta0, phi0), then drop any
+    that are the parent (via parent_id) of another in-cone B-hadron. The
+    survivors are the LEAF B-hadrons of the b-quark fragmentation cascade
+    inside this jet — summing them never double-counts (a B* whose decay
+    product is the B in the same set has its 4-momentum already redirected
+    to the daughter B by 4-momentum conservation)."""
+    pdg = np.asarray(raw_row["pdg_id"], dtype=np.int64)
+    vp  = np.asarray(raw_row["vertex_primary"], dtype=np.int64)
+    particle_id = np.asarray(raw_row["particle_id"], dtype=np.int64)
+    parent_id   = np.asarray(raw_row["parent_id"],   dtype=np.int64)
+    px  = np.asarray(raw_row["px"], dtype=np.float64)
+    py  = np.asarray(raw_row["py"], dtype=np.float64)
+    pz  = np.asarray(raw_row["pz"], dtype=np.float64)
+    E   = np.asarray(raw_row["energy"], dtype=np.float64)
+    pt = np.hypot(px, py)
+    eta_all = np.arcsinh(pz / np.maximum(pt, 1e-30))
+    phi_all = np.arctan2(py, px)
+
+    b_mask = (vp == 1) & np.isin(np.abs(pdg), list(B_HADRON_PDGS))
+    if not b_mask.any():
+        return {"n_in_cone": 0, "n_leaf": 0, "px": 0.0, "py": 0.0, "pz": 0.0,
+                "E": 0.0, "pt": 0.0, "pdgs": []}
+
+    dphi = phi_all - phi0
+    dphi = np.where(dphi >  math.pi, dphi - 2 * math.pi, dphi)
+    dphi = np.where(dphi < -math.pi, dphi + 2 * math.pi, dphi)
+    in_cone = (eta_all - eta0) ** 2 + dphi ** 2 < dR ** 2
+    sel = b_mask & in_cone
+    n_in_cone = int(sel.sum())
+    if n_in_cone == 0:
+        return {"n_in_cone": 0, "n_leaf": 0, "px": 0.0, "py": 0.0, "pz": 0.0,
+                "E": 0.0, "pt": 0.0, "pdgs": []}
+
+    # Drop any selected B-hadron whose particle_id appears as the parent_id
+    # of ANOTHER selected B-hadron — that's the parent-of-cascade case.
+    sel_idx = np.where(sel)[0]
+    sel_pids = set(int(particle_id[i]) for i in sel_idx)
+    parents_of_other = {
+        int(parent_id[j]) for j in sel_idx
+    }
+    keep_idx = np.array(
+        [i for i in sel_idx if int(particle_id[i]) not in parents_of_other],
+        dtype=int,
+    )
+    if len(keep_idx) == 0:
+        # Pathological: all are parents of each other; fall back to highest pT
+        keep_idx = np.array([int(sel_idx[np.argmax(pt[sel_idx])])])
+
+    pxs = float(px[keep_idx].sum()); pys = float(py[keep_idx].sum())
+    return {
+        "n_in_cone": n_in_cone,
+        "n_leaf":    int(len(keep_idx)),
+        "px": pxs, "py": pys,
+        "pz": float(pz[keep_idx].sum()),
+        "E":  float(E[keep_idx].sum()),
+        "pt": float(math.hypot(pxs, pys)),
+        "pdgs": [int(pdg[i]) for i in keep_idx],
+    }
 
 
 def get_neutrinos_vp1(raw_row: dict) -> dict:
@@ -223,39 +303,78 @@ def match_b_to_jets(bhads: list[dict], jets: list[dict],
     return matched
 
 
-def main():
-    parser = argparse.ArgumentParser()
-    parser.add_argument("--label-dir", type=str, default=str(DEFAULT_LABEL_DIR),
-                        help=f"Where the bb̄ labels live (default: {DEFAULT_LABEL_DIR})")
-    parser.add_argument("--n-bb-events", type=int, default=50,
-                        help="How many bb̄ events to analyse (default: 5)")
-    
-    # CUTS KEPT EXACTLY AS ORIGINAL
-    parser.add_argument("--truth-pt-cut", type=float, default=1.0)
-    parser.add_argument("--truth-eta-cut", type=float, default=3.0)
-    parser.add_argument("--target-pt-cut", type=float, default=0.3)
-    parser.add_argument("--clusters-cutoff", type=float, default=0.15)
-    args = parser.parse_args()
+def _diagnose_list_column_lengths(df: pl.DataFrame, label: str) -> None:
+    """If any event has list-columns of inconsistent lengths, print the
+    offending (event_id, column, length) details. preprocess_for_model
+    explodes multiple list columns together and will raise ShapeError
+    if any single event has mismatched lengths, so we surface the cause
+    explicitly here instead of letting it crash without context."""
+    list_cols = [c for c, dtype in df.schema.items()
+                 if isinstance(dtype, pl.List)]
+    if not list_cols:
+        return
+    any_bad = False
+    for row in df.iter_rows(named=True):
+        lens = {c: len(row[c]) for c in list_cols}
+        if len(set(lens.values())) > 1:
+            if not any_bad:
+                print(f"\n!!! list-column length MISMATCH in {label} !!!")
+                any_bad = True
+            print(f"  event_id={row['event_id']}:")
+            for c, n in sorted(lens.items()):
+                print(f"    {c:<25}  len={n}")
 
-    file_to_events = load_bb_event_ids(Path(args.label_dir), args.n_bb_events)
-    flat = sorted((fi, eid) for fi, eids in file_to_events.items() for eid in eids)
-    print(f"selected {len(flat)} H→bb̄ events from {args.label_dir}:")
 
-    print(f"\ndownloading particles + tracks + calo_hits for "
-          f"{len(flat)} events across {len(file_to_events)} HF files …")
-    particles_bb = load_events(file_to_events, kind="particles",
+def process_chunk(file_to_events: dict[int, list[int]],
+                  truth_pt_cut: float, truth_eta_cut: float,
+                  target_pt_cut: float, clusters_cutoff: float
+                  ) -> tuple[list[float], list[float], list[float]]:
+    """One subprocess's worth of work: process all events in the chunk,
+    one HF file at a time. Particle_ids are local to each HF file, so
+    concatenating events across files would break the joins inside
+    preprocess_for_model — we keep each file's events isolated."""
+    masses_vis: list[float] = []
+    masses_corr: list[float] = []
+    masses_bsum: list[float] = []
+    for fi in sorted(file_to_events):
+        eids = file_to_events[fi]
+        v, c, b = _process_single_file(
+            fi, eids,
+            truth_pt_cut, truth_eta_cut, target_pt_cut, clusters_cutoff,
+        )
+        masses_vis.extend(v)
+        masses_corr.extend(c)
+        masses_bsum.extend(b)
+    return masses_vis, masses_corr, masses_bsum
+
+
+def _process_single_file(file_idx: int, event_ids: list[int],
+                         truth_pt_cut: float, truth_eta_cut: float,
+                         target_pt_cut: float, clusters_cutoff: float
+                         ) -> tuple[list[float], list[float]]:
+    """Download + preprocess + analyse the events of a single HF file. No
+    cross-file particle_id collisions can occur here."""
+    single = {file_idx: event_ids}
+    print(f"\n--- HF file {file_idx}: {len(event_ids)} events ---")
+    particles_bb = load_events(single, kind="particles",
                                columns=DEFAULT_COLUMNS["particles"])
-    tracks_bb    = load_events(file_to_events, kind="tracks",
+    tracks_bb    = load_events(single, kind="tracks",
                                columns=DEFAULT_COLUMNS["tracks"])
-    calo_hits_bb = load_events(file_to_events, kind="calo_hits",
+    calo_hits_bb = load_events(single, kind="calo_hits",
                                columns=DEFAULT_COLUMNS["calo_hits"])
 
-    print("\nrunning preprocess_for_model …")
+    # Diagnostic: surface any per-event list-column length mismatch before
+    # preprocess_for_model raises its less-informative ShapeError.
+    _diagnose_list_column_lengths(particles_bb, f"particles_bb[file={file_idx}]")
+    _diagnose_list_column_lengths(tracks_bb,    f"tracks_bb[file={file_idx}]")
+    _diagnose_list_column_lengths(calo_hits_bb, f"calo_hits_bb[file={file_idx}]")
+
+    print(f"running preprocess_for_model on file {file_idx} …")
     out = preprocess_for_model(
         particles=particles_bb, tracks=tracks_bb, calo_hits=calo_hits_bb,
         num_of_events=-1,
-        truth_pt_cut=args.truth_pt_cut, truth_eta_cut=args.truth_eta_cut,
-        target_pt_cut=args.target_pt_cut, clusters_cutoff=args.clusters_cutoff,
+        truth_pt_cut=truth_pt_cut, truth_eta_cut=truth_eta_cut,
+        target_pt_cut=target_pt_cut, clusters_cutoff=clusters_cutoff,
     )
     target_particles = out["target_particles"]
     raw_by_eid = {int(r["event_id"]): r
@@ -263,30 +382,39 @@ def main():
 
     masses_vis: list[float] = []
     masses_corr: list[float] = []
+    masses_bsum: list[float] = []
     for tp in target_particles.iter_rows(named=True):
         eid = int(tp["event_id"])
         pt  = np.asarray(tp["pt"],  dtype=np.float64)
         eta = np.asarray(tp["eta"], dtype=np.float64)
         phi = np.asarray(tp["phi"], dtype=np.float64)
 
-        # 1. Get all distinct B-Hadron directions
+        # 1. Get all distinct, central B-hadron directions (|η|<3.5, ΔR-clustered)
         bhads_all = get_all_b_hadrons(raw_by_eid[eid])
-        
-        # 2. Select the pair of B-hadrons that most likely came from the Higgs 
-        # (Mass closest to 125 GeV).
+
+        # 2. Pick the pair that best matches the Higgs, applying ALL conditions:
+        #    - both candidates already pass |η|<3.5 (enforced in get_all_b_hadrons)
+        #    - both already at distinct cluster centers (ΔR>0.4 via clustering)
+        #    - additionally require explicit ΔR>B_HAD_PAIR_DR_MIN between them
+        #    - among surviving pairs, choose the one whose M is closest to 125 GeV.
         bhads = []
         best_mass = 0.0
         if len(bhads_all) >= 2:
             best_diff = float('inf')
             for i in range(len(bhads_all)):
                 for j in range(i + 1, len(bhads_all)):
-                    m = _mass_two_dict(bhads_all[i], bhads_all[j])
-                    if abs(m - 125.0) < best_diff:
-                        best_diff = abs(m - 125.0)
-                        bhads = [bhads_all[i], bhads_all[j]]
+                    a, b = bhads_all[i], bhads_all[j]
+                    dr_ab = _delta_r(a["eta"], a["phi"], b["eta"], b["phi"])
+                    if dr_ab < B_HAD_PAIR_DR_MIN:
+                        continue
+                    m = _mass_two_dict(a, b)
+                    if abs(m - HIGGS_MASS) < best_diff:
+                        best_diff = abs(m - HIGGS_MASS)
+                        bhads = [a, b]
                         best_mass = m
-        else:
-            bhads = bhads_all
+        # if exactly 1 candidate survived (and we still want to report it)
+        if not bhads and bhads_all:
+            bhads = bhads_all[:1]
 
         print(f"\n=== event {eid} ===")
         print(f"  {len(pt)} target particles  (target pT range {pt.min():.2f}-{pt.max():.2f})")
@@ -312,11 +440,13 @@ def main():
         print(f"  ghost-association (ΔR<{DR_MATCH}), with in-cone ν sums:")
 
         nu_sums: list[dict] = []   # in-cone ν sum per matched jet (or zero)
+        b_sums:  list[dict] = []   # in-cone leaf-B-hadron sum per matched jet
         for k, (b, ji) in enumerate(zip(bhads, matches), 1):
+            zero4 = {"n": 0, "px": 0.0, "py": 0.0, "pz": 0.0, "E": 0.0, "pt": 0.0}
             if ji is None:
                 print(f"    bH#{k} → NO MATCHED JET within ΔR<{DR_MATCH}")
-                nu_sums.append({"n": 0, "px": 0.0, "py": 0.0, "pz": 0.0,
-                                "E": 0.0, "pt": 0.0})
+                nu_sums.append(dict(zero4))
+                b_sums.append(dict(zero4))
                 continue
             j = jets[ji]
             dr = _delta_r(b["eta"], b["phi"], j["eta"], j["phi"])
@@ -325,9 +455,18 @@ def main():
             nu = sum_neutrinos_in_cone(nus, j["eta"], j["phi"], dR=JET_R)
             nu_sums.append(nu)
             nu_frac = nu["pt"] / j["pt"] if j["pt"] > 0 else 0.0
+            bsum = sum_leaf_b_hadrons_in_cone(raw_by_eid[eid],
+                                              j["eta"], j["phi"], dR=JET_R)
+            b_sums.append(bsum)
+            E_b = bsum["E"]
+            dE = j["E"] - E_b
+            rel_E = dE / E_b if E_b > 0 else 0.0
             print(f"    bH#{k} → j#{ji+1}  pT_jet={j['pt']:7.2f}  "
-                  f"ΔR={dr:.3f}  ΔpT={d_pt:+6.2f} ({rel:+.0%})  "
-                  f"in-cone ν: n={nu['n']}  pT_ν={nu['pt']:6.2f}  "
+                  f"ΔR={dr:.3f}  ΔpT={d_pt:+6.2f} ({rel:+.0%})")
+            print(f"        E_jet={j['E']:7.2f}  E_b_leaves={E_b:7.2f}  "
+                  f"ΔE={dE:+6.2f} ({rel_E:+.0%})  "
+                  f"(n_B_in_cone={bsum['n_in_cone']}, n_leaf={bsum['n_leaf']}, pdgs={bsum['pdgs']})")
+            print(f"        in-cone ν: n={nu['n']}  pT_ν={nu['pt']:6.2f}  "
                   f"E_ν={nu['E']:6.2f}  (ν/jet pT = {nu_frac:+.0%})")
 
         if (len(matches) == 2 and all(m is not None for m in matches)
@@ -348,33 +487,216 @@ def main():
             pz_c = j1["pz"] + j2["pz"] + nu1["pz"] + nu2["pz"]
             mjj_corr = float(math.sqrt(max(E_c * E_c - (px_c * px_c + py_c * py_c + pz_c * pz_c), 0.0)))
             masses_corr.append(mjj_corr)
+            # Leaf-B-hadron-only dijet mass: invariant mass of the two
+            # leaf-B-hadron sums in the matched jet cones (truth-level
+            # B-pair, jet-clustering bypassed).
+            b1, b2 = b_sums[0], b_sums[1]
+            if b1["E"] > 0 and b2["E"] > 0:
+                E_b  = b1["E"]  + b2["E"]
+                px_b = b1["px"] + b2["px"]
+                py_b = b1["py"] + b2["py"]
+                pz_b = b1["pz"] + b2["pz"]
+                mjj_b = float(math.sqrt(max(
+                    E_b * E_b - (px_b * px_b + py_b * py_b + pz_b * pz_b), 0.0
+                )))
+            else:
+                mjj_b = 0.0
+            masses_bsum.append(mjj_b)
             print(f"  → visible dijet mass        M(bj,b̄j)     = {mjj_vis:7.2f} GeV")
             print(f"  → ν-corrected dijet mass    M(bj+ν,b̄j+ν) = {mjj_corr:7.2f} GeV  "
                   f"(in-cone ν pT: {nu1['pt']:.2f} + {nu2['pt']:.2f})")
+            print(f"  → leaf-B-hadron dijet mass  M(ΣB,ΣB̄)     = {mjj_b:7.2f} GeV  "
+                  f"(E_b: {b1['E']:.1f} + {b2['E']:.1f})")
         else:
             print("  → could not form b-tagged dijet (one or both b-jets missing)")
 
-    if masses_vis:
-        vis = np.array(masses_vis)
-        cor = np.array(masses_corr)
-        print(f"\n=== summary across {len(vis)} reconstructed events ===")
-        print(f"{'':<20}  {'visible':>10}  {'ν-corrected':>12}")
-        print("-" * 48)
-        print(f"  {'mean M(bb̄)':<20}  {vis.mean():>10.2f}  {cor.mean():>12.2f}")
-        print(f"  {'median':<20}  {float(np.median(vis)):>10.2f}  "
-              f"{float(np.median(cor)):>12.2f}")
-        print(f"  {'std':<20}  {vis.std():>10.2f}  {cor.std():>12.2f}")
-        print(f"  {'min':<20}  {vis.min():>10.2f}  {cor.min():>12.2f}")
-        print(f"  {'max':<20}  {vis.max():>10.2f}  {cor.max():>12.2f}")
-        within_5  = (np.abs(cor - 125) < 5).sum()
-        within_10 = (np.abs(cor - 125) < 10).sum()
-        within_20 = (np.abs(cor - 125) < 20).sum()
-        print(f"\n  ν-corrected within ±5  GeV of 125: "
-              f"{within_5}/{len(cor)} ({within_5/len(cor):.0%})")
-        print(f"  ν-corrected within ±10 GeV of 125: "
-              f"{within_10}/{len(cor)} ({within_10/len(cor):.0%})")
-        print(f"  ν-corrected within ±20 GeV of 125: "
-              f"{within_20}/{len(cor)} ({within_20/len(cor):.0%})")
+    return masses_vis, masses_corr, masses_bsum
+
+
+def print_running_summary(masses_vis: list[float],
+                          masses_corr: list[float],
+                          masses_bsum: list[float]) -> None:
+    if not masses_vis:
+        print("(no events reconstructed yet)")
+        return
+    vis = np.array(masses_vis)
+    cor = np.array(masses_corr)
+    bsm = np.array(masses_bsum) if masses_bsum else np.array([])
+    print(f"\n=== running aggregate across {len(vis)} reconstructed events ===")
+    print(f"{'':<20}  {'jet visible':>12}  {'jet+ν':>10}  {'leaf-B':>10}")
+    print("-" * 60)
+    def _row(label, get):
+        a = get(vis); b = get(cor); c = get(bsm) if bsm.size else float('nan')
+        print(f"  {label:<20}  {a:>12.2f}  {b:>10.2f}  {c:>10.2f}")
+    _row("mean M(bb̄)",  lambda x: float(x.mean()))
+    _row("median",      lambda x: float(np.median(x)))
+    _row("std",         lambda x: float(x.std()))
+    _row("min",         lambda x: float(x.min()))
+    _row("max",         lambda x: float(x.max()))
+
+    def _hits(arr, w):
+        return f"{int((np.abs(arr - HIGGS_MASS) < w).sum())}/{len(arr)} " \
+               f"({(np.abs(arr - HIGGS_MASS) < w).mean():.0%})"
+    print(f"  within ±5  of 125    {_hits(vis, 5):>12}  {_hits(cor, 5):>10}  "
+          f"{_hits(bsm, 5) if bsm.size else '—':>10}")
+    print(f"  within ±10 of 125    {_hits(vis, 10):>12}  {_hits(cor, 10):>10}  "
+          f"{_hits(bsm, 10) if bsm.size else '—':>10}")
+    print(f"  within ±20 of 125    {_hits(vis, 20):>12}  {_hits(cor, 20):>10}  "
+          f"{_hits(bsm, 20) if bsm.size else '—':>10}")
+
+
+def get_chunk_file_to_events(label_dir: Path, n_bb_events: int,
+                             chunk_size: int, chunk_idx: int
+                             ) -> dict[int, list[int]]:
+    """Deterministically slice the first n_bb_events bb̄ events into chunks
+    of chunk_size and return the file_to_events dict for chunk_idx."""
+    full = load_bb_event_ids(label_dir, n_bb_events)
+    flat = sorted((fi, eid) for fi, eids in full.items() for eid in eids)
+    start = chunk_idx * chunk_size
+    chunk_pairs = flat[start : start + chunk_size]
+    out: dict[int, list[int]] = defaultdict(list)
+    for fi, eid in chunk_pairs:
+        out[fi].append(eid)
+    return dict(out)
+
+
+def worker_main(label_dir: Path, n_bb_events: int, chunk_size: int,
+                chunk_idx: int, truth_pt_cut: float, truth_eta_cut: float,
+                target_pt_cut: float, clusters_cutoff: float) -> None:
+    """Subprocess entry: process exactly one chunk and print results as a
+    sentinel-tagged JSON line on stdout. Polars / FastJet allocations all
+    die when this process exits."""
+    file_to_events = get_chunk_file_to_events(
+        label_dir, n_bb_events, chunk_size, chunk_idx
+    )
+    flat = sorted((fi, eid) for fi, eids in file_to_events.items() for eid in eids)
+    print(f"[chunk {chunk_idx}] {len(flat)} events: {flat}")
+
+    masses_vis, masses_corr, masses_bsum = process_chunk(
+        file_to_events,
+        truth_pt_cut=truth_pt_cut, truth_eta_cut=truth_eta_cut,
+        target_pt_cut=target_pt_cut, clusters_cutoff=clusters_cutoff,
+    )
+    payload = {"vis": masses_vis, "corr": masses_corr, "bsum": masses_bsum}
+    print(f"{RESULT_SENTINEL}{json.dumps(payload)}")
+
+
+def manager_loop(label_dir: Path, n_bb_events: int, chunk_size: int,
+                 truth_pt_cut: float, truth_eta_cut: float,
+                 target_pt_cut: float, clusters_cutoff: float) -> None:
+    """Spawn one subprocess per chunk, sequentially. After each chunk
+    completes, parse its results from stdout and print the running aggregate.
+    Memory from each chunk is fully returned to the OS at subprocess exit."""
+    full = load_bb_event_ids(label_dir, n_bb_events)
+    flat = sorted((fi, eid) for fi, eids in full.items() for eid in eids)
+    n_total = len(flat)
+    n_chunks = (n_total + chunk_size - 1) // chunk_size
+    print(f"selected {n_total} H→bb̄ events from {label_dir}")
+    print(f"splitting into {n_chunks} chunks of {chunk_size} "
+          f"(each chunk runs in its own subprocess)")
+
+    script = str(Path(__file__).resolve())
+    cum_vis:  list[float] = []
+    cum_corr: list[float] = []
+    cum_bsum: list[float] = []
+    for ci in range(n_chunks):
+        cmd = [
+            sys.executable, "-u", script,
+            "--worker", "--chunk-idx", str(ci),
+            "--chunk-size", str(chunk_size),
+            "--n-bb-events", str(n_bb_events),
+            "--label-dir", str(label_dir),
+            "--truth-pt-cut", str(truth_pt_cut),
+            "--truth-eta-cut", str(truth_eta_cut),
+            "--target-pt-cut", str(target_pt_cut),
+            "--clusters-cutoff", str(clusters_cutoff),
+        ]
+        print(f"\n[chunk {ci+1}/{n_chunks}] spawning subprocess …")
+        t0 = time.perf_counter()
+        # Popen + line-by-line streaming so worker stdout appears LIVE in
+        # the manager's terminal instead of arriving as a single bulk
+        # block after the subprocess exits.
+        proc = subprocess.Popen(
+            cmd,
+            stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+            text=True, bufsize=1,
+        )
+        result_line: str | None = None
+        assert proc.stdout is not None
+        for line in proc.stdout:
+            sys.stdout.write(line)
+            sys.stdout.flush()
+            if line.startswith(RESULT_SENTINEL):
+                result_line = line
+        rc = proc.wait()
+        dt = time.perf_counter() - t0
+
+        if rc != 0:
+            print(f"  ! chunk {ci} subprocess exited {rc} ({dt:.1f}s)")
+            continue
+
+        chunk_vis:  list[float] | None = None
+        chunk_corr: list[float] | None = None
+        chunk_bsum: list[float] | None = None
+        if result_line is not None:
+            try:
+                payload = json.loads(result_line[len(RESULT_SENTINEL):])
+                chunk_vis  = payload["vis"]
+                chunk_corr = payload["corr"]
+                chunk_bsum = payload.get("bsum", [])
+            except (json.JSONDecodeError, KeyError) as e:
+                print(f"  ! could not parse worker result: {e}")
+        if chunk_vis is None:
+            print(f"  ! chunk {ci} produced no RESULT line — skipping")
+            continue
+
+        cum_vis.extend(chunk_vis)
+        cum_corr.extend(chunk_corr)
+        if chunk_bsum:
+            cum_bsum.extend(chunk_bsum)
+        print(f"  ✓ chunk {ci+1}/{n_chunks} done in {dt:.1f}s "
+              f"({len(chunk_vis)} dijet masses recovered)")
+        print_running_summary(cum_vis, cum_corr, cum_bsum)
+
+
+def main():
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--label-dir", type=str, default=str(DEFAULT_LABEL_DIR),
+                        help=f"Where the bb̄ labels live (default: {DEFAULT_LABEL_DIR})")
+    parser.add_argument("--n-bb-events", type=int, default=50,
+                        help="Total bb̄ events to analyse (default: 300)")
+    parser.add_argument("--chunk-size", type=int, default=70,
+                        help="Events per subprocess chunk (default: 50)")
+    parser.add_argument("--truth-pt-cut", type=float, default=1.0)
+    parser.add_argument("--truth-eta-cut", type=float, default=3.0)
+    parser.add_argument("--target-pt-cut", type=float, default=0.3)
+    parser.add_argument("--clusters-cutoff", type=float, default=0.15)
+    parser.add_argument("--worker", action="store_true",
+                        help="(internal) worker mode: process --chunk-idx and exit")
+    parser.add_argument("--chunk-idx", type=int, default=None,
+                        help="(worker mode) chunk index to process")
+    args = parser.parse_args()
+
+    if args.worker:
+        assert args.chunk_idx is not None, "--worker requires --chunk-idx"
+        worker_main(
+            label_dir=Path(args.label_dir),
+            n_bb_events=args.n_bb_events,
+            chunk_size=args.chunk_size,
+            chunk_idx=args.chunk_idx,
+            truth_pt_cut=args.truth_pt_cut, truth_eta_cut=args.truth_eta_cut,
+            target_pt_cut=args.target_pt_cut, clusters_cutoff=args.clusters_cutoff,
+        )
+        return
+
+    manager_loop(
+        label_dir=Path(args.label_dir),
+        n_bb_events=args.n_bb_events,
+        chunk_size=args.chunk_size,
+        truth_pt_cut=args.truth_pt_cut, truth_eta_cut=args.truth_eta_cut,
+        target_pt_cut=args.target_pt_cut, clusters_cutoff=args.clusters_cutoff,
+    )
+
 
 if __name__ == "__main__":
     main()

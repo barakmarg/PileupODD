@@ -5,31 +5,11 @@ import yaml # type: ignore
 import gc
 
 from sklearn.model_selection import train_test_split
-from primary.preprocessing import (
-    add_eta_and_phi_and_pt,
-    add_orphan_mask,
-    add_created_inside_calo_mask,
-    add_particle_have_track_mask,
-    set_target_particles_maskv4,
-    get_particles_id_parent_of_inside_calo_particles_maskv3,
-    backtrack_to_target,
-    cluster_purity,
-    cluster_contrib_energy,
-    cluster_vertex_primary_deps,
-    calculate_extrapolated_features_polars,
-)
+from primary.preprocessing import add_eta_and_phi_and_pt, add_eta_and_phi_and_pt, \
+     add_orphan_mask, add_created_inside_calo_mask, add_particle_have_track_mask, set_target_particles_maskv4, get_particles_id_parent_of_inside_calo_particles_maskv3, \
+    add_eta_and_phi_and_pt, backtrack_to_target, cluster_purity, cluster_contrib_energy, cluster_vertex_primary_deps, calculate_extrapolated_features_polars
 from primary.calibration import CALIBRATION
 from primary.clue_clustering import clue_clustering
-
-
-# --- Time-of-Flight cut for PU hits (Dan's fix for the +8% PU energy excess) ---
-# In real PU200, pileup interactions are spread in time (sigma = 185 ps), so
-# "late" pileup hits fall outside the detector's read-out window and are
-# trimmed during simulation. We model this only on the PU side (HS hits are
-# at t=0 in sim and were already cut).
-TOF_TIME_SIGMA_NS = 0.185          # per-PU-vertex Gaussian shift sigma
-TOF_C_MM_NS = 299.792458           # speed of light in mm/ns
-TOF_WINDOW_NS = (-1.0, 10.0)       # [t_min, t_max] for the corrected hit time
 
 
 
@@ -91,6 +71,7 @@ def generate_normalization_yaml(data: Dict[str, pl.DataFrame]) -> str:
         "z0":         {"df": "tracks",        "col": "z0",          "transform": None,   "type": "min_max_sym"},
         "tanlambda":  {"df": "tracks",        "col": "track_tanlambda", "transform": None, "type": "min_max_sym"},
         "omega":      {"df": "tracks",        "col": "track_omega", "transform": None,   "type": "std"},
+        "cluster_time": {"df": "calo_clusters", "col": "cluster_time", "transform": None, "type": "std"},
         "number_of_hits":  {"df": "calo_clusters", "col": "number_of_hits",  "transform": "sqrt", "type": "min_max_sym"},
         "energy_hits_std": {"df": "calo_clusters", "col": "energy_hits_std", "transform": "sqrt", "type": "std"},
         "max_hit_energy":  {"df": "calo_clusters", "col": "max_hit_energy",  "transform": "sqrt", "type": "min_max_sym"},
@@ -199,6 +180,7 @@ def generate_normalization_stats_sequential(data_dir: str, max_files: int = 40, 
         "z0":         {"df": "tracks",        "col": "z0",          "transform": None,   "type": "min_max_sym"},
         "tanlambda":  {"df": "tracks",        "col": "track_tanlambda", "transform": None, "type": "min_max_sym"},
         "omega":      {"df": "tracks",        "col": "track_omega", "transform": None,   "type": "std"},
+        "cluster_time": {"df": "calo_clusters", "col": "cluster_time", "transform": None, "type": "std"},
         "number_of_hits":  {"df": "calo_clusters", "col": "number_of_hits",  "transform": None, "type": "min_max_sym"},
         "energy_hits_std": {"df": "calo_clusters", "col": "energy_hits_std", "transform": "sqrt", "type": "std"},
         "max_hit_energy":  {"df": "calo_clusters", "col": "max_hit_energy",  "transform": "sqrt", "type": "min_max_sym"},
@@ -682,6 +664,107 @@ def create_calo_clusters(calo_hits: pl.DataFrame) -> pl.DataFrame:
         ])
     )
 
+    # --- BRANCH C: CLUSTER TIME ---
+    # Sub-chain 1: Cell-level E_total_cell from precomputed total_energy (single explode)
+    cell_energy_df = (
+        calo_hits.lazy()
+        .select(['event_id', 'cluster_id', 'detector', 'total_energy'])
+        .explode(['cluster_id', 'detector', 'total_energy'])
+        .filter(pl.col('cluster_id') >= 0)
+        .join(calib_optimized.select(['detector', 'calib_factor']), on='detector', how='left')
+        .with_columns(
+            (pl.col('total_energy') * pl.col('calib_factor')).alias('E_total_cell')
+        )
+        .with_row_index('_cell_idx')
+        .select(['event_id', 'cluster_id', '_cell_idx', 'E_total_cell'])
+    )
+
+    # Sub-chain 2: Contribution-level energy-weighted time (double explode)
+    weighted_time_df = (
+        calo_hits.lazy()
+        .select(['event_id', 'cluster_id', 'detector', 'contrib_times', 'contrib_energies'])
+        .explode(['cluster_id', 'detector', 'contrib_times', 'contrib_energies'])
+        .filter(pl.col('cluster_id') >= 0)
+        .join(calib_optimized.select(['detector', 'calib_factor']), on='detector', how='left')
+        .with_row_index('_cell_idx')
+        # Second explode: cell → contribution level
+        .explode(['contrib_times', 'contrib_energies'])
+        .with_columns(
+            (pl.col('contrib_energies') * pl.col('calib_factor')).alias('E_cal')
+        )
+        # Per-cell aggregation: energy-weighted time
+        .group_by(['event_id', 'cluster_id', '_cell_idx'])
+        .agg([
+            (pl.col('contrib_times') * pl.col('E_cal')).sum().alias('tE_sum'),
+            pl.col('E_cal').sum().alias('sum_E_cal'),
+        ])
+        .with_columns(
+            (pl.col('tE_sum') / pl.col('sum_E_cal'))
+            .fill_nan(0.0).fill_null(0.0)
+            .alias('t_true_cell')
+        )
+        .select(['event_id', 'cluster_id', '_cell_idx', 't_true_cell'])
+    )
+
+    # Merge sub-chains at cell level
+    time_df = (
+        cell_energy_df
+        .join(weighted_time_df, on=['event_id', 'cluster_id', '_cell_idx'], how='left')
+        .with_columns(pl.col('t_true_cell').fill_null(0.0))
+        .drop('_cell_idx')
+        .collect(streaming=True)
+    )
+
+    # ATLAS TileCal resolution + Gaussian smear (NumPy vectorized)
+    n_cells = len(time_df)
+    cell_E = time_df['E_total_cell'].to_numpy()
+    cell_E_safe = np.maximum(cell_E, 1e-9)
+
+    sigma_t = np.sqrt(
+        (1.45 / np.sqrt(cell_E_safe))**2 +
+        (0.38 / cell_E_safe)**2 +
+        0.07**2
+    ).astype(np.float32)
+
+    rng = np.random.default_rng(seed=42)
+    z_cells = rng.standard_normal(n_cells).astype(np.float32)
+    cell_noise = z_cells * sigma_t
+
+    # Per-event shift: N(0,1) * 0.17 ns, drawn once per event
+    unique_events = time_df['event_id'].unique()
+    z_events = rng.standard_normal(len(unique_events)).astype(np.float32)
+    event_shifts = pl.DataFrame({
+        'event_id': unique_events,
+        'event_shift': z_events * np.float32(0.17),
+    })
+
+    time_df = (
+        time_df
+        .with_columns(pl.Series('cell_noise', cell_noise))
+        .join(event_shifts, on='event_id', how='left')
+        .with_columns(
+            (pl.col('t_true_cell') + pl.col('cell_noise') + pl.col('event_shift'))
+            .alias('t_NN_input')
+        )
+        .drop(['cell_noise', 'event_shift', 't_true_cell'])
+    )
+
+    # Cluster-level energy-weighted aggregation
+    time_df = (
+        time_df.lazy()
+        .group_by(['event_id', 'cluster_id'])
+        .agg([
+            (pl.col('t_NN_input') * pl.col('E_total_cell')).sum().alias('tE_cluster_sum'),
+            pl.col('E_total_cell').sum().alias('cluster_E_total'),
+        ])
+        .with_columns(
+            (pl.col('tE_cluster_sum') / pl.col('cluster_E_total'))
+            .fill_nan(0.0).fill_null(0.0)
+            .alias('cluster_time')
+        )
+        .select(['event_id', 'cluster_id', 'cluster_time'])
+    )
+
     # --- FINAL MERGE ---
     calo_clusters = (
         physics_df
@@ -690,11 +773,17 @@ def create_calo_clusters(calo_hits: pl.DataFrame) -> pl.DataFrame:
             on=['event_id', 'cluster_id'],
             how='left'
         )
-        .with_columns(
+        .join(
+            time_df,
+            on=['event_id', 'cluster_id'],
+            how='left'
+        )
+        .with_columns([
             (pl.col('hcal_energy') / pl.col('total_cluster_energy'))
             .fill_nan(0.0)
             .alias('hcal_fraction'),
-        )
+            pl.col('cluster_time'),
+        ])
         .sort(['event_id', 'cluster_id'])
         .group_by('event_id', maintain_order=True)
         .agg(pl.all())
@@ -704,131 +793,47 @@ def create_calo_clusters(calo_hits: pl.DataFrame) -> pl.DataFrame:
     return calo_clusters
 
 
-def _preprocess_source(
-    particles: pl.DataFrame,
-    tracks: pl.DataFrame,
-    calo_hits: pl.DataFrame,
-    kind: str,
-    num_of_events: int = -1,
-    truth_eta_cut: float = 3.0,
-    truth_pt_cut: float = 1.0,
-    target_pt_cut: float = 0.3,
-    tof_enabled: bool = True,
-) -> Dict[str, pl.DataFrame]:
+def preprocess_for_model(particles: pl.DataFrame, tracks: pl.DataFrame, calo_hits: pl.DataFrame,
+
+                         num_of_events: int=-1,  truth_eta_cut: float=3.0, truth_pt_cut: float=1.0, target_pt_cut: float=0.3, clusters_cutoff: float=0.1) -> Dict[str,pl.DataFrame]:
     """
-    Per-source preprocessing (HS or PU), run independently before overlay.
-
-    Shared (both):
-      Float32 cast, extrapolated track features, track explode + pt/eta filter
-      + vertex_primary join + group-back, particles eta/phi/pt, and
-      track->particle info join for vx/vy/vz/particle_pt.
-
-    HS-only:
-      pre-filter particles_pid_to_vertex snapshot, hard-scatter filter, particle
-      masks (orphan/calo/has_track), parent-of-inside-calo mask, target mask.
-
-    PU particles are consumed only to add pt and to feed the track-particle
-    info join, then dropped.
+    Aggregates the number of cells per cluster.
     """
     import psutil
     import os
+    
     process = psutil.Process(os.getpid())
-    tag = kind.upper()
-    print(f"\n[{tag} PREPROCESS START] RAM: {process.memory_info().rss / 1024 / 1024:.2f} MB")
+    
+    print("\n[PREPROCESS START]")
+    print(f"RAM: {process.memory_info().rss / 1024 / 1024:.2f} MB")
+    
+    if num_of_events >= 0:
+        print(f"[FILTERING] Filtering to {num_of_events} events...")
+        particles = particles.filter(pl.col("event_id") <num_of_events)
+        tracks = tracks.filter(pl.col("event_id") <num_of_events)
+        calo_hits = calo_hits.filter(pl.col("event_id") <num_of_events)
+        print(f"[FILTERING DONE] RAM: {process.memory_info().rss / 1024 / 1024:.2f} MB")
 
-    # num_of_events is an HS-only debug limiter: shrinking the pileup pool too
-    # would starve the Poisson sampler. Pileup keeps its full event pool.
-    # Filter by the first N unique event_ids (files have global ids, not 0-based).
-    if num_of_events >= 0 and kind == 'hs':
-        first_n_ids = particles['event_id'].unique().sort()[:num_of_events]
-        particles = particles.filter(pl.col('event_id').is_in(first_n_ids))
-        tracks = tracks.filter(pl.col('event_id').is_in(first_n_ids))
-        calo_hits = calo_hits.filter(pl.col('event_id').is_in(first_n_ids))
-
-    # Float32 cast
+    # Cast to Float32
+    print("[CASTING] Converting Float64 to Float32...")
     particles = particles.with_columns([
         pl.col(pl.Float64).cast(pl.Float32),
-        pl.col(pl.List(pl.Float64)).cast(pl.List(pl.Float32)),
+        pl.col(pl.List(pl.Float64)).cast(pl.List(pl.Float32))
     ])
     tracks = tracks.with_columns([
         pl.col(pl.Float64).cast(pl.Float32),
-        pl.col(pl.List(pl.Float64)).cast(pl.List(pl.Float32)),
+        pl.col(pl.List(pl.Float64)).cast(pl.List(pl.Float32))
     ])
     calo_hits = calo_hits.with_columns([
         pl.col(pl.Float64).cast(pl.Float32),
-        pl.col(pl.List(pl.Float64)).cast(pl.List(pl.Float32)),
+        pl.col(pl.List(pl.Float64)).cast(pl.List(pl.Float32))
     ])
-
-    # PU only: precompute per-hit `t_hit` (energy-weighted mean of contrib_times)
-    # once. Used by _overlay_calo_hits for the ToF window cut. We then drop
-    # `contrib_times` because nothing downstream consumes it.
-    #
-    # CHUNKED: the level-2 contrib explode of the full PU pool peaks at ~1B rows
-    # (~30 GB) which the OS doesn't return after the regroup. We process the
-    # pool in micro-batches and concat the small per-event t_hit Series so peak
-    # RAM during this step is bounded by the batch (a few GB).
-    if kind != 'hs' and tof_enabled and 'contrib_times' in calo_hits.columns:
-        n_pu = calo_hits.height
-        t_hit_batch = 1000  # PU events per double-explode batch
-        print(f"[{tag} T_HIT PRECOMPUTE] energy-weighted hit time "
-              f"({n_pu} events in batches of {t_hit_batch})...")
-        t_hit_parts = []
-        for start in range(0, n_pu, t_hit_batch):
-            sub = calo_hits.slice(start, t_hit_batch)
-            part = (
-                sub.lazy()
-                .select(['total_energy', 'contrib_energies', 'contrib_times'])
-                .with_row_index('_ev')
-                .with_columns(
-                    _hit_pos=pl.int_ranges(
-                        0, pl.col('total_energy').list.len(), dtype=pl.UInt32
-                    )
-                )
-                .drop('total_energy')
-                # Level-1: per-hit row.
-                .explode(['contrib_energies', 'contrib_times', '_hit_pos'])
-                .with_row_index('_hit')
-                # Level-2: per-contributor row.
-                .explode(['contrib_energies', 'contrib_times'])
-                .group_by('_hit', maintain_order=True)
-                .agg([
-                    pl.col('_ev').first(),
-                    pl.col('_hit_pos').first(),
-                    (
-                        (pl.col('contrib_times') * pl.col('contrib_energies')).sum()
-                        / pl.col('contrib_energies').sum().clip(lower_bound=1e-30)
-                    ).cast(pl.Float32).alias('t_hit'),
-                ])
-                # Restore within-event hit order before re-aggregating.
-                .sort(['_ev', '_hit_pos'])
-                .group_by('_ev', maintain_order=True)
-                .agg(pl.col('t_hit'))
-                .collect(streaming=True)
-            )
-            t_hit_parts.append(part.select('t_hit'))
-            del sub, part
-            gc.collect()
-        # Concat preserves the original PU event order (chunks are consecutive slices).
-        t_hit_col = pl.concat(t_hit_parts)
-        del t_hit_parts
-        gc.collect()
-        # Stitch the t_hit column back onto calo_hits by position (same row order
-        # as the slices we processed). hstack avoids a join + row-index round-trip.
-        calo_hits = calo_hits.drop('contrib_times').hstack(t_hit_col)
-        del t_hit_col
-        gc.collect()
-        # Force the allocator to return the contrib-explode arena to the OS.
-        try:
-            import ctypes
-            ctypes.CDLL("libc.so.6").malloc_trim(0)
-        except (OSError, AttributeError):
-            pass
-        print(f"[{tag} T_HIT DONE] RAM: {process.memory_info().rss / 1024 / 1024:.2f} MB")
-
+    print("[EXTRAPOLATED FEATURES] Calculating extrapolated track features...")
     tracks = calculate_extrapolated_features_polars(tracks)
-    print(f"[{tag} EXTRAPOLATED] RAM: {process.memory_info().rss / 1024 / 1024:.2f} MB")
 
-    # Track filter + vertex_primary join + group-back
+    print(f"[EXTRAPOLATED FEATURES DONE] RAM: {process.memory_info().rss / 1024 / 1024:.2f} MB")
+
+    print("[PROCESSING TRACKS] Filtering and processing tracks...")
     track_cols = [c for c in tracks.columns if c != 'event_id']
     tracks = (
         tracks.lazy()
@@ -836,7 +841,7 @@ def _preprocess_source(
             local_order=pl.int_ranges(
                 start=0,
                 end=pl.col('majority_particle_id').list.len(),
-                dtype=pl.UInt32,
+                dtype=pl.UInt32
             )
         )
         .select(['event_id', 'local_order'] + track_cols)
@@ -847,7 +852,7 @@ def _preprocess_source(
             particles.lazy().select(['event_id', 'particle_id', 'vertex_primary']).explode('particle_id', 'vertex_primary'),
             left_on=['event_id', 'majority_particle_id'],
             right_on=['event_id', 'particle_id'],
-            how='left',
+            how='left'
         )
         .with_columns(pl.col('majority_particle_id').cast(pl.Int64))
         .sort(['event_id', 'local_order'])
@@ -856,49 +861,61 @@ def _preprocess_source(
         .sort('event_id')
         .collect(streaming=True)
     )
-    print(f"[{tag} TRACKS FILTERED] RAM: {process.memory_info().rss / 1024 / 1024:.2f} MB")
 
-    particles_pid_to_vertex = None
-    particles_hard_scatter_ids = None
-
-    if kind == 'hs':
-        particles_pid_to_vertex = (
-            particles.lazy()
-            .select(['event_id', 'particle_id', 'vertex_primary'])
-            .explode('particle_id', 'vertex_primary')
-            .with_columns(
-                pl.col('particle_id').cast(pl.Int64),
-                pl.col('vertex_primary').cast(pl.UInt16),
-            )
-            .collect(streaming=True)
+    # Capture pid -> vertex_primary for ALL particles (incl. pileup) BEFORE
+    # the hard-scatter filter below. Used later by cluster_vertex_primary_deps.
+    particles_pid_to_vertex = (
+        particles.lazy()
+        .select(['event_id', 'particle_id', 'vertex_primary'])
+        .explode('particle_id', 'vertex_primary')
+        .with_columns(
+            pl.col('particle_id').cast(pl.Int64),
+            pl.col('vertex_primary').cast(pl.UInt16),
         )
+        .collect(streaming=True)
+    )
 
-        particles = (
-            particles.lazy()
-            .with_columns(
-                _indices=pl.col('vertex_primary').list.eval(
+    particles = (particles.lazy().with_columns(
+                # 1. Find the INDICES strictly inside list.eval()
+                # (pl.element() == 1) creates a boolean mask
+                # .arg_true() converts that mask to indices
+                _indices = pl.col("vertex_primary").list.eval(
                     (pl.element() == 1).arg_true()
                 )
-            )
-            .with_columns(
-                pl.exclude('event_id', '_indices').list.gather(pl.col('_indices'))
-            )
-            .drop('_indices')
-            .sort('event_id')
-        ).collect()
+            ).with_columns(
+                # 2. Use those indices to pick elements from all other list columns
+                pl.exclude("event_id", "_indices")
+                .list.gather(pl.col("_indices"))
+            ).drop("_indices").sort("event_id")
+)
+    particles_hard_scatter_ids=(particles.lazy()
+    .select('event_id', 'particle_id')
+    ).collect()
 
-        particles_hard_scatter_ids = (
-            particles.lazy().select('event_id', 'particle_id')
-        ).collect()
+    # ----------------------------------------------
 
-        particles = add_orphan_mask(particles)
-        particles = add_created_inside_calo_mask(particles)
-        particles = add_particle_have_track_mask(particles, tracks)
+    print(f"[CASTING DONE] RAM: {process.memory_info().rss / 1024 / 1024:.2f} MB")
 
+    print("[ORPHAN MASK] Adding orphan mask...")
+    particles = add_orphan_mask(particles)
+    print(f"[ORPHAN MASK DONE] RAM: {process.memory_info().rss / 1024 / 1024:.2f} MB")
+    
+    print("[CALO MASK] Adding created inside calo mask...")
+    particles = add_created_inside_calo_mask(particles)
+    print(f"[CALO MASK DONE] RAM: {process.memory_info().rss / 1024 / 1024:.2f} MB")
+    
+    print("[TRACK MASK] Adding particle have track mask...")
+    particles = add_particle_have_track_mask(particles, tracks)
+    print(f"[TRACK MASK DONE] RAM: {process.memory_info().rss / 1024 / 1024:.2f} MB")
+    
+
+    # ---------------------
+    print("[ETA PHI PT] Adding eta, phi, pt...")
     particles = add_eta_and_phi_and_pt(particles)
-    print(f"[{tag} ETA PHI PT] RAM: {process.memory_info().rss / 1024 / 1024:.2f} MB")
+    print(f"[ETA PHI PT DONE] RAM: {process.memory_info().rss / 1024 / 1024:.2f} MB")
 
-    # Track <- particle info (vx, vy, vz, particle_pt)
+    # Join particle vertex info + pt onto tracks (particles now has pt)
+    print("[TRACK PARTICLE INFO] Joining particle vertex info to tracks...")
     particle_info_lf = (
         particles.lazy()
         .select(['event_id', 'particle_id', 'vx', 'vy', 'vz', 'pt'])
@@ -916,7 +933,7 @@ def _preprocess_source(
             particle_info_lf,
             left_on=['event_id', 'majority_particle_id'],
             right_on=['event_id', 'particle_id'],
-            how='left',
+            how='left'
         )
         .sort(['event_id', '_local_order'])
         .group_by('event_id', maintain_order=True)
@@ -930,362 +947,78 @@ def _preprocess_source(
     )
     tracks = tracks.join(track_particle_cols, on='event_id', how='left')
     del track_particle_cols, particle_info_lf
-    print(f"[{tag} TRACK<-PARTICLE INFO] RAM: {process.memory_info().rss / 1024 / 1024:.2f} MB")
+    print(f"[TRACK PARTICLE INFO DONE] RAM: {process.memory_info().rss / 1024 / 1024:.2f} MB")
 
-    out: Dict[str, pl.DataFrame] = {
-        'tracks': tracks,
-        'calo_hits': calo_hits,
-    }
-    if kind == 'hs':
-        particles = get_particles_id_parent_of_inside_calo_particles_maskv3(particles, calo_hits)
-        particles = set_target_particles_maskv4(
-            particles,
-            truth_eta_cut=truth_eta_cut,
-            truth_pt_cut=truth_pt_cut,
-            target_pt_cut=target_pt_cut,
-            tracks=tracks,
-        )
-        out['particles'] = particles
-        out['particles_pid_to_vertex'] = particles_pid_to_vertex
-        out['particles_hard_scatter_ids'] = particles_hard_scatter_ids
-        print(f"[{tag} MASKS DONE] RAM: {process.memory_info().rss / 1024 / 1024:.2f} MB")
-    else:
-        # Pileup particles are not part of the dataset; release them.
-        # Keep a tiny event_ids snapshot first: particles is the canonical
-        # source of "which PU vertices exist" — used by the sampler so that
-        # vertices with no calo hits (invisible vertices) still get sampled
-        # at their Poisson rate and contribute zero cells.
-        out['particle_event_ids'] = (
-            particles.lazy().select('event_id').unique(maintain_order=True).collect()
-        )
-        del particles
-        gc.collect()
-    return out
+    print("[PARENT MASK] Getting particles id parent of inside calo particles...")
+    particles = get_particles_id_parent_of_inside_calo_particles_maskv3(particles, calo_hits)
+    print(f"[PARENT MASK DONE] RAM: {process.memory_info().rss / 1024 / 1024:.2f} MB")
+    
+    print("[TARGET PARTICLES MASK] Setting target particles mask...")
+    particles = set_target_particles_maskv4(particles, truth_eta_cut=truth_eta_cut, truth_pt_cut=truth_pt_cut, target_pt_cut=target_pt_cut, tracks=tracks)
+    print(f"[TARGET PARTICLES MASK DONE] RAM: {process.memory_info().rss / 1024 / 1024:.2f} MB")
 
 
-def _build_sample_map(hs_event_ids: np.ndarray, pu_event_ids: np.ndarray,
-                       pileup_level: int, seed: int,
-                       invisible_pu_prob: float = 0.0) -> pl.DataFrame:
-    """
-    Per HS event: N ~ Poisson(pileup_level), then choose N distinct pileup
-    event_ids (no repeat within an HS event). Replacement allowed across HS
-    events. Returns a DataFrame with columns hs_event_id (u32) and
-    pu_event_id (list[u32]).
-
-    If invisible_pu_prob > 0, each of the N draws is independently "invisible"
-    (contributes nothing — simulates diffractive events missing the detector)
-    with that probability. Equivalent to drawing K ~ Binomial(N, 1-p) and
-    sampling K events from the pool — done that way for efficiency (no wasted
-    sampling on rolls that would be discarded).
-    """
-    if not 0.0 <= invisible_pu_prob < 1.0:
-        raise ValueError(f"invisible_pu_prob must be in [0, 1), got {invisible_pu_prob}")
-    rng = np.random.default_rng(seed=seed)
-    pool = pu_event_ids
-    pool_size = len(pool)
-    ns = rng.poisson(pileup_level, size=len(hs_event_ids))
-    if invisible_pu_prob > 0.0:
-        ns = rng.binomial(ns, 1.0 - invisible_pu_prob)
-    ns = np.minimum(ns, pool_size).astype(np.int64)
-    pu_per_hs = [rng.choice(pool, size=int(n), replace=False).astype(pool.dtype) for n in ns]
-    return pl.DataFrame({
-        'hs_event_id': hs_event_ids,
-        'pu_event_id': pu_per_hs,
-    })
-
-
-def _overlay_calo_hits(
-    hs_calo_hits: pl.DataFrame,
-    pu_calo_hits: pl.DataFrame,
-    sample_map_flat: pl.DataFrame,
-    tof_enabled: bool = True,
-) -> pl.DataFrame:
-    """
-    Merge HS + sampled pileup calo hits cell-by-cell on (event_id, detector,
-    x, y, z) via full outer join. Pileup contribs are NOT carried: we only
-    add pileup energy. HS contrib lists pass through untouched; pileup-only
-    cells get empty contrib lists. Returns list-per-event frame suitable
-    for clue_clustering.
-
-    When `tof_enabled=True`, per-PU-vertex Gaussian time shifts in
-    `sample_map_flat['time_shift']` and per-hit `pu_calo_hits['t_hit']` are
-    used to apply the read-out time-window cut to pileup hits before summing.
-    """
-    # Pileup hits: select-explode-round, join sample_map (replicates per HS event), sum per cell.
-    pu_select_cols = ['event_id', 'detector', 'total_energy', 'x', 'y', 'z']
-    if tof_enabled:
-        pu_select_cols.append('t_hit')
-    pu_cells = (
-        pu_calo_hits.lazy()
-        .select(pu_select_cols)
-        .explode([c for c in pu_select_cols if c != 'event_id'])
-        # Drop the phantom null row that polars produces when an empty calo_hits
-        # list is exploded. The PU event itself is still in the sampler pool
-        # (enumerated from unique event_id of pu_calo_hits) so empty-calo
-        # vertices still get sampled and just contribute zero cells, which
-        # correctly imitates an "invisible" pileup vertex.
-        .filter(pl.col('detector').is_not_null())
-        .with_columns([
-            pl.col('x').round(3),
-            pl.col('y').round(3),
-            pl.col('z').round(3),
-        ])
-    )
-    pu_cell_energy = sample_map_flat.lazy().join(pu_cells, left_on='pu_event_id', right_on='event_id')
-    if tof_enabled:
-        # ToF cut: shift the energy-weighted hit time by the per-PU-vertex
-        # bunch-crossing offset, subtract the speed-of-light flight time, and
-        # drop hits outside the read-out window [-1, 10] ns.
-        t_min, t_max = TOF_WINDOW_NS
-        pu_cell_energy = (
-            pu_cell_energy
-            .with_columns(
-                t_corr=(
-                    pl.col('t_hit') + pl.col('time_shift')
-                    - (pl.col('x').pow(2) + pl.col('y').pow(2) + pl.col('z').pow(2)).sqrt()
-                      / TOF_C_MM_NS
-                )
-            )
-            .filter((pl.col('t_corr') >= t_min) & (pl.col('t_corr') <= t_max))
-        )
-    pu_cell_energy = (
-        pu_cell_energy
-        .group_by([pl.col('hs_event_id').alias('event_id'), 'detector', 'x', 'y', 'z'])
-        .agg(pl.col('total_energy').sum().alias('pu_energy'))
-    )
-
-    # HS hits: select-explode-round.
-    hs_flat = (
-        hs_calo_hits.lazy()
-        .select(['event_id', 'detector', 'total_energy', 'x', 'y', 'z',
-                 'contrib_particle_ids', 'contrib_energies'])
-        .explode(['detector', 'total_energy', 'x', 'y', 'z',
-                  'contrib_particle_ids', 'contrib_energies'])
-        .with_columns([
-            pl.col('x').round(3),
-            pl.col('y').round(3),
-            pl.col('z').round(3),
-        ])
-    )
-
-    merged_flat = (
-        hs_flat
-        .join(pu_cell_energy,
-              on=['event_id', 'detector', 'x', 'y', 'z'],
-              how='full', coalesce=True)
-        .with_columns([
-            (pl.col('total_energy').fill_null(0.0) + pl.col('pu_energy').fill_null(0.0))
-                .alias('total_energy'),
-            pl.col('contrib_particle_ids').fill_null(pl.lit([], dtype=pl.List(pl.UInt64))),
-            pl.col('contrib_energies').fill_null(pl.lit([], dtype=pl.List(pl.Float32))),
-        ])
-        .drop('pu_energy')
-    )
-
-    merged_calo_hits = (
-        merged_flat
-        .group_by('event_id', maintain_order=True)
-        .agg(pl.all())
-        .sort('event_id')
-        .collect(streaming=True)
-    )
-    return merged_calo_hits
-
-
-def _overlay_tracks(
-    hs_tracks: pl.DataFrame,
-    pu_tracks: pl.DataFrame,
-    sample_map_flat: pl.DataFrame,
-) -> pl.DataFrame:
-    """
-    Concatenate HS tracks and sampled pileup tracks per HS event, with a new
-    `source_pileup_event_id` list column (null on HS rows, original pileup
-    event_id on pileup rows). HS tracks come first in each per-event list,
-    then pileup tracks.
-    """
-    hs_track_cols = [c for c in hs_tracks.columns if c != 'event_id']
-    hs_flat = (
-        hs_tracks.lazy()
-        .explode(hs_track_cols)
-        .with_columns(pl.lit(None, dtype=pl.UInt32).alias('source_pileup_event_id'))
-    )
-
-    pu_track_cols = [c for c in pu_tracks.columns if c != 'event_id']
-    pu_flat = (
-        pu_tracks.lazy()
-        .explode(pu_track_cols)
-        .rename({'event_id': 'pu_event_id'})
-    )
-    pu_overlaid = (
-        sample_map_flat.lazy()
-        .join(pu_flat, on='pu_event_id', how='inner')
-        .rename({'hs_event_id': 'event_id',
-                 'pu_event_id': 'source_pileup_event_id'})
-    )
-
-    final_cols = ['event_id'] + hs_track_cols + ['source_pileup_event_id']
-    tracks = (
-        pl.concat(
-            [hs_flat.select(final_cols), pu_overlaid.select(final_cols)],
-            how='vertical_relaxed',
-        )
-        .group_by('event_id', maintain_order=True)
-        .agg(pl.all())
-        .sort('event_id')
-        .collect(streaming=True)
-    )
-    return tracks
-
-
-def _run_overlay_and_aggregate(
-    hs: Dict[str, pl.DataFrame],
-    pu: Dict[str, pl.DataFrame],
-    pileup_level: int,
-    seed: int,
-    clusters_cutoff: float,
-    clue_backend: str,
-    process,
-    invisible_pu_prob: float = 0.0,
-    tof_enabled: bool = True,
-) -> Dict[str, pl.DataFrame]:
-    """
-    Overlay HS+PU calo hits, cluster, and run the full target/cluster
-    aggregation. Consumes (and progressively `del`s) entries inside `hs`;
-    leaves `pu` untouched (caller owns it — useful for chunked reuse).
-    """
-    # 1. Poisson sample map.
-    hs_event_ids = hs['calo_hits']['event_id'].to_numpy()
-    # Enumerate the PU pool from PARTICLES (canonical "vertex exists" set), so
-    # vertices with no calo hits / no tracks still get sampled at their
-    # Poisson rate — they correctly contribute zero cells / zero tracks
-    # (imitates the real PU200 distribution where some vertices are invisible).
-    # Fallback to calo_hits.event_id for callers that don't set particle_event_ids.
-    if 'particle_event_ids' in pu:
-        pu_event_ids = pu['particle_event_ids']['event_id'].to_numpy()
-    else:
-        pu_event_ids = pu['calo_hits']['event_id'].unique(maintain_order=True).to_numpy()
-    sample_map = _build_sample_map(hs_event_ids, pu_event_ids, pileup_level, seed,
-                                   invisible_pu_prob=invisible_pu_prob)
-    sample_map_flat = sample_map.explode('pu_event_id')
-    del sample_map
-
-    if tof_enabled:
-        # One Gaussian time shift per sampled PU vertex (per HS-PU pair).
-        # Modelled as N(0, 0.185 ns) — the bunch-crossing spread Dan called out.
-        rng = np.random.default_rng(seed)
-        time_shifts = rng.normal(loc=0.0, scale=TOF_TIME_SIGMA_NS,
-                                 size=len(sample_map_flat)).astype(np.float32)
-        sample_map_flat = sample_map_flat.with_columns(
-            pl.Series('time_shift', time_shifts, dtype=pl.Float32)
-        )
-
-    print(f"[SAMPLE MAP] {len(sample_map_flat)} HS-PU pairs across {len(hs_event_ids)} HS events. "
-          f"RAM: {process.memory_info().rss / 1024 / 1024:.2f} MB")
-
-    # 2. Overlay calo hits.
-    print(f"[OVERLAY CALO HITS] Merging HS and pileup hits per cell (tof_enabled={tof_enabled})...")
-    merged_calo_hits = _overlay_calo_hits(hs['calo_hits'], pu['calo_hits'], sample_map_flat,
-                                          tof_enabled=tof_enabled)
-    del hs['calo_hits']
+    print(f"[PROCESSING TRACKS DONE] RAM: {process.memory_info().rss / 1024 / 1024:.2f} MB")
+    
+    print("[CLUE CLUSTERING] Running CLUE clustering...")
+    #calo_hits = clue_clustering(calo_hits, dc=75.88106168184893, rhoc=104.34315216716726, dm=87.0967630118376, ppbin=16)
+    calo_hits = clue_clustering(calo_hits, dc=75.88106168184893, rhoc=104.34315216716726, dm=87.0967630118376, ppbin=16)
     gc.collect()
-    print(f"[OVERLAY CALO HITS DONE] RAM: {process.memory_info().rss / 1024 / 1024:.2f} MB")
-
-    # 3. Overlay tracks.
-    print("[OVERLAY TRACKS] Merging HS and pileup tracks...")
-    tracks = _overlay_tracks(hs['tracks'], pu['tracks'], sample_map_flat)
-    del hs['tracks'], sample_map_flat
-    gc.collect()
-    print(f"[OVERLAY TRACKS DONE] RAM: {process.memory_info().rss / 1024 / 1024:.2f} MB")
-
-    # 4. CLUE clustering.
-    print("[CLUE CLUSTERING] Running CLUE clustering on overlaid hits...")
-    calo_hits = clue_clustering(merged_calo_hits, dc=75.88106168184893,
-                                rhoc=104.34315216716726, dm=87.0967630118376, ppbin=16,
-                                backend=clue_backend)
-    del merged_calo_hits
-    gc.collect()
-    print(f"[CLUE CLUSTERING DONE] RAM: {process.memory_info().rss / 1024 / 1024:.2f} MB")
-    # 5. Cluster energy cutoff filter.
-    # Compute kept hit positions on a NARROW side-frame (3 hit cols + position),
-    # then apply with `list.gather` to ALL wide list columns in one pass — no
-    # wide explode of contrib_particle_ids / contrib_energies and no regroup.
-    import time as _time
-    _t0 = _time.time()
-    keep_idx = (
-        calo_hits.lazy()
-        .select(['cluster_id', 'total_energy', 'detector'])
-        .with_row_index('_rid')
-        .with_columns(
-            _pos=pl.int_ranges(0, pl.col('cluster_id').list.len(), dtype=pl.UInt32)
-        )
-        .explode(['cluster_id', 'total_energy', 'detector', '_pos'])
-        .join(CALIBRATION.lazy().select(['detector', 'calib_factor']),
-              on='detector', how='left')
-        .with_columns(_cal_e=pl.col('total_energy') * pl.col('calib_factor'))
-        .with_columns(_clu_sum=pl.col('_cal_e').sum().over(['_rid', 'cluster_id']))
-        .filter((pl.col('_clu_sum') > clusters_cutoff) & (pl.col('cluster_id') >= 0))
-        .group_by('_rid', maintain_order=True)
-        .agg(_indices=pl.col('_pos').sort())
-        .select(['_rid', '_indices'])
-    )
-
+    # apply cutoff on calo hits, grouby by event_id and cluster_id to aggregate cell ids, if sum < 0.1 Gev drop the cells
     calo_hits = (
         calo_hits.lazy()
-        .with_row_index('_rid')
-        .join(keep_idx, on='_rid', how='left')
+        .with_row_index('_event_idx_temp')
+        .explode(pl.all().exclude(['event_id', '_event_idx_temp']))
+        .join(CALIBRATION.lazy().select(['detector', 'calib_factor']), on='detector', how='left')
         .with_columns(
-            pl.col('_indices').fill_null(pl.lit([], dtype=pl.List(pl.UInt32)))
+            (pl.col('total_energy') * pl.col('calib_factor')).alias('hit_energy_gev')
         )
         .with_columns(
-            pl.exclude('event_id', '_rid', '_indices').list.gather(pl.col('_indices'))
+            pl.col('hit_energy_gev').sum().over(['event_id', 'cluster_id']).alias('cluster_sum_energy')
         )
-        .drop(['_rid', '_indices'])
+        .filter(pl.col('cluster_sum_energy') > clusters_cutoff)
+        .filter(pl.col('cluster_id') >= 0) # Remove noise hits that were not clustered
+        .drop(['calib_factor', 'hit_energy_gev', 'cluster_sum_energy'])
+        .group_by(['_event_idx_temp', 'event_id'], maintain_order=True)
+        .agg(pl.all().exclude(['_event_idx_temp', 'event_id']))
+        .drop('_event_idx_temp')
         .collect(streaming=True)
     )
-    _dt = _time.time() - _t0
-    print(f"[CLUE CLUSTERING DONE hits cut off] {_dt:.2f}s. "
-          f"RAM: {process.memory_info().rss / 1024 / 1024:.2f} MB")
-
-    # 6. depositors_list (HS particles only).
-    # .pop() so the dict no longer holds these refs — `del` below truly frees them.
-    particles = hs.pop('particles')
-    particles_pid_to_vertex = hs.pop('particles_pid_to_vertex')
-    particles_hard_scatter_ids = hs.pop('particles_hard_scatter_ids')
-
+    print(f"[CLUE CLUSTERING DONE] RAM: {process.memory_info().rss / 1024 / 1024:.2f} MB")
+    # Target particle caloremeter calo clusters deposits ---------
     print("[DEPOSITORS LIST] Creating depositors list...")
     depositors_list = (
         calo_hits.lazy()
         .select(['event_id', 'contrib_particle_ids'])
         .explode('contrib_particle_ids')
-        .explode('contrib_particle_ids')
+        .explode('contrib_particle_ids') # Double explode if list[list]
         .rename({'contrib_particle_ids': 'particle_id'})
         .unique(subset=['event_id', 'particle_id'])
+
         .join(
             particles_hard_scatter_ids.lazy().select(['event_id', 'particle_id']).explode('particle_id'),
             on=['event_id', 'particle_id'],
-            how='inner',
+            how='inner'
         )
         .select([
             pl.col('event_id'),
-            pl.col('particle_id').cast(pl.Int64),
+            pl.col('particle_id').cast(pl.Int64)
         ])
     ).collect(streaming=True)
-    del particles_hard_scatter_ids
-    gc.collect()
     print(f"[DEPOSITORS LIST DONE] RAM: {process.memory_info().rss / 1024 / 1024:.2f} MB")
 
-    # 7. Target particles aggregation.
+    print("[TARGET PARTICLES AGG] Aggregating target particles...")
     target_particles = (
         particles.lazy()
         .select(['event_id', 'particle_id', 'is_target_particle', 'pdg_id',
-                 'energy', 'eta', 'phi', 'px', 'py', 'pz', 'pt', 'has_track', 'vertex_primary',
-                 'vx', 'vy', 'vz'])
-        .explode('particle_id', 'is_target_particle', 'pdg_id',
-                 'energy', 'eta', 'phi', 'px', 'py', 'pz', 'pt',
-                 'has_track', 'vertex_primary', 'vx', 'vy', 'vz')
+              'energy', 'eta', 'phi', 'px', 'py', 'pz', 'pt', 'has_track', 'vertex_primary',
+              'vx', 'vy', 'vz'])
+        .explode( 'particle_id', 'is_target_particle', 'pdg_id',
+              'energy', 'eta', 'phi', 'px', 'py', 'pz', 'pt',
+              'has_track', 'vertex_primary', 'vx', 'vy', 'vz')
         .filter(pl.col('is_target_particle'))
         .sort('event_id')
-        .with_row_index('global_order')
+        .with_row_index("global_order")
         .sort('global_order')
         .drop('is_target_particle', 'global_order')
         .group_by('event_id', maintain_order=True)
@@ -1293,19 +1026,21 @@ def _run_overlay_and_aggregate(
         .collect(streaming=True)
     )
     print(f"[TARGET PARTICLES AGG DONE] RAM: {process.memory_info().rss / 1024 / 1024:.2f} MB")
-
-    particles_for_backtrack = (
-        particles.lazy()
-        .select(pl.col('event_id'), pl.col('particle_id'), pl.col('parent_id'), pl.col('is_parent_missing'))
-        .collect()
-    )
+    
+    # OPTIMIZATION: Save particles for backtrack, then free large structure
+    particles_for_backtrack = particles.lazy().select(           pl.col("event_id"),
+            pl.col("particle_id"),
+            pl.col("parent_id"),
+            pl.col("is_parent_missing")).collect()
     del particles
     gc.collect()
+    print(f"[PARTICLES FREED] RAM: {process.memory_info().rss / 1024 / 1024:.2f} MB")
 
     print("[CREATE CALO CLUSTERS] Creating calo clusters...")
     calo_clusters = create_calo_clusters(calo_hits)
     print(f"[CREATE CALO CLUSTERS DONE] RAM: {process.memory_info().rss / 1024 / 1024:.2f} MB")
-
+    
+    print("[CLUSTER IDX MAPPING] Creating cluster to cluster index mapping...")
     cluster_to_cluster_idx = (
         calo_clusters.lazy()
         .select(['event_id', 'cluster_id'])
@@ -1314,24 +1049,34 @@ def _run_overlay_and_aggregate(
         .group_by('event_id', maintain_order=True)
         .agg([
             pl.col('cluster_id'),
-            (pl.col('cluster_idx') - pl.col('cluster_idx').min()).alias('cluster_idx'),
+            (pl.col('cluster_idx') - pl.col('cluster_idx').min()).alias('cluster_idx')
         ])
         .explode(['cluster_id', 'cluster_idx'])
         .collect()
     )
+    print(f"[CLUSTER IDX MAPPING DONE] RAM: {process.memory_info().rss / 1024 / 1024:.2f} MB")
+    
 
-    points_to_target = backtrack_to_target(
-        particles=particles_for_backtrack,
-        src_df=depositors_list,
-        target_df=target_particles.select(['event_id', 'particle_id']).explode('particle_id'),
-    )
+    print("[BACKTRACK TO TARGET] Backtracking particles to target...")
+    points_to_target = backtrack_to_target(particles=particles_for_backtrack,
+                       src_df=depositors_list,
+                       target_df=target_particles.select(['event_id', 'particle_id']).explode('particle_id'))
+    print(f"[BACKTRACK TO TARGET DONE] RAM: {process.memory_info().rss / 1024 / 1024:.2f} MB")
+    
+    # OPTIMIZATION: Free intermediate structures
     del particles_for_backtrack, depositors_list
     gc.collect()
-
+    print(f"[INTERMEDIATES FREED] RAM: {process.memory_info().rss / 1024 / 1024:.2f} MB")
+    
+    # Heavy double-explode of contrib_particle_ids x contrib_energies happens once
+    # here; both cluster_purity and cluster_vertex_primary_deps consume the result.
+    print("[CONTRIB ENERGY] Building shared per-(event, cluster, particle) energies...")
     contrib_energy = cluster_contrib_energy(calo_hits_with_clusters=calo_hits)
     del calo_hits
     gc.collect()
+    print(f"[CONTRIB ENERGY DONE] RAM: {process.memory_info().rss / 1024 / 1024:.2f} MB")
 
+    print("[CLUSTER VERTEX DEPS] Aggregating calibrated energy by vertex_primary...")
     cluster_vertex_deps = cluster_vertex_primary_deps(
         contrib_energy=contrib_energy,
         pid_to_vertex=particles_pid_to_vertex,
@@ -1339,11 +1084,13 @@ def _run_overlay_and_aggregate(
     )
     del particles_pid_to_vertex
     gc.collect()
+    print(f"[CLUSTER VERTEX DEPS DONE] RAM: {process.memory_info().rss / 1024 / 1024:.2f} MB")
 
     calo_clusters = calo_clusters.join(cluster_vertex_deps, on='event_id', how='left')
     del cluster_vertex_deps
     gc.collect()
 
+    print("[CLUSTER PURITY] Computing cluster purity...")
     target_particles_deps = cluster_purity(
         contrib_energy=contrib_energy,
         ancestors=points_to_target,
@@ -1352,214 +1099,25 @@ def _run_overlay_and_aggregate(
     gc.collect()
     print(f"[CLUSTER PURITY DONE] RAM: {process.memory_info().rss / 1024 / 1024:.2f} MB")
 
+
+
+    # Filter Orphans and Reindex -------------------
+    print("[FILTER ORPHANS] Filtering orphan particles and reindexing...")
     filtered_data = filter_orphans_and_reindex(
         target_particles=target_particles,
         target_particles_deps=target_particles_deps,
         tracks=tracks,
-        cluster_to_cluster_idx=cluster_to_cluster_idx,
+        cluster_to_cluster_idx=cluster_to_cluster_idx
     )
     print(f"[FILTER ORPHANS DONE] RAM: {process.memory_info().rss / 1024 / 1024:.2f} MB")
+    print("[PREPROCESS COMPLETE]\n")
 
     return {
-        'target_particles': filtered_data['target_particles'],
-        'calo_clusters': calo_clusters,
-        'tracks': filtered_data['tracks'],
-        'target_particles_deps': filtered_data['target_particles_deps'],
+        "target_particles": filtered_data["target_particles"],
+        "calo_clusters": calo_clusters,
+        "tracks": filtered_data["tracks"],
+        "target_particles_deps": filtered_data["target_particles_deps"], 
     }
-
-
-def preprocess_for_model(
-    hs_particles: pl.DataFrame,
-    hs_tracks: pl.DataFrame,
-    hs_calo_hits: pl.DataFrame,
-    pu_particles: pl.DataFrame,
-    pu_tracks: pl.DataFrame,
-    pu_calo_hits: pl.DataFrame,
-    pileup_level: int = 200,
-    seed: int = 42,
-    num_of_events: int = -1,
-    truth_eta_cut: float = 3.0,
-    truth_pt_cut: float = 1.0,
-    target_pt_cut: float = 0.3,
-    clusters_cutoff: float = 0.1,
-    clue_backend: str = 'gpu cuda',
-    chunk_size: int = -1,
-    chunk_tmp_dir: str = "/storage/agrp/barakma/PileupODD/data/tmp",
-    invisible_pu_prob: float = 0.0,
-    tof_enabled: bool = True,
-) -> Dict[str, pl.DataFrame]:
-    """
-    Build a synthetic PU<pileup_level> dataset by overlaying ~Poisson(pileup_level)
-    pileup events on each PU0 hard-scatter event, then run clustering and the
-    full target/cluster aggregation pipeline.
-
-    clue_backend: backend passed to CLUEstering. Use 'gpu cuda' (default) for
-    NVIDIA GPUs, or 'cpu serial' / 'cpu tbb' for CPU-only nodes. Example:
-        preprocess_for_model(..., clue_backend='cpu serial')
-
-    chunk_size: if > 0, process HS events in chunks of this size through the
-    overlay->cluster->aggregate pipeline, then concatenate. The PU pool is
-    NOT chunked (it's the shared sampling pool). Reduces peak RAM but slightly
-    increases wall time. <=0 means no chunking (process all HS events at once).
-
-    chunk_tmp_dir: parent directory under which a per-run temp dir is created
-    for spilling chunk outputs to disk. Defaults to a path under PileupODD/data
-    (large shared storage). Only used when chunk_size > 0.
-    """
-    import psutil
-    import os
-    process = psutil.Process(os.getpid())
-
-    print("\n[PREPROCESS START]")
-    print(f"RAM: {process.memory_info().rss / 1024 / 1024:.2f} MB")
-
-    # 1. Per-source preprocessing.
-    hs = _preprocess_source(hs_particles, hs_tracks, hs_calo_hits, kind='hs',
-                             num_of_events=num_of_events,
-                             truth_eta_cut=truth_eta_cut,
-                             truth_pt_cut=truth_pt_cut,
-                             target_pt_cut=target_pt_cut,
-                             tof_enabled=tof_enabled)
-    del hs_particles, hs_tracks
-    gc.collect()
-
-    pu = _preprocess_source(pu_particles, pu_tracks, pu_calo_hits, kind='pu',
-                             num_of_events=num_of_events,
-                             truth_eta_cut=truth_eta_cut,
-                             truth_pt_cut=truth_pt_cut,
-                             target_pt_cut=target_pt_cut,
-                             tof_enabled=tof_enabled)
-    del pu_particles, pu_tracks
-    gc.collect()
-    print(f"[PER-SOURCE DONE] RAM: {process.memory_info().rss / 1024 / 1024:.2f} MB")
-
-    hs_event_ids_all = hs['calo_hits']['event_id'].to_numpy()
-    n_hs = len(hs_event_ids_all)
-
-    if chunk_size is None or chunk_size <= 0 or n_hs <= chunk_size:
-        # Single pass (no chunking).
-        result = _run_overlay_and_aggregate(hs, pu, pileup_level, seed,
-                                            clusters_cutoff, clue_backend, process,
-                                            invisible_pu_prob=invisible_pu_prob,
-                                            tof_enabled=tof_enabled)
-        del hs, pu
-        gc.collect()
-        print("[PREPROCESS COMPLETE]\n")
-        return result
-
-    # Chunked pass: run each chunk in a FORKED CHILD process.
-    #
-    # Why fork: polars uses mimalloc, which retains free arenas inside the
-    # process. The in-process chunk loop accumulated those arenas — chunk N+1
-    # started at chunk N's peak. malloc_trim is a no-op for mimalloc and polars
-    # exposes no purge API. The only reliable way to give pages back to the OS
-    # is process termination, which `sys_exit_group` does forcibly regardless
-    # of what mimalloc wanted to keep.
-    #
-    # Fork is preferred over spawn/subprocess.run because the child inherits
-    # `hs` and `pu` via copy-on-write — zero copy, zero serialization, zero
-    # disk re-read. The parent has just returned from `_preprocess_source` so
-    # polars's thread pool is idle (safe fork point — no internal lock can be
-    # held across the syscall).
-    import os
-    import sys
-    import tempfile
-    import time
-    import traceback
-    import psutil
-    from pathlib import Path
-
-    n_chunks = (n_hs + chunk_size - 1) // chunk_size
-    print(f"[CHUNKING] Splitting {n_hs} HS events into {n_chunks} chunks of <= {chunk_size} "
-          f"(each chunk runs in a forked child)")
-
-    keys = ['target_particles', 'calo_clusters', 'tracks', 'target_particles_deps']
-
-    Path(chunk_tmp_dir).mkdir(parents=True, exist_ok=True)
-    with tempfile.TemporaryDirectory(prefix='clue_chunks_', dir=chunk_tmp_dir) as tmpdir:
-        tmp = Path(tmpdir)
-        for ci in range(n_chunks):
-            chunk_ids_np = hs_event_ids_all[ci * chunk_size:(ci + 1) * chunk_size]
-            chunk_ids = pl.Series('event_id', chunk_ids_np)
-
-            print(f"\n[CHUNK {ci+1}/{n_chunks}] forking child for {len(chunk_ids_np)} HS events. "
-                  f"PARENT RAM: {process.memory_info().rss / 1024 / 1024:.2f} MB")
-            sys.stdout.flush()
-            sys.stderr.flush()
-
-            pid = os.fork()
-            if pid == 0:
-                # ===== CHILD =====
-                # hs/pu are inherited from the parent via COW — no copy, no I/O.
-                # Anything we allocate here is child-private and gets reclaimed
-                # by the kernel on os._exit().
-                try:
-                    hs_chunk = {
-                        'particles':                 hs['particles'].filter(pl.col('event_id').is_in(chunk_ids)),
-                        'tracks':                    hs['tracks'].filter(pl.col('event_id').is_in(chunk_ids)),
-                        'calo_hits':                 hs['calo_hits'].filter(pl.col('event_id').is_in(chunk_ids)),
-                        'particles_pid_to_vertex':   hs['particles_pid_to_vertex'].filter(pl.col('event_id').is_in(chunk_ids)),
-                        'particles_hard_scatter_ids':hs['particles_hard_scatter_ids'].filter(pl.col('event_id').is_in(chunk_ids)),
-                    }
-                    child_process = psutil.Process(os.getpid())
-                    out = _run_overlay_and_aggregate(
-                        hs_chunk, pu,
-                        pileup_level=pileup_level,
-                        seed=seed + ci,  # distinct sampling per chunk
-                        clusters_cutoff=clusters_cutoff,
-                        clue_backend=clue_backend,
-                        process=child_process,
-                        invisible_pu_prob=invisible_pu_prob,
-                        tof_enabled=tof_enabled,
-                    )
-                    for k in keys:
-                        out[k].write_parquet(tmp / f'chunk_{ci:04d}_{k}.parquet')
-                    sys.stdout.flush()
-                    sys.stderr.flush()
-                except BaseException:
-                    traceback.print_exc()
-                    sys.stdout.flush()
-                    sys.stderr.flush()
-                    os._exit(1)
-                # os._exit skips Python finalizers / atexit / gc — important so
-                # the child doesn't touch pages still shared with the parent.
-                os._exit(0)
-            else:
-                # ===== PARENT =====
-                t0 = time.perf_counter()
-                _, status = os.waitpid(pid, 0)
-                dt = time.perf_counter() - t0
-                if os.WIFEXITED(status):
-                    exit_code = os.WEXITSTATUS(status)
-                else:
-                    exit_code = -1
-                if exit_code != 0:
-                    raise RuntimeError(
-                        f"chunk {ci+1}/{n_chunks} child (pid {pid}) failed with "
-                        f"exit code {exit_code} after {dt:.1f}s"
-                    )
-                print(f"[CHUNK {ci+1}/{n_chunks} DONE] {dt:.1f}s. "
-                      f"PARENT RAM: {process.memory_info().rss / 1024 / 1024:.2f} MB")
-
-        # All chunks processed: free per-source data BEFORE reading chunks back.
-        del hs, pu
-        gc.collect()
-        print(f"\n[ALL CHUNKS DONE / SOURCES FREED] RAM: {process.memory_info().rss / 1024 / 1024:.2f} MB")
-
-        # Read chunks per-key, concat, then delete files to release disk early.
-        final: Dict[str, pl.DataFrame] = {}
-        for k in keys:
-            parts = sorted(tmp.glob(f'chunk_*_{k}.parquet'))
-            final[k] = pl.concat([pl.read_parquet(p) for p in parts])
-            for p in parts:
-                p.unlink()
-            gc.collect()
-            print(f"[CONCAT {k}] {len(parts)} chunks merged. "
-                  f"RAM: {process.memory_info().rss / 1024 / 1024:.2f} MB")
-
-    print(f"[CHUNKS MERGED] RAM: {process.memory_info().rss / 1024 / 1024:.2f} MB")
-    print("[PREPROCESS COMPLETE]\n")
-    return final
 
 
 
@@ -1839,161 +1397,67 @@ def update_target_particles_with_vertex_info(
     print("Done.")
 
 
-def run_preprocessing_pipeline(
-    r=None,
-    event_name: str = "ttbar_pu0",
-    pileup_level: int = 200,
-    pu_event_name: str = "pileup_only_pu0",
-    seed: int = 42,
-    num_of_events: int = -1,
-    clusters_cutoff: float = 0.15,
-    pu_files_per_batch: int = 3,
-    pu_indices=None,
-    clue_backend: str = 'gpu cuda',
-    chunk_size: int = -1,
-    chunk_tmp_dir: str = "/storage/agrp/barakma/PileupODD/data/tmp",
-    invisible_pu_prob: float = 0.0,
-    tof_enabled: bool = True,
-):
-    """
-    Synthetic PU<pileup_level>: load PU0 HS and pileup-only triplets from
-    HuggingFace, overlay Poisson(pileup_level) pileup events on each HS event,
-    cluster, aggregate, and write parquets to:
-      /storage/agrp/barakma/PileupODD/data/{event_name}_overlay_pu{pileup_level}/
-
-    Args:
-      r: iterable of file indices to process (e.g. [0, 1, 2] or range(5)).
-      event_name: HS dataset prefix (e.g. 'ttbar_pu0').
-      pileup_level: mean of the Poisson sampler for pileup events per HS event.
-      pu_event_name: pileup-only dataset prefix on HF.
-      seed: RNG seed for the sample map.
-      num_of_events: if >= 0, restrict HS events (pileup pool is never truncated).
-      clusters_cutoff: drop clusters whose calibrated energy sum is below this (GeV).
-      pu_files_per_batch: number of PU files concatenated into a shared pool per batch
-                          of HS files.  Each HS file in the batch samples from the full
-                          combined pool, giving better combinatorics across files.
-                          Ignored when `pu_indices` is provided.
-      pu_indices: explicit iterable of PU file indices to load into a single shared
-                  pool used by ALL HS files in `r` (decouples PU pool from HS files).
-                  When None (default), PU pool is derived from `r` in batches of
-                  `pu_files_per_batch` (legacy behavior).
-      clue_backend: backend for CLUEstering. Default 'gpu cuda' (NVIDIA GPU).
-                    Use 'cpu serial' or 'cpu tbb' for CPU-only nodes. Example:
-                        run_preprocessing_pipeline(r=[0], clue_backend='cpu serial')
-      chunk_size: if > 0, process HS events of each file in chunks of this size
-                  through the overlay->cluster->aggregate stages to cap peak RAM
-                  (PU pool stays shared across chunks). <=0 disables chunking.
-      invisible_pu_prob: per-PU-draw probability of contributing nothing
-                  (simulates diffractive events missing the detector). Drawn
-                  efficiently via Binomial — no wasted sampling on rolls that
-                  would be discarded. Default 0.0 (no change to legacy behavior).
-                  Reasonable value: 0.19.
-    """
+def run_preprocessing_pipeline(r=None, event_name: str="ttbar_pu200", ):
     from huggingface_hub import HfFileSystem
-    from pathlib import Path
     import polars as pl
     import tqdm
     import gc
-    import time
-
     fs = HfFileSystem()
-    if r is None:
-        raise ValueError("Must pass an iterable `r` of file indices to process.")
+    if r is not None:
+        number_of_files = r
     number_of_hf_repo_files = 1000
+    for i in tqdm.tqdm(number_of_files):
+        file_path = f"datasets/CERN/ColliderML-Release-1/data/{event_name}_particles/train-{i:05d}-of-{number_of_hf_repo_files:05d}.parquet"
+        print(f"Processing file: {file_path}")
+        if not fs.exists(file_path):
+            raise FileNotFoundError(f"File not found: {file_path}")
 
-    particle_cols = [
-        'event_id', 'particle_id', 'vertex_primary', 'pdg_id',
-        'energy', 'px', 'py', 'pz', 'vx', 'vy', 'vz', 'parent_id',
-    ]
-    hs_calo_cols = [
-        'event_id', 'detector', 'total_energy', 'x', 'y', 'z',
-        'contrib_particle_ids', 'contrib_energies',
-    ]
-    # PU calo loader picks up contrib_times only when the ToF cut is on; it's
-    # consumed by _preprocess_source to compute the energy-weighted hit time
-    # and dropped immediately after.
-    pu_calo_cols = list(hs_calo_cols)
-    if tof_enabled:
-        pu_calo_cols.append('contrib_times')
+        file_path = f"datasets/CERN/ColliderML-Release-1/data/{event_name}_particles/train-{i:05d}-of-{number_of_hf_repo_files:05d}.parquet"
+        with fs.open(file_path, "rb") as f:
+            particles = pl.read_parquet(f,columns=[    'event_id',
+    'particle_id',
+    'vertex_primary',
+    'pdg_id',
+    'energy',
+    'px',
+    'py',
+    'pz',
+    'vx',
+    'vy',
+    'vz',
+    'parent_id',
+])
 
-    out_dir = Path(f"/storage/agrp/barakma/PileupODD/data/{event_name}_overlay_pu{pileup_level}")
-    out_dir.mkdir(parents=True, exist_ok=True)
 
-    def _hf_path(prefix: str, kind: str, idx: int) -> str:
-        return (
-            f"datasets/CERN/ColliderML-Release-1/data/"
-            f"{prefix}_{kind}/train-{idx:05d}-of-{number_of_hf_repo_files:05d}.parquet"
-        )
+        file_path = f"datasets/CERN/ColliderML-Release-1/data/{event_name}_calo_hits/train-{i:05d}-of-{number_of_hf_repo_files:05d}.parquet"
+        with fs.open(file_path, "rb") as f:
+            calo_hits = pl.read_parquet(f,columns=    ['event_id',
+    'detector',
+    'total_energy',
+    'x',
+    'y',
+    'z',
+    'contrib_particle_ids',
+    'contrib_energies',
+     'contrib_times',
+])
 
-    def _read(prefix: str, kind: str, idx: int, columns=None) -> pl.DataFrame:
-        path = _hf_path(prefix, kind, idx)
-        if not fs.exists(path):
-            raise FileNotFoundError(f"File not found: {path}")
-        with fs.open(path, "rb") as f:
-            return pl.read_parquet(f, columns=columns)
+        file_path = f"datasets/CERN/ColliderML-Release-1/data/{event_name}_tracks/train-{i:05d}-of-{number_of_hf_repo_files:05d}.parquet"
+        with fs.open(file_path, "rb") as f:
+            tracks = pl.read_parquet(f)
 
-    def _load_pu_batch(file_indices) -> tuple:
-        """Load and concatenate PU files, offsetting event_ids to be unique."""
-        p_list, c_list, t_list = [], [], []
-        offset = 0
-        for idx in file_indices:
-            p = _read(pu_event_name, 'particles', idx, columns=particle_cols)
-            c = _read(pu_event_name, 'calo_hits', idx, columns=pu_calo_cols)
-            t = _read(pu_event_name, 'tracks', idx)
-            # Offset so event_ids don't collide across files.
-            max_eid = int(max(p['event_id'].max(), c['event_id'].max(), t['event_id'].max())) + 1
-            p_list.append(p.with_columns(pl.col('event_id') + offset))
-            c_list.append(c.with_columns(pl.col('event_id') + offset))
-            t_list.append(t.with_columns(pl.col('event_id') + offset))
-            offset += max_eid
-        return pl.concat(p_list), pl.concat(c_list), pl.concat(t_list)
-
-    r_list = list(r)
-    if pu_indices is not None:
-        batches = [(list(pu_indices), r_list)]
-    else:
-        batches = [
-            (r_list[i:i + pu_files_per_batch], r_list[i:i + pu_files_per_batch])
-            for i in range(0, len(r_list), pu_files_per_batch)
-        ]
-
-    for pu_batch, hs_batch in tqdm.tqdm(batches, desc="Batches"):
-        print(f"\n=== Loading PU pool from files {pu_batch} ===")
-        pu_particles, pu_calo_hits, pu_tracks = _load_pu_batch(pu_batch)
-        n_pu = pu_calo_hits['event_id'].n_unique()
-        print(f"    PU pool: {n_pu} unique pileup events from {len(pu_batch)} file(s).")
-
-        for i in tqdm.tqdm(hs_batch, desc="HS files in batch", leave=False):
-            print(f"\n=== File index {i:05d} ===")
-            _t0 = time.perf_counter()
-
-            hs_particles = _read(event_name, 'particles', i, columns=particle_cols)
-            hs_calo_hits = _read(event_name, 'calo_hits', i, columns=hs_calo_cols)
-            hs_tracks = _read(event_name, 'tracks', i)
-
-            preprocessed_data = preprocess_for_model(
-                hs_particles=hs_particles, hs_tracks=hs_tracks, hs_calo_hits=hs_calo_hits,
-                pu_particles=pu_particles, pu_tracks=pu_tracks, pu_calo_hits=pu_calo_hits,
-                pileup_level=pileup_level,
-                seed=seed + i,  # different sampling per file index
-                num_of_events=num_of_events,
-                truth_pt_cut=1, truth_eta_cut=3.0, target_pt_cut=0.3,
-                clusters_cutoff=clusters_cutoff,
-                clue_backend=clue_backend,
-                chunk_size=chunk_size,
-                chunk_tmp_dir=chunk_tmp_dir,
-                invisible_pu_prob=invisible_pu_prob,
-                tof_enabled=tof_enabled,
-            )
-
-            for key, df in preprocessed_data.items():
-                df.write_parquet(out_dir / f"{key}-{i:05d}.parquet")
-
-            del hs_particles, hs_tracks, hs_calo_hits, preprocessed_data
-            gc.collect()
-            _dt = time.perf_counter() - _t0
-            print(f"=== File index {i:05d} done in {_dt:.1f} s ({_dt/60:.2f} min) ===")
-
-        del pu_particles, pu_calo_hits, pu_tracks
+        preprocessed_data = preprocess_for_model(particles=particles, tracks=tracks,
+                                                  calo_hits=calo_hits, num_of_events=-1, 
+                                                  truth_pt_cut=1, truth_eta_cut=3.0, target_pt_cut=0.3, clusters_cutoff=0.15)
+        
+        # write preprocessed data to local disk as parquets
+        file_path_data = f"/storage/agrp/barakma/PileupODD/data/{event_name}"
+        from pathlib import Path
+        Path(file_path_data).mkdir(parents=True, exist_ok=True)
+        for key, df in preprocessed_data.items():
+            df.write_parquet(f"{file_path_data}/{key}-{i:05d}.parquet")
+        
+        # Free memory
+        del particles, tracks, calo_hits, preprocessed_data
         gc.collect()
 
