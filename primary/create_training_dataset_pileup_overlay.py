@@ -1,4 +1,7 @@
 from typing import Dict
+import sys
+sys.path.insert(0, '/storage/agrp/barakma/PileupODD')
+
 import polars as pl
 import numpy as np
 import yaml # type: ignore
@@ -1493,6 +1496,11 @@ def preprocess_for_model(
                 # hs/pu are inherited from the parent via COW — no copy, no I/O.
                 # Anything we allocate here is child-private and gets reclaimed
                 # by the kernel on os._exit().
+                # Line-buffer so each [...] print is visible immediately —
+                # otherwise piped stdout block-buffers until os._exit().
+                sys.stdout.reconfigure(line_buffering=True)
+                sys.stderr.reconfigure(line_buffering=True)
+                print(f"[CHUNK {ci+1} CHILD ALIVE] pid={os.getpid()}", flush=True)
                 try:
                     hs_chunk = {
                         'particles':                 hs['particles'].filter(pl.col('event_id').is_in(chunk_ids)),
@@ -1997,3 +2005,6 @@ def run_preprocessing_pipeline(
         del pu_particles, pu_calo_hits, pu_tracks
         gc.collect()
 
+
+if __name__ == "__main__":
+    run_preprocessing_pipeline(r=[0,1,2], chunk_size=50)

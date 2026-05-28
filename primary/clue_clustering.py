@@ -2,7 +2,6 @@ import numpy as np
 import os
 import polars as pl
 from primary.calibration import CALIBRATION
-import CLUEstering as clue
 from primary.downsample import voxel_config, voxelize_hits
 import tqdm
 
@@ -122,6 +121,9 @@ def clue_clustering(calo_hits: pl.DataFrame, dc=75.88106168184893, rhoc=104.3431
                 res_cz[idx] = cz
     else:
         # Sequential path: reuse a single clusterer for all events.
+        # Import lazily so CUDA is not initialized in the parent at module
+        # import time — that would poison the child after fork().
+        import CLUEstering as clue
         clusterer = clue.clusterer(dc=dc, rhoc=rhoc, dm=dm, ppbin=ppbin)
         for i, points in enumerate(tqdm.tqdm(points_list, desc="Clustering events")):
             clusterer.read_data(points.T)

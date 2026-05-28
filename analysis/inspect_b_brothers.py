@@ -183,8 +183,8 @@ def main() -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument("--label-dir", type=str, default=str(DEFAULT_LABEL_DIR),
                         help=f"Where the bb~ labels live (default: {DEFAULT_LABEL_DIR})")
-    parser.add_argument("--n-events", type=int, default=5,
-                        help="Number of H->bb~ events to inspect (default: 5)")
+    parser.add_argument("--n-events", type=int, default=20,
+                        help="Number of H->bb~ events to inspect (default: 20)")
     args = parser.parse_args()
 
     label_dir = Path(args.label_dir)

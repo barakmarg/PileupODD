@@ -46,15 +46,14 @@ from classify_hf_decay_channels import (  # noqa: E402
 from primary.create_trainning_dataset_pileup import preprocess_for_model  # noqa: E402
 
 JET_ALGO = "antikt"
-JET_R = 0.4
+JET_R = 0.6 
 MIN_CONSTITUENTS = 2
 MIN_JET_PT = 10.0
 JET_ETA_CUT = 4.0  # Kept exactly as original
 DR_MATCH = 0.4
 B_HAD_MIN_PT = 5.0
 B_HAD_ETA_CUT = 3.5            # drop forward B-hadrons (beam remnants / ISR fakes)
-B_HAD_PAIR_DR_MIN = 0.4        # require the chosen pair be ΔR-separated
-HIGGS_MASS = 125.0             # target for the closest-mass pair selection
+HIGGS_MASS = 125.0             # reference mass for plot/summary tolerance bands
 
 
 def cluster_jets_event(pt, eta, phi,
@@ -478,35 +477,24 @@ def _process_single_file(file_idx: int, event_ids: list[int],
         # 1. Get all distinct, central B-hadron directions (|η|<3.5, ΔR-clustered)
         bhads_all = get_all_b_hadrons(raw_by_eid[eid])
 
-        # 2. Pick the pair that best matches the Higgs, applying ALL conditions:
-        #    - both candidates already pass |η|<3.5 (enforced in get_all_b_hadrons)
-        #    - both already at distinct cluster centers (ΔR>0.4 via clustering)
-        #    - additionally require explicit ΔR>B_HAD_PAIR_DR_MIN between them
-        #    - among surviving pairs, choose the one whose M is closest to 125 GeV.
-        bhads = []
-        best_mass = 0.0
-        if len(bhads_all) >= 2:
-            best_diff = float('inf')
-            for i in range(len(bhads_all)):
-                for j in range(i + 1, len(bhads_all)):
-                    a, b = bhads_all[i], bhads_all[j]
-                    dr_ab = _delta_r(a["eta"], a["phi"], b["eta"], b["phi"])
-                    if dr_ab < B_HAD_PAIR_DR_MIN:
-                        continue
-                    m = _mass_two_dict(a, b)
-                    if abs(m - HIGGS_MASS) < best_diff:
-                        best_diff = abs(m - HIGGS_MASS)
-                        bhads = [a, b]
-                        best_mass = m
-        # if exactly 1 candidate survived (and we still want to report it)
-        if not bhads and bhads_all:
-            bhads = bhads_all[:1]
+        # 2. Pick the two leading-pT B-hadron directions. In gg → H → bb̄,
+        #    the two Higgs daughters are usually the hardest B-hadrons in
+        #    the event; ISR/UE B-pairs are softer. This is right ~95% of
+        #    the time. The earlier "closest-to-125 GeV" heuristic failed
+        #    on boosted/asymmetric Higgs decays — when one Higgs leg sits
+        #    below an ISR B-hadron in pT, kinematics-fitting glued the
+        #    high-pT Higgs leg to the ISR B and missed the soft Higgs leg.
+        #    `get_all_b_hadrons` already returns ΔR>0.4-clustered B's sorted
+        #    by pT desc, so the first two satisfy the pair separation cut.
+        bhads = bhads_all[:2] if len(bhads_all) >= 2 else bhads_all[:1]
+        best_mass = (_mass_two_dict(bhads[0], bhads[1])
+                     if len(bhads) == 2 else 0.0)
 
         print(f"\n=== event {eid} ===")
         print(f"  {len(pt)} target particles  (target pT range {pt.min():.2f}-{pt.max():.2f})")
         print(f"  found {len(bhads_all)} B-hadron candidates.")
         if len(bhads) == 2:
-            print(f"  Selected pair closest to Higgs mass (M = {best_mass:.2f} GeV):")
+            print(f"  Selected top-2 leading-pT B-hadrons (M = {best_mass:.2f} GeV):")
         
         for k, b in enumerate(bhads, 1):
             print(f"    bH#{k}  pdg={b['pdg']:+5d}  pT={b['pt']:7.2f}  "
@@ -622,8 +610,26 @@ def _process_single_file(file_idx: int, event_ids: list[int],
             # once. Falls back to 0.0 if no B's were found in either cone.
             bb1, bb2 = bpbr_sums[0], bpbr_sums[1]
             union_idx = bb1["indices"] | bb2["indices"]
+            n_ancestors_dropped = 0
             if union_idx:
                 raw = raw_by_eid[eid]
+                pid_r = np.asarray(raw["particle_id"], dtype=np.int64)
+                par_r = np.asarray(raw["parent_id"], dtype=np.int64)
+                # Cascade-leaf cut at the UNION level: drop any union member
+                # whose particle_id is the parent_id of another union member.
+                # The per-jet leaf cut inside b_plus_brothers_in_cone only
+                # drops in-cone B-ancestors; cross-jet cascades (e.g. one
+                # jet's brother set contains a B* whose decay products live
+                # in the OTHER jet's set) still double-count its energy
+                # without this. After the cut, ancestor 4-momentum is
+                # replaced by its descendants', conserving total p_μ.
+                parent_ids_in_union = {int(par_r[i]) for i in union_idx}
+                ancestors = {i for i in union_idx
+                             if int(pid_r[i]) in parent_ids_in_union}
+                n_ancestors_dropped = len(ancestors)
+                if ancestors:
+                    union_idx = union_idx - ancestors
+            if union_idx:
                 px_r = np.asarray(raw["px"], dtype=np.float64)
                 py_r = np.asarray(raw["py"], dtype=np.float64)
                 pz_r = np.asarray(raw["pz"], dtype=np.float64)
@@ -645,7 +651,8 @@ def _process_single_file(file_idx: int, event_ids: list[int],
             print(f"  → leaf-B-hadron dijet mass  M(ΣB,ΣB̄)     = {mjj_b:7.2f} GeV  "
                   f"(E_b: {b1['E']:.1f} + {b2['E']:.1f})")
             print(f"  → B+brothers dijet mass     M(ΣB+bro,…)  = {mjj_bpbr:7.2f} GeV  "
-                  f"(n_particles_union={len(union_idx)})")
+                  f"(n_particles_union={len(union_idx)}, "
+                  f"n_ancestors_dropped={n_ancestors_dropped})")
         else:
             print("  → could not form b-tagged dijet (one or both b-jets missing)")
 
@@ -702,12 +709,32 @@ def print_running_summary(masses_vis: list[float],
           f"{_hits(top, 20) if top.size else '—':>11}")
 
 
+def parse_only_events(spec: str) -> dict[int, list[int]]:
+    """Parse '0:5' or '0:1,0:5,1:42' into {file_idx: [event_ids]}.
+    Bypasses the labels parquet — debug helper for inspecting specific
+    events without scanning the full label set."""
+    out: dict[int, list[int]] = defaultdict(list)
+    for pair in spec.split(','):
+        pair = pair.strip()
+        if not pair:
+            continue
+        fi_str, eid_str = pair.split(':')
+        out[int(fi_str)].append(int(eid_str))
+    return dict(out)
+
+
 def get_chunk_file_to_events(label_dir: Path, n_bb_events: int,
-                             chunk_size: int, chunk_idx: int
+                             chunk_size: int, chunk_idx: int,
+                             only_events: str | None = None,
                              ) -> dict[int, list[int]]:
     """Deterministically slice the first n_bb_events bb̄ events into chunks
-    of chunk_size and return the file_to_events dict for chunk_idx."""
-    full = load_bb_event_ids(label_dir, n_bb_events)
+    of chunk_size and return the file_to_events dict for chunk_idx.
+    If `only_events` is given, use that fixed (file_idx, event_id) set
+    instead and ignore n_bb_events."""
+    if only_events:
+        full = parse_only_events(only_events)
+    else:
+        full = load_bb_event_ids(label_dir, n_bb_events)
     flat = sorted((fi, eid) for fi, eids in full.items() for eid in eids)
     start = chunk_idx * chunk_size
     chunk_pairs = flat[start : start + chunk_size]
@@ -719,12 +746,14 @@ def get_chunk_file_to_events(label_dir: Path, n_bb_events: int,
 
 def worker_main(label_dir: Path, n_bb_events: int, chunk_size: int,
                 chunk_idx: int, truth_pt_cut: float, truth_eta_cut: float,
-                target_pt_cut: float, clusters_cutoff: float) -> None:
+                target_pt_cut: float, clusters_cutoff: float,
+                only_events: str | None = None) -> None:
     """Subprocess entry: process exactly one chunk and print results as a
     sentinel-tagged JSON line on stdout. Polars / FastJet allocations all
     die when this process exits."""
     file_to_events = get_chunk_file_to_events(
-        label_dir, n_bb_events, chunk_size, chunk_idx
+        label_dir, n_bb_events, chunk_size, chunk_idx,
+        only_events=only_events,
     )
     flat = sorted((fi, eid) for fi, eids in file_to_events.items() for eid in eids)
     print(f"[chunk {chunk_idx}] {len(flat)} events: {flat}")
@@ -827,11 +856,15 @@ def plot_histograms(masses_vis: list[float],
 def manager_loop(label_dir: Path, n_bb_events: int, chunk_size: int,
                  truth_pt_cut: float, truth_eta_cut: float,
                  target_pt_cut: float, clusters_cutoff: float,
-                 plots_dir: Path) -> None:
+                 plots_dir: Path,
+                 only_events: str | None = None) -> None:
     """Spawn one subprocess per chunk, sequentially. After each chunk
     completes, parse its results from stdout and print the running aggregate.
     Memory from each chunk is fully returned to the OS at subprocess exit."""
-    full = load_bb_event_ids(label_dir, n_bb_events)
+    if only_events:
+        full = parse_only_events(only_events)
+    else:
+        full = load_bb_event_ids(label_dir, n_bb_events)
     flat = sorted((fi, eid) for fi, eids in full.items() for eid in eids)
     n_total = len(flat)
     n_chunks = (n_total + chunk_size - 1) // chunk_size
@@ -860,6 +893,8 @@ def manager_loop(label_dir: Path, n_bb_events: int, chunk_size: int,
             "--target-pt-cut", str(target_pt_cut),
             "--clusters-cutoff", str(clusters_cutoff),
         ]
+        if only_events:
+            cmd += ["--only-events", only_events]
         print(f"\n[chunk {ci+1}/{n_chunks}] spawning subprocess …")
         t0 = time.perf_counter()
         # Popen + line-by-line streaming so worker stdout appears LIVE in
@@ -947,6 +982,11 @@ def main():
                         default=str(Path(__file__).resolve().parent
                                     / "plots_inspect_hbb"),
                         help="Where to write histogram PNGs")
+    parser.add_argument("--only-events", type=str, default=None,
+                        help="Comma-separated file_idx:event_id pairs to "
+                             "process (e.g. '0:5' or '0:1,0:5,1:42'). "
+                             "Bypasses --n-bb-events / the labels parquet. "
+                             "Useful for debugging a specific event.")
     parser.add_argument("--worker", action="store_true",
                         help="(internal) worker mode: process --chunk-idx and exit")
     parser.add_argument("--chunk-idx", type=int, default=None,
@@ -962,6 +1002,7 @@ def main():
             chunk_idx=args.chunk_idx,
             truth_pt_cut=args.truth_pt_cut, truth_eta_cut=args.truth_eta_cut,
             target_pt_cut=args.target_pt_cut, clusters_cutoff=args.clusters_cutoff,
+            only_events=args.only_events,
         )
         return
 
@@ -972,6 +1013,7 @@ def main():
         truth_pt_cut=args.truth_pt_cut, truth_eta_cut=args.truth_eta_cut,
         target_pt_cut=args.target_pt_cut, clusters_cutoff=args.clusters_cutoff,
         plots_dir=Path(args.plots_dir),
+        only_events=args.only_events,
     )
 
 
