@@ -10,6 +10,8 @@ Histograms (overlaid A vs B):
   3. track energy distribution (E = pt * cosh(eta))
   4. # particles per cluster      (target-particle deposits)
   5. # clusters per particle      (target-particle deposits)
+  6. sum cluster energy per event
+  7. # tracks per event
 
 Author note: counts in (4)/(5) are derived from `target_particles_deps`
 (cluster_idx, particle_idx) WITHIN each event. They are per-event positional
@@ -23,13 +25,13 @@ import numpy as np
 import polars as pl
 
 DATA_ROOT = Path("/storage/agrp/barakma/PileupODD/data")
-DIR_A = DATA_ROOT / "ttbar_pu0_overlay_pu200_from_ttbar"   # 1 file, 1000 events
+DIR_A = DATA_ROOT / "ttbar_pu0_overlay_pu200"   # 1 file, 1000 events
 DIR_B = DATA_ROOT / "ttbar_pu200"               # many files, 100 ev each
 
 N_FILES_A = 1     # read all
 N_FILES_B = 10    # 10 * 100 = 1000 events
 
-OUT_DIR = Path("/storage/agrp/barakma/PileupODD/scripts/out_pu200fullsimoverlay_vs_pu200")
+OUT_DIR = Path("/storage/agrp/barakma/PileupODD/scripts/out_pu200tosfilter_overlay_vs_pu200")
 OUT_DIR.mkdir(parents=True, exist_ok=True)
 
 
@@ -63,6 +65,11 @@ def cluster_energy(calo: pl.DataFrame) -> np.ndarray:
 
 def sum_cluster_energy_per_event(calo: pl.DataFrame) -> np.ndarray:
     return calo["total_cluster_energy"].list.sum().to_numpy()
+
+
+def n_tracks_per_event(tracks: pl.DataFrame) -> np.ndarray:
+    """One row per event; pt is a per-track list — its length is # tracks."""
+    return tracks["pt"].list.len().to_numpy()
 
 
 def track_energy(tracks: pl.DataFrame) -> np.ndarray:
@@ -179,12 +186,16 @@ def main() -> None:
             sum_cluster_energy_per_event(A["calo_clusters"]),
             sum_cluster_energy_per_event(B["calo_clusters"]),
         ),
+        "n_tracks_per_event": (
+            n_tracks_per_event(A["tracks"]),
+            n_tracks_per_event(B["tracks"]),
+        ),
     }
 
     for name, (a, b) in stats.items():
         _print_summary(name, a, b)
 
-    fig, axes = plt.subplots(3, 2, figsize=(13, 14))
+    fig, axes = plt.subplots(4, 2, figsize=(13, 18))
     axes = axes.ravel()
 
     overlay_hist(
@@ -223,6 +234,14 @@ def main() -> None:
         xlabel="sum cluster energy / event [GeV]",
         title="Sum cluster energy per event",
     )
+    overlay_hist(
+        axes[6], *stats["n_tracks_per_event"],
+        bins=60, integer=True, log_y=True,
+        xlabel="# tracks / event",
+        title="Tracks per event",
+    )
+    # Hide the unused 8th axis in the 4x2 grid.
+    axes[7].set_axis_off()
 
     fig.suptitle("ttbar_pu0_overlay_pu200  vs  ttbar_pu200   (1000 events each)",
                  fontsize=13)

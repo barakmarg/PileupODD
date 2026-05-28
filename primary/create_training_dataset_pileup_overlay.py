@@ -2028,4 +2028,4 @@ def run_preprocessing_pipeline(
 
 
 if __name__ == "__main__":
-    run_preprocessing_pipeline(r=[0,1,2], chunk_size=50, pu_files_per_batch=1)
+    run_preprocessing_pipeline(r=[0], chunk_size=50, pu_indices=[0,1,2], pu_files_per_batch=3)
