@@ -54,6 +54,65 @@ DR_MATCH = 0.4
 B_HAD_MIN_PT = 5.0
 B_HAD_ETA_CUT = 3.5            # drop forward B-hadrons (beam remnants / ISR fakes)
 HIGGS_MASS = 125.0             # reference mass for plot/summary tolerance bands
+HIGGS_TOL  = 1.0               # tolerance (GeV) for "family invariant mass = MH"
+
+
+def find_higgs_family(raw_row: dict) -> dict | None:
+    """Try the n=1..4 orphan-group strategies from inspect_b_brothers.py and
+    return the matched family (the particle indices summing to MH), the
+    strategy number, and the matched mass. Returns None if no strategy
+    yielded a family with |M - 125| < HIGGS_TOL. Deferred import to avoid
+    the import cycle (inspect_b_brothers imports load_bb_event_ids from
+    this module)."""
+    from inspect_b_brothers import strategy_n_orphan_groups
+    pdg         = np.asarray(raw_row["pdg_id"],         dtype=np.int64)
+    vp          = np.asarray(raw_row["vertex_primary"], dtype=np.int64)
+    particle_id = np.asarray(raw_row["particle_id"],    dtype=np.int64)
+    parent_id   = np.asarray(raw_row["parent_id"],      dtype=np.int64)
+    px = np.asarray(raw_row["px"], dtype=np.float64)
+    py = np.asarray(raw_row["py"], dtype=np.float64)
+    pz = np.asarray(raw_row["pz"], dtype=np.float64)
+    E  = np.asarray(raw_row["energy"], dtype=np.float64)
+    for n in (1, 2, 3, 4):
+        res = strategy_n_orphan_groups(
+            n, pdg, vp, particle_id, parent_id, px, py, pz, E,
+        )
+        if res is not None:
+            return {"strategy": n, "mass": res["mass"],
+                    "particle_idxs": list(res["particle_idxs"])}
+    return None
+
+
+def top2_b_hadrons_in_family(raw_row: dict,
+                             family_idxs: list[int]) -> list[dict]:
+    """Pick the two highest-E B-hadrons inside the matched family. Returns
+    them in the same dict format the rest of this script expects."""
+    pdg = np.asarray(raw_row["pdg_id"],   dtype=np.int64)
+    px  = np.asarray(raw_row["px"],       dtype=np.float64)
+    py  = np.asarray(raw_row["py"],       dtype=np.float64)
+    pz  = np.asarray(raw_row["pz"],       dtype=np.float64)
+    E   = np.asarray(raw_row["energy"],   dtype=np.float64)
+
+    fam = np.asarray(family_idxs, dtype=int)
+    if fam.size == 0:
+        return []
+    is_B = np.isin(np.abs(pdg[fam]), list(B_HADRON_PDGS))
+    if not is_B.any():
+        return []
+    b_local = np.where(is_B)[0]
+    b_local = b_local[np.argsort(E[fam][b_local])[::-1]][:2]
+    out: list[dict] = []
+    for li in b_local:
+        i = int(fam[li])
+        pt_i  = math.hypot(float(px[i]), float(py[i]))
+        eta_i = float(np.arcsinh(float(pz[i]) / max(pt_i, 1e-30)))
+        phi_i = math.atan2(float(py[i]), float(px[i]))
+        out.append({
+            "pdg": int(pdg[i]),
+            "pt":  pt_i, "eta": eta_i, "phi": phi_i,
+            "E":   float(E[i]),
+        })
+    return out
 
 
 def cluster_jets_event(pt, eta, phi,
@@ -474,28 +533,29 @@ def _process_single_file(file_idx: int, event_ids: list[int],
         eta = np.asarray(tp["eta"], dtype=np.float64)
         phi = np.asarray(tp["phi"], dtype=np.float64)
 
-        # 1. Get all distinct, central B-hadron directions (|η|<3.5, ΔR-clustered)
-        bhads_all = get_all_b_hadrons(raw_by_eid[eid])
-
-        # 2. Pick the two leading-pT B-hadron directions. In gg → H → bb̄,
-        #    the two Higgs daughters are usually the hardest B-hadrons in
-        #    the event; ISR/UE B-pairs are softer. This is right ~95% of
-        #    the time. The earlier "closest-to-125 GeV" heuristic failed
-        #    on boosted/asymmetric Higgs decays — when one Higgs leg sits
-        #    below an ISR B-hadron in pT, kinematics-fitting glued the
-        #    high-pT Higgs leg to the ISR B and missed the soft Higgs leg.
-        #    `get_all_b_hadrons` already returns ΔR>0.4-clustered B's sorted
-        #    by pT desc, so the first two satisfy the pair separation cut.
-        bhads = bhads_all[:2] if len(bhads_all) >= 2 else bhads_all[:1]
-        best_mass = (_mass_two_dict(bhads[0], bhads[1])
-                     if len(bhads) == 2 else 0.0)
-
+        # === New family-based identification (from inspect_b_brothers.py) ===
+        # 1. Find the Higgs decay family: try n=1..4 orphan-group strategies
+        #    until one yields a particle set whose invariant mass = MH=125.
+        family = find_higgs_family(raw_by_eid[eid])
         print(f"\n=== event {eid} ===")
         print(f"  {len(pt)} target particles  (target pT range {pt.min():.2f}-{pt.max():.2f})")
-        print(f"  found {len(bhads_all)} B-hadron candidates.")
-        if len(bhads) == 2:
-            print(f"  Selected top-2 leading-pT B-hadrons (M = {best_mass:.2f} GeV):")
-        
+        if family is None:
+            print(f"  ✗ no Higgs family identified by any strategy — skipping")
+            continue
+        family_idxs = family["particle_idxs"]
+        print(f"  ✓ Higgs family identified via strategy n={family['strategy']}  "
+              f"(M = {family['mass']:.4f} GeV, N_family = {len(family_idxs)})")
+
+        # 2. Pick the two highest-E B-hadrons FROM INSIDE that family — these
+        #    are the genuine Higgs daughters' b-quark proxies (not event-wide
+        #    leading B-hadrons, which can come from ISR / g→bb̄).
+        bhads = top2_b_hadrons_in_family(raw_by_eid[eid], family_idxs)
+        if len(bhads) < 2:
+            print(f"  fewer than 2 B-hadrons in family ({len(bhads)}) — "
+                  f"skipping (likely H→γγ/ττ/etc.)")
+            continue
+        best_mass = family["mass"]
+        print(f"  Top-2 B-hadrons inside the family (used for jet matching):")
         for k, b in enumerate(bhads, 1):
             print(f"    bH#{k}  pdg={b['pdg']:+5d}  pT={b['pt']:7.2f}  "
                   f"η={b['eta']:+.2f}  φ={b['phi']:+.2f}  E={b['E']:7.2f}")
