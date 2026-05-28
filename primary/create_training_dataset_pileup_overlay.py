@@ -1371,6 +1371,56 @@ def _run_overlay_and_aggregate(
     }
 
 
+def _chunk_worker_process(
+    ci, hs_chunk, pu, chunk_tmp_dir, pileup_level, seed,
+    clusters_cutoff, clue_backend, invisible_pu_prob, tof_enabled,
+):
+    """
+    Top-level worker for the `spawn`-context multiprocessing path used by
+    `preprocess_for_model`'s chunked branch. Receives `hs_chunk` and `pu`
+    in-memory (multiprocessing pickles them through a kernel pipe — no disk
+    I/O), runs one overlay+cluster+aggregate cycle, writes the 4 chunk output
+    parquets, exits. OS reclaims the child's address space on exit so
+    polars/mimalloc arenas don't accumulate across chunks.
+
+    Must live at module top level (not nested) for spawn to be able to
+    re-import it in the child.
+    """
+    import os
+    import sys
+    import traceback
+    import psutil
+    from pathlib import Path
+
+    sys.stdout.reconfigure(line_buffering=True)
+    sys.stderr.reconfigure(line_buffering=True)
+
+    try:
+        print(f"[CHUNK {ci+1} CHILD ALIVE] pid={os.getpid()}", flush=True)
+        child_process = psutil.Process(os.getpid())
+
+        out = _run_overlay_and_aggregate(
+            hs_chunk, pu,
+            pileup_level=pileup_level,
+            seed=seed,
+            clusters_cutoff=clusters_cutoff,
+            clue_backend=clue_backend,
+            process=child_process,
+            invisible_pu_prob=invisible_pu_prob,
+            tof_enabled=tof_enabled,
+        )
+
+        tmp = Path(chunk_tmp_dir)
+        keys = ['target_particles', 'calo_clusters', 'tracks', 'target_particles_deps']
+        for k in keys:
+            out[k].write_parquet(tmp / f'chunk_{ci:04d}_{k}.parquet')
+    except BaseException:
+        traceback.print_exc()
+        sys.stdout.flush()
+        sys.stderr.flush()
+        sys.exit(1)
+
+
 def preprocess_for_model(
     hs_particles: pl.DataFrame,
     hs_tracks: pl.DataFrame,
@@ -1450,104 +1500,75 @@ def preprocess_for_model(
         print("[PREPROCESS COMPLETE]\n")
         return result
 
-    # Chunked pass: run each chunk in a FORKED CHILD process.
+    # Chunked pass: run each chunk in a `spawn`-context multiprocessing child.
     #
-    # Why fork: polars uses mimalloc, which retains free arenas inside the
-    # process. The in-process chunk loop accumulated those arenas — chunk N+1
-    # started at chunk N's peak. malloc_trim is a no-op for mimalloc and polars
-    # exposes no purge API. The only reliable way to give pages back to the OS
-    # is process termination, which `sys_exit_group` does forcibly regardless
-    # of what mimalloc wanted to keep.
+    # Why not fork: polars uses Rayon (Rust thread pool). After fork the child
+    # inherits the pool's mutex state but NOT the worker threads themselves, so
+    # the first polars op in the child deadlocks. Documented polars limitation.
     #
-    # Fork is preferred over spawn/subprocess.run because the child inherits
-    # `hs` and `pu` via copy-on-write — zero copy, zero serialization, zero
-    # disk re-read. The parent has just returned from `_preprocess_source` so
-    # polars's thread pool is idle (safe fork point — no internal lock can be
-    # held across the syscall).
-    import os
+    # Why spawn: a clean Python interpreter in the child means Rayon initializes
+    # fresh — no deadlock. Data is handed off in-memory via multiprocessing's
+    # pickle-over-pipe (Polars frames pickle as Arrow IPC, no disk I/O for the
+    # source frames). On child exit the OS reclaims everything, including
+    # mimalloc's retained arenas — no across-chunk accumulation.
     import sys
     import tempfile
     import time
-    import traceback
-    import psutil
+    import multiprocessing as mp
     from pathlib import Path
 
     n_chunks = (n_hs + chunk_size - 1) // chunk_size
     print(f"[CHUNKING] Splitting {n_hs} HS events into {n_chunks} chunks of <= {chunk_size} "
-          f"(each chunk runs in a forked child)")
+          f"(in-memory 'spawn' multiprocessing — RAM released per chunk).")
 
     keys = ['target_particles', 'calo_clusters', 'tracks', 'target_particles_deps']
+    ctx = mp.get_context('spawn')
 
     Path(chunk_tmp_dir).mkdir(parents=True, exist_ok=True)
     with tempfile.TemporaryDirectory(prefix='clue_chunks_', dir=chunk_tmp_dir) as tmpdir:
         tmp = Path(tmpdir)
         for ci in range(n_chunks):
             chunk_ids_np = hs_event_ids_all[ci * chunk_size:(ci + 1) * chunk_size]
-            chunk_ids = pl.Series('event_id', chunk_ids_np)
+            # Python list, not pl.Series — sidesteps the polars 1.x
+            # `is_in(same-dtype-Series)` deprecation warning.
+            chunk_ids_list = chunk_ids_np.tolist()
 
-            print(f"\n[CHUNK {ci+1}/{n_chunks}] forking child for {len(chunk_ids_np)} HS events. "
+            print(f"\n[CHUNK {ci+1}/{n_chunks}] slicing {len(chunk_ids_list)} HS events in parent. "
                   f"PARENT RAM: {process.memory_info().rss / 1024 / 1024:.2f} MB")
             sys.stdout.flush()
-            sys.stderr.flush()
 
-            pid = os.fork()
-            if pid == 0:
-                # ===== CHILD =====
-                # hs/pu are inherited from the parent via COW — no copy, no I/O.
-                # Anything we allocate here is child-private and gets reclaimed
-                # by the kernel on os._exit().
-                # Line-buffer so each [...] print is visible immediately —
-                # otherwise piped stdout block-buffers until os._exit().
-                sys.stdout.reconfigure(line_buffering=True)
-                sys.stderr.reconfigure(line_buffering=True)
-                print(f"[CHUNK {ci+1} CHILD ALIVE] pid={os.getpid()}", flush=True)
-                try:
-                    hs_chunk = {
-                        'particles':                 hs['particles'].filter(pl.col('event_id').is_in(chunk_ids)),
-                        'tracks':                    hs['tracks'].filter(pl.col('event_id').is_in(chunk_ids)),
-                        'calo_hits':                 hs['calo_hits'].filter(pl.col('event_id').is_in(chunk_ids)),
-                        'particles_pid_to_vertex':   hs['particles_pid_to_vertex'].filter(pl.col('event_id').is_in(chunk_ids)),
-                        'particles_hard_scatter_ids':hs['particles_hard_scatter_ids'].filter(pl.col('event_id').is_in(chunk_ids)),
-                    }
-                    child_process = psutil.Process(os.getpid())
-                    out = _run_overlay_and_aggregate(
-                        hs_chunk, pu,
-                        pileup_level=pileup_level,
-                        seed=seed + ci,  # distinct sampling per chunk
-                        clusters_cutoff=clusters_cutoff,
-                        clue_backend=clue_backend,
-                        process=child_process,
-                        invisible_pu_prob=invisible_pu_prob,
-                        tof_enabled=tof_enabled,
-                    )
-                    for k in keys:
-                        out[k].write_parquet(tmp / f'chunk_{ci:04d}_{k}.parquet')
-                    sys.stdout.flush()
-                    sys.stderr.flush()
-                except BaseException:
-                    traceback.print_exc()
-                    sys.stdout.flush()
-                    sys.stderr.flush()
-                    os._exit(1)
-                # os._exit skips Python finalizers / atexit / gc — important so
-                # the child doesn't touch pages still shared with the parent.
-                os._exit(0)
-            else:
-                # ===== PARENT =====
-                t0 = time.perf_counter()
-                _, status = os.waitpid(pid, 0)
-                dt = time.perf_counter() - t0
-                if os.WIFEXITED(status):
-                    exit_code = os.WEXITSTATUS(status)
-                else:
-                    exit_code = -1
-                if exit_code != 0:
-                    raise RuntimeError(
-                        f"chunk {ci+1}/{n_chunks} child (pid {pid}) failed with "
-                        f"exit code {exit_code} after {dt:.1f}s"
-                    )
-                print(f"[CHUNK {ci+1}/{n_chunks} DONE] {dt:.1f}s. "
-                      f"PARENT RAM: {process.memory_info().rss / 1024 / 1024:.2f} MB")
+            # Slice the HS frames in the parent so the child only receives its
+            # own slice (much smaller than the full HS pool).
+            hs_chunk = {
+                'particles':                 hs['particles'].filter(pl.col('event_id').is_in(chunk_ids_list)),
+                'tracks':                    hs['tracks'].filter(pl.col('event_id').is_in(chunk_ids_list)),
+                'calo_hits':                 hs['calo_hits'].filter(pl.col('event_id').is_in(chunk_ids_list)),
+                'particles_pid_to_vertex':   hs['particles_pid_to_vertex'].filter(pl.col('event_id').is_in(chunk_ids_list)),
+                'particles_hard_scatter_ids':hs['particles_hard_scatter_ids'].filter(pl.col('event_id').is_in(chunk_ids_list)),
+            }
+
+            t0 = time.perf_counter()
+            p = ctx.Process(
+                target=_chunk_worker_process,
+                args=(
+                    ci, hs_chunk, pu, str(tmp), pileup_level, seed + ci,
+                    clusters_cutoff, clue_backend, invisible_pu_prob, tof_enabled,
+                ),
+            )
+            p.start()
+            # Drop the parent's reference once the child is started so we
+            # don't double-hold the chunk while the child works.
+            del hs_chunk
+            gc.collect()
+            p.join()
+            dt = time.perf_counter() - t0
+            if p.exitcode != 0:
+                raise RuntimeError(
+                    f"chunk {ci+1}/{n_chunks} child (pid {p.pid}) failed with "
+                    f"exit code {p.exitcode} after {dt:.1f}s"
+                )
+            print(f"[CHUNK {ci+1}/{n_chunks} DONE] {dt:.1f}s. "
+                  f"PARENT RAM: {process.memory_info().rss / 1024 / 1024:.2f} MB")
 
         # All chunks processed: free per-source data BEFORE reading chunks back.
         del hs, pu
@@ -2007,4 +2028,4 @@ def run_preprocessing_pipeline(
 
 
 if __name__ == "__main__":
-    run_preprocessing_pipeline(r=[0,1,2], chunk_size=50)
+    run_preprocessing_pipeline(r=[0,1,2], chunk_size=50, pu_files_per_batch=1)
