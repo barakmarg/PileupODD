@@ -793,6 +793,88 @@ def create_calo_clusters(calo_hits: pl.DataFrame) -> pl.DataFrame:
     return calo_clusters
 
 
+def _chunk_worker_process(
+    ci: int,
+    file_idx: int,
+    chunk_event_ids: list,
+    event_name: str,
+    number_of_hf_repo_files: int,
+    particle_cols: list,
+    calo_cols: list,
+    chunk_tmp_dir: str,
+    truth_eta_cut: float,
+    truth_pt_cut: float,
+    target_pt_cut: float,
+    clusters_cutoff: float,
+) -> None:
+    """
+    Top-level worker for the spawn-context chunked path used by
+    `run_preprocessing_pipeline`. Scans the HF parquet shard directly with
+    `is_in(chunk_event_ids)` predicate pushdown (same pattern as
+    analysis/load_higgs_diphoton_events.py::_fetch_one), so only the chunk's
+    events are downloaded — never the full file. Then runs the single-pass
+    pipeline on that slice, writes 4 chunk parquets, exits.
+    OS reclaims polars/mimalloc arenas on exit so memory doesn't accumulate.
+    """
+    import os, sys, time, traceback
+    from pathlib import Path
+    sys.path.insert(0, '/storage/agrp/barakma/PileupODD')
+    sys.stdout.reconfigure(line_buffering=True)
+    sys.stderr.reconfigure(line_buffering=True)
+    try:
+        import polars as pl_
+        from primary.create_trainning_dataset_pileup import preprocess_for_model
+
+        HF_RESOLVE = "https://huggingface.co/datasets/CERN/ColliderML-Release-1/resolve/main"
+
+        def _url(kind: str) -> str:
+            return (f"{HF_RESOLVE}/data/{event_name}_{kind}/"
+                    f"train-{file_idx:05d}-of-{number_of_hf_repo_files:05d}.parquet")
+
+        print(f"[CHUNK {ci+1} CHILD ALIVE] pid={os.getpid()} file={file_idx} "
+              f"n_events={len(chunk_event_ids)}", flush=True)
+        t0 = time.perf_counter()
+        eids = list(chunk_event_ids)  # plain python list — no is_in Series-dtype deprecation
+        particles = (
+            pl_.scan_parquet(_url('particles'))
+            .filter(pl_.col('event_id').is_in(eids))
+            .select(particle_cols)
+            .collect()
+        )
+        tracks = (
+            pl_.scan_parquet(_url('tracks'))
+            .filter(pl_.col('event_id').is_in(eids))
+            .collect()
+        )
+        calo_hits = (
+            pl_.scan_parquet(_url('calo_hits'))
+            .filter(pl_.col('event_id').is_in(eids))
+            .select(calo_cols)
+            .collect()
+        )
+        print(f"[CHUNK {ci+1} CHILD] HF scan done in {time.perf_counter()-t0:.1f}s "
+              f"(particles={particles.height}, tracks={tracks.height}, "
+              f"calo_hits={calo_hits.height})", flush=True)
+
+        out = preprocess_for_model(
+            particles=particles, tracks=tracks, calo_hits=calo_hits,
+            num_of_events=-1,
+            truth_eta_cut=truth_eta_cut,
+            truth_pt_cut=truth_pt_cut,
+            target_pt_cut=target_pt_cut,
+            clusters_cutoff=clusters_cutoff,
+        )
+
+        tmp = Path(chunk_tmp_dir)
+        keys = ['target_particles', 'calo_clusters', 'tracks', 'target_particles_deps']
+        for k in keys:
+            out[k].write_parquet(tmp / f'chunk_{ci:04d}_{k}.parquet')
+    except BaseException:
+        traceback.print_exc()
+        sys.stdout.flush(); sys.stderr.flush()
+        sys.exit(1)
+
+
 def preprocess_for_model(particles: pl.DataFrame, tracks: pl.DataFrame, calo_hits: pl.DataFrame,
 
                          num_of_events: int=-1,  truth_eta_cut: float=3.0, truth_pt_cut: float=1.0, target_pt_cut: float=0.3, clusters_cutoff: float=0.1) -> Dict[str,pl.DataFrame]:
@@ -1397,67 +1479,137 @@ def update_target_particles_with_vertex_info(
     print("Done.")
 
 
-def run_preprocessing_pipeline(r=None, event_name: str="ttbar_pu200", ):
+def run_preprocessing_pipeline(
+    r=None,
+    event_name: str = "ttbar_pu200",
+    chunk_size: int = -1,
+    chunk_tmp_dir: str = "/storage/agrp/barakma/PileupODD/data/tmp",
+    event_ids: dict | None = None,
+    truth_pt_cut: float = 1.0,
+    truth_eta_cut: float = 3.0,
+    target_pt_cut: float = 0.3,
+    clusters_cutoff: float = 0.15,
+):
+    """
+    Per-file preprocessing pipeline driven by spawn-context workers.
+
+    Each chunk runs in its own spawn child that HF-scans ONLY its chunk's
+    event_ids (predicate pushdown via `pl.scan_parquet(url).filter(is_in(...))`),
+    runs `preprocess_for_model`, and writes 4 chunk parquets. The parent
+    concatenates per key into `data/{event_name}/{key}-{file_idx:05d}.parquet`.
+    Spawn isolation means polars/mimalloc arenas are released at chunk
+    boundaries — RAM doesn't accumulate across chunks or files.
+
+    Args:
+      r: iterable of HF file indices to process. Used when `event_ids` is None
+         (the file's event_ids are auto-discovered by a small scan of the
+         `event_id` column). Ignored if `event_ids` is provided.
+      event_name: HF dataset prefix (e.g. 'ttbar_pu200').
+      chunk_size: max events per spawn child. <= 0 means one chunk per file
+                  (still spawned, so memory is still released after the file).
+      chunk_tmp_dir: parent for per-file temp dirs that hold chunk parquets
+                     before concat.
+      event_ids: optional explicit map {file_idx: [event_id, ...]}. When set,
+                 only those events from those files are processed (skipping the
+                 auto-discovery scan). Same scope as `r` but per-event-precise.
+    """
     from huggingface_hub import HfFileSystem
+    from pathlib import Path
+    import multiprocessing as mp
     import polars as pl
+    import psutil, os, tempfile, time, gc
     import tqdm
-    import gc
+
+    process = psutil.Process(os.getpid())
     fs = HfFileSystem()
-    if r is not None:
-        number_of_files = r
     number_of_hf_repo_files = 1000
-    for i in tqdm.tqdm(number_of_files):
-        file_path = f"datasets/CERN/ColliderML-Release-1/data/{event_name}_particles/train-{i:05d}-of-{number_of_hf_repo_files:05d}.parquet"
-        print(f"Processing file: {file_path}")
-        if not fs.exists(file_path):
-            raise FileNotFoundError(f"File not found: {file_path}")
+    HF_RESOLVE = "https://huggingface.co/datasets/CERN/ColliderML-Release-1/resolve/main"
 
-        file_path = f"datasets/CERN/ColliderML-Release-1/data/{event_name}_particles/train-{i:05d}-of-{number_of_hf_repo_files:05d}.parquet"
-        with fs.open(file_path, "rb") as f:
-            particles = pl.read_parquet(f,columns=[    'event_id',
-    'particle_id',
-    'vertex_primary',
-    'pdg_id',
-    'energy',
-    'px',
-    'py',
-    'pz',
-    'vx',
-    'vy',
-    'vz',
-    'parent_id',
-])
+    particle_cols = [
+        'event_id', 'particle_id', 'vertex_primary', 'pdg_id',
+        'energy', 'px', 'py', 'pz', 'vx', 'vy', 'vz', 'parent_id',
+    ]
+    calo_cols = [
+        'event_id', 'detector', 'total_energy', 'x', 'y', 'z',
+        'contrib_particle_ids', 'contrib_energies', 'contrib_times',
+    ]
 
+    out_dir = Path(f"/storage/agrp/barakma/PileupODD/data/{event_name}")
+    out_dir.mkdir(parents=True, exist_ok=True)
+    Path(chunk_tmp_dir).mkdir(parents=True, exist_ok=True)
+    ctx = mp.get_context('spawn')
 
-        file_path = f"datasets/CERN/ColliderML-Release-1/data/{event_name}_calo_hits/train-{i:05d}-of-{number_of_hf_repo_files:05d}.parquet"
-        with fs.open(file_path, "rb") as f:
-            calo_hits = pl.read_parquet(f,columns=    ['event_id',
-    'detector',
-    'total_energy',
-    'x',
-    'y',
-    'z',
-    'contrib_particle_ids',
-    'contrib_energies',
-     'contrib_times',
-])
+    # Build the work list: list of (file_idx, [event_ids]) pairs.
+    if event_ids is not None:
+        work = [(int(fi), list(eids)) for fi, eids in event_ids.items() if eids]
+    else:
+        if r is None:
+            raise ValueError("Must pass `r` (iterable of file indices) or `event_ids` dict.")
+        work = []
+        for file_idx in r:
+            url = (f"{HF_RESOLVE}/data/{event_name}_particles/"
+                   f"train-{int(file_idx):05d}-of-{number_of_hf_repo_files:05d}.parquet")
+            print(f"[discover] {url}")
+            eids_for_file = (
+                pl.scan_parquet(url)
+                .select('event_id')
+                .unique()
+                .sort('event_id')
+                .collect()['event_id']
+                .to_list()
+            )
+            work.append((int(file_idx), eids_for_file))
 
-        file_path = f"datasets/CERN/ColliderML-Release-1/data/{event_name}_tracks/train-{i:05d}-of-{number_of_hf_repo_files:05d}.parquet"
-        with fs.open(file_path, "rb") as f:
-            tracks = pl.read_parquet(f)
+    keys = ['target_particles', 'calo_clusters', 'tracks', 'target_particles_deps']
 
-        preprocessed_data = preprocess_for_model(particles=particles, tracks=tracks,
-                                                  calo_hits=calo_hits, num_of_events=-1, 
-                                                  truth_pt_cut=1, truth_eta_cut=3.0, target_pt_cut=0.3, clusters_cutoff=0.15)
-        
-        # write preprocessed data to local disk as parquets
-        file_path_data = f"/storage/agrp/barakma/PileupODD/data/{event_name}"
-        from pathlib import Path
-        Path(file_path_data).mkdir(parents=True, exist_ok=True)
-        for key, df in preprocessed_data.items():
-            df.write_parquet(f"{file_path_data}/{key}-{i:05d}.parquet")
-        
-        # Free memory
-        del particles, tracks, calo_hits, preprocessed_data
+    for file_idx, eids in tqdm.tqdm(work, desc="files"):
+        n_events = len(eids)
+        if chunk_size is None or chunk_size <= 0:
+            chunks = [eids]
+        else:
+            chunks = [eids[i:i + chunk_size] for i in range(0, n_events, chunk_size)]
+        n_chunks = len(chunks)
+        print(f"\n=== File {file_idx:05d}: {n_events} events → {n_chunks} chunks "
+              f"of <= {chunk_size if chunk_size and chunk_size > 0 else n_events} ===")
+
+        with tempfile.TemporaryDirectory(prefix=f'pp_chunks_{file_idx:05d}_',
+                                          dir=chunk_tmp_dir) as tmpdir:
+            tmp = Path(tmpdir)
+            for ci, chunk_eids in enumerate(chunks):
+                print(f"\n[CHUNK {ci+1}/{n_chunks}] spawning child for {len(chunk_eids)} events. "
+                      f"PARENT RAM: {process.memory_info().rss / 1024 / 1024:.2f} MB")
+                t0 = time.perf_counter()
+                p = ctx.Process(
+                    target=_chunk_worker_process,
+                    args=(
+                        ci, file_idx, chunk_eids,
+                        event_name, number_of_hf_repo_files,
+                        particle_cols, calo_cols, str(tmp),
+                        truth_eta_cut, truth_pt_cut, target_pt_cut, clusters_cutoff,
+                    ),
+                )
+                p.start()
+                p.join()
+                dt = time.perf_counter() - t0
+                if p.exitcode != 0:
+                    raise RuntimeError(
+                        f"file {file_idx:05d} chunk {ci+1}/{n_chunks} (pid {p.pid}) failed "
+                        f"with exit code {p.exitcode} after {dt:.1f}s"
+                    )
+                print(f"[CHUNK {ci+1}/{n_chunks} DONE] {dt:.1f}s. "
+                      f"PARENT RAM: {process.memory_info().rss / 1024 / 1024:.2f} MB")
+
+            # Concat chunk parquets per key → one per-file output.
+            for k in keys:
+                parts = sorted(tmp.glob(f'chunk_*_{k}.parquet'))
+                if not parts:
+                    print(f"  WARNING: no chunk outputs for {k} (file {file_idx:05d})")
+                    continue
+                merged = pl.concat([pl.read_parquet(p) for p in parts])
+                merged.write_parquet(out_dir / f"{k}-{file_idx:05d}.parquet")
+                print(f"[CONCAT {k}] {len(parts)} chunks → "
+                      f"{out_dir / f'{k}-{file_idx:05d}.parquet'}  ({merged.height} rows)")
+                del merged
+                gc.collect()
         gc.collect()
 
