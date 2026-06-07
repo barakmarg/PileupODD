@@ -1547,11 +1547,21 @@ def preprocess_for_model(
                 'particles_hard_scatter_ids':hs['particles_hard_scatter_ids'].filter(pl.col('event_id').is_in(chunk_ids_list)),
             }
 
+            # Derive a per-chunk seed that is unique across every
+            # (file_index, chunk_index) pair globally and reproducible from
+            # the (file_seed, chunk_index) inputs alone. SeedSequence mixes
+            # the two ints through a cryptographic hash, so additive
+            # collisions like `seed+ci` (where file_a's chunk_n collides
+            # with file_b's chunk_m whenever a+n == b+m) cannot occur.
+            import numpy as _np
+            chunk_seed = int(_np.random.SeedSequence(
+                entropy=int(seed), spawn_key=(int(ci),)
+            ).generate_state(1, dtype=_np.uint64)[0])
             t0 = time.perf_counter()
             p = ctx.Process(
                 target=_chunk_worker_process,
                 args=(
-                    ci, hs_chunk, pu, str(tmp), pileup_level, seed + ci,
+                    ci, hs_chunk, pu, str(tmp), pileup_level, chunk_seed,
                     clusters_cutoff, clue_backend, invisible_pu_prob, tof_enabled,
                 ),
             )
