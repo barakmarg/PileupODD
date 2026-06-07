@@ -264,14 +264,12 @@ calibrated energy each *individual* particle deposited in each cluster.
 **Step 2 — Attribute to targets** (*`cluster_purity()`* with *`backtrack_to_target()`*). Each
 contributing particle is walked up its parentage chain until it reaches a **target particle** (its
 "ultimate ancestor" in the target set). Energies are then summed per (event, cluster, target),
-yielding:
-
-- `total_energy_deps_in_cluster` — energy that target deposited in that cluster;
-- `total_energy_deps` — that target's total deposited energy across all clusters;
-- `purity = total_energy_deps_in_cluster / total_energy_deps`.
-
-This per-(cluster, target) table is written as `target_particles_deps` and is exactly the
-information from which the model builds its column-normalised particle↔node incidence matrix.
+yielding internally `total_energy_deps_in_cluster` (energy that target deposited in that cluster),
+`total_energy_deps` (the target's total across all clusters) and `purity = in_cluster / total`. Of
+these, **only `total_energy_deps_in_cluster`** is kept in the written file, paired with the target's
+`particle_idx` and the `cluster_idx` — i.e. a sparse list of `(particle, cluster, energy)` triplets.
+This per-(cluster, target) deposit is exactly the information from which the model builds its
+column-normalised particle↔node incidence matrix.
 
 **Step 3 — Per-cluster hard-scatter vs pileup split**
 (*`cluster_vertex_primary_deps()`*, `preprocessing.py`). The same calibrated contribution energies
@@ -342,18 +340,150 @@ narrow showers.
 
 ---
 
-## 9. Output Tables
+## 9. Output Tables — Exact Schema & Examples
 
 Four Parquet files are written per shard (assembled in *`preprocess_for_model()`*, finalised by
-*`filter_orphans_and_reindex()`*). Particle/track/cluster quantities are stored as per-event list
-columns; the deposits table is flat.
+*`filter_orphans_and_reindex()`*). **Every file uses one row per event**, with the per-object
+quantities stored as equal-length **`List` columns** (element *i* across the lists describes object
+*i*); nested `List(List(...))` columns hold per-object variable-length lists. Energies are in GeV
+with calorimeter calibration applied (§6). The schemas and example values below are taken directly
+from a real shard (`ggf_pu200/…-00000.parquet`); list columns are shown truncated to the first few
+elements.
 
-| Table | Contents (per target particle / cluster / track / deposit) |
-|---|---|
-| **`target_particles`** | `particle_id`, `pdg_id`, `energy`, `eta`, `phi`, `px,py,pz`, `pt`, `has_track`, `vertex_primary`, production vertex `vx,vy,vz` |
-| **`calo_clusters`** | the §8.2 cluster features, plus per-cluster `vertex_primary_indices` / `vertex_primary_energies` (HS-vs-pileup energy split from §7) |
-| **`tracks`** | the §8.1 track variables, with the matched `majority_particle_id` (and its `vertex_primary`) |
-| **`target_particles_deps`** | flat per (cluster, target): `cluster_idx`, `ultimate_ancestor_id` (the target), `total_energy_deps_in_cluster`, `total_energy_deps`, `purity` |
+Index conventions used across the tables:
+- `particle_idx` — contiguous 0…N−1 index of a **target particle** within the event (the canonical
+  particle handle used by the model and the deposits table).
+- `cluster_idx` — contiguous 0…M−1 index of a **cluster** within the event (matches the order of
+  the `calo_clusters` lists).
+- In `tracks`, `particle_idx = −1` flags a track whose majority particle is **not** a target
+  (i.e. a pileup/secondary track); `vx/vy/vz/particle_pt` are then null.
+
+### 9.1 `target_particles` — one entry per selected hard-scatter target particle
+
+| Column | Dtype | Meaning |
+|---|---|---|
+| `event_id` | `UInt32` | event identifier (scalar) |
+| `particle_id` | `List(UInt64)` | original simulation particle id |
+| `particle_idx` | `List(UInt32)` | contiguous per-event target index (0…N−1) |
+| `pdg_id` | `List(Int64)` | PDG code |
+| `energy` | `List(Float32)` | truth energy [GeV] |
+| `pt` | `List(Float32)` | transverse momentum [GeV] |
+| `eta`, `phi` | `List(Float32)` | direction |
+| `px, py, pz` | `List(Float32)` | momentum components [GeV] |
+| `has_track` | `List(Boolean)` | whether a reconstructed track is matched |
+| `vertex_primary` | `List(UInt16)` | vertex id (≡ 1 for these HS targets) |
+| `vx, vy, vz` | `List(Float32)` | production vertex [mm] |
+
+**Example (event 1, 187 target particles):**
+```
+event_id       = 1
+particle_id    = [209, 228, 251, 382, …]
+particle_idx   = [0,   1,   2,   3,   …]
+pdg_id         = [-321, -211, 321, 22, …]      # K-, pi-, K+, photon
+energy         = [4.160, 10.164, 3.910, 0.786, …]   GeV
+pt             = [3.979, 1.435, 0.610, 0.748, …]    GeV
+eta            = [0.275, -2.646, 2.537, 0.321, …]
+phi            = [0.880, -0.810, -0.493, 0.343, …]
+has_track      = [True, True, True, False, …]       # photon (382) has no track
+vertex_primary = [1, 1, 1, 1, …]
+vx,vy,vz       = [-0.0095, -0.0024, -78.697, …]     mm   (shared HS vertex)
+```
+
+### 9.2 `calo_clusters` — one entry per CLUE cluster
+
+| Column | Dtype | Meaning |
+|---|---|---|
+| `event_id` | `UInt32` | event identifier (scalar) |
+| `cluster_id` | `List(Int32)` | CLUE cluster id (per-event) |
+| `total_cluster_energy` | `List(Float64)` | calibrated cluster energy [GeV] |
+| `hcal_energy` | `List(Float64)` | calibrated energy in HCAL cells [GeV] |
+| `hcal_fraction` | `List(Float64)` | `hcal_energy / total_cluster_energy` |
+| `cluster_eta`, `cluster_phi` | `List(Float32)` | centroid direction |
+| `cluster_rho` | `List(Float32)` | centroid transverse radius [mm] |
+| `sigma_eta`, `sigma_phi`, `sigma_rho` | `List(Float32)` | shower-shape widths |
+| `number_of_hits` | `List(UInt32)` | cell multiplicity |
+| `energy_hits_std` | `List(Float64)` | std of per-cell energy [GeV] |
+| `max_hit_energy` | `List(Float64)` | hottest cell energy [GeV] |
+| `cluster_time` | `List(Float64)` | cluster time [ns] — **not used by the network** |
+| `vertex_primary_indices` | `List(List(UInt16))` | per-cluster list of contributing vertex ids |
+| `vertex_primary_energies` | `List(List(Float32))` | matching calibrated energy per vertex [GeV] |
+
+The paired `vertex_primary_indices`/`vertex_primary_energies` give the HS-vs-pileup energy split per
+cluster (the entry with vertex id 1 is the hard-scatter energy; see §7).
+
+**Example (event 1, 4261 clusters):**
+```
+cluster_id              = [0, 1, 2, 3, …]
+total_cluster_energy    = [3.053, 0.614, 1.760, 2.199, …]   GeV
+hcal_energy             = [0.0, 0.0, 1.760, 2.199, …]       GeV
+hcal_fraction           = [0.0, 0.0, 1.0, 1.0, …]           # 0 = pure ECAL, 1 = pure HCAL
+cluster_eta             = [-1.321, 0.825, 2.101, -2.339, …]
+cluster_phi             = [-1.296, 2.634, -2.198, -1.342, …]
+cluster_rho             = [1284.8, 1416.8, 1017.5, 749.3, …]  mm
+sigma_eta               = [0.0243, 0.0048, 0.0483, 0.0478, …]
+number_of_hits          = [125, 41, 18, 22, …]
+max_hit_energy          = [0.475, 0.136, 0.525, 0.886, …]    GeV
+vertex_primary_indices  = [[1, 35, 50], [51, 83], [3, 91, 92], …]
+vertex_primary_energies = [[1.072, 0.545, 0.108], [0.004, 0.610], [0.006, 0.017, 0.913], …]  GeV
+#   → cluster 0 received 1.072 GeV from the hard scatter (vertex 1) plus pileup from vertices 35, 50
+```
+
+### 9.3 `tracks` — one entry per reconstructed track (HS **and** pileup)
+
+| Column | Dtype | Meaning |
+|---|---|---|
+| `event_id` | `UInt32` | event identifier (scalar) |
+| `track_id` | `List(UInt16)` | track id |
+| `d0`, `z0` | `List(Float32)` | impact parameters [mm] |
+| `phi`, `theta`, `qop` | `List(Float32)` | raw perigee fit parameters |
+| `pt`, `eta` | `List(Float32)` | derived kinematics [GeV], — |
+| `track_tanlambda` | `List(Float32)` | `cot θ` |
+| `track_omega` | `List(Float32)` | signed curvature [1/mm] |
+| `phi_int`, `eta_int` | `List(Float32)` | extrapolated calorimeter-face direction |
+| `hit_ids` | `List(List(UInt32))` | tracker hit ids on the track |
+| `vertex_primary` | `List(UInt16)` | vertex id of the track's majority particle |
+| `particle_id` | `List(Int64)` | majority simulation particle id |
+| `particle_idx` | `List(Int64)` | matched **target** index, or `−1` if not a target (pileup) |
+| `particle_pt` | `List(Float32)` | matched target's pT [GeV]; null if `particle_idx = −1` |
+| `vx, vy, vz` | `List(Float32)` | matched target's production vertex; null if `particle_idx = −1` |
+
+**Example (event 1, 1103 tracks):**
+```
+track_id        = [1, 2, 6, 8, …]
+d0              = [-0.143, 0.031, 0.052, 0.003, …]   mm
+z0              = [-131.40, -8.98, 49.10, -131.57, …] mm
+phi             = [-3.001, -3.049, -2.982, -3.019, …]
+theta           = [0.265, 0.582, 3.022, 0.962, …]
+qop             = [0.180, -0.418, 0.117, 0.773, …]
+pt              = [1.458, 1.315, 1.021, 1.061, …]     GeV
+eta             = [2.014, 1.206, -2.815, 0.650, …]
+track_tanlambda = [3.679, 1.520, -8.316, 0.697, …]
+track_omega     = [6.17e-4, -6.84e-4, 8.81e-4, 8.49e-4, …]  1/mm
+vertex_primary  = [100, 87, 32, 100, …]               # all pileup in this head slice
+particle_idx    = [-1, -1, -1, -1, …]                 # → not target particles
+particle_id     = [52402, 47567, 13371, 53792, …]
+```
+
+### 9.4 `target_particles_deps` — sparse particle↔cluster energy deposits
+
+The incidence ground truth, stored as three parallel `List` columns (one row per event); element
+*k* says target `particle_idx[k]` deposited `total_energy_deps_in_cluster[k]` GeV into cluster
+`cluster_idx[k]`.
+
+| Column | Dtype | Meaning |
+|---|---|---|
+| `event_id` | `UInt32` | event identifier (scalar) |
+| `particle_idx` | `List(UInt32)` | target particle index (matches `target_particles.particle_idx`) |
+| `cluster_idx` | `List(UInt32)` | cluster index (matches `calo_clusters` order) |
+| `total_energy_deps_in_cluster` | `List(Float32)` | calibrated energy this target put in this cluster [GeV] |
+
+**Example (event 1, 1022 nonzero deposits):**
+```
+particle_idx                 = [9,    30,   95,    85,    68,   66,  …]
+cluster_idx                  = [0,    0,    5,     5,     16,   16,  …]
+total_energy_deps_in_cluster = [0.537, 0.535, 0.208, 0.033, 6.800, 0.157, …]   GeV
+#   → cluster 0 shares energy between targets 9 and 30; cluster 16 is dominated by target 68 (6.8 GeV)
+```
 
 ---
 
