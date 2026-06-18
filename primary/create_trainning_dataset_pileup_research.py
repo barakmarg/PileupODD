@@ -1451,11 +1451,100 @@ def run_preprocessing_pipeline(r=None, event_name: str="ttbar_pu200", ):
         gc.collect()
 
 
+def _read_parquet_with_retry(fs, file_path, columns=None, max_retries=3, wait_seconds=60):
+    """
+    Read a parquet from the HF filesystem with retries on transient download
+    failures (e.g. httpx.ReadTimeout, surfaced by polars as a PanicException).
+
+    Retries up to `max_retries` times, waiting `wait_seconds` between attempts.
+    On the final failure it prints an info message and exits the process.
+    """
+    import sys
+    import time
+    import polars as pl
+
+    for attempt in range(1, max_retries + 1):
+        try:
+            with fs.open(file_path, "rb") as f:
+                if columns is not None:
+                    return pl.read_parquet(f, columns=columns)
+                return pl.read_parquet(f)
+        except (KeyboardInterrupt, SystemExit):
+            raise
+        except BaseException as e:
+            print(
+                f"[DOWNLOAD RETRY] Attempt {attempt}/{max_retries} failed reading "
+                f"{file_path}: {type(e).__name__}: {e}",
+                flush=True,
+            )
+            if attempt < max_retries:
+                print(
+                    f"[DOWNLOAD RETRY] Waiting {wait_seconds}s before retrying...",
+                    flush=True,
+                )
+                time.sleep(wait_seconds)
+            else:
+                print(
+                    f"[DOWNLOAD FAILED] Giving up after {max_retries} attempts on "
+                    f"{file_path}. Exiting.",
+                    flush=True,
+                )
+                sys.exit(1)
+
+
+def _research_chunk_worker_process(
+    ci, particles_chunk, tracks_chunk, calo_hits_chunk, chunk_tmp_dir,
+):
+    """
+    Top-level worker for the `spawn`-context multiprocessing path used by
+    `run_preprocessing_pipeline_all_vertices_chunked`. Receives the chunk's
+    three frames in-memory (multiprocessing pickles them through a kernel pipe
+    — no disk I/O), runs one all-vertices preprocess cycle, writes the 4 chunk
+    output parquets, exits. OS reclaims the child's address space on exit so
+    polars/mimalloc arenas don't accumulate across chunks.
+
+    Must live at module top level (not nested) for spawn to be able to
+    re-import it in the child.
+    """
+    import os
+    import sys
+    import traceback
+    from pathlib import Path
+
+    sys.stdout.reconfigure(line_buffering=True)
+    sys.stderr.reconfigure(line_buffering=True)
+
+    try:
+        print(f"[CHUNK {ci+1} CHILD ALIVE] pid={os.getpid()}", flush=True)
+
+        out = preprocess_for_model(
+            particles=particles_chunk,
+            tracks=tracks_chunk,
+            calo_hits=calo_hits_chunk,
+            num_of_events=-1,
+            truth_pt_cut=1,
+            truth_eta_cut=3.0,
+            target_pt_cut=0.3,
+            clusters_cutoff=0.15,
+        )
+
+        tmp = Path(chunk_tmp_dir)
+        keys = ['target_particles', 'calo_clusters', 'tracks', 'target_particles_deps']
+        for k in keys:
+            out[k].write_parquet(tmp / f'chunk_{ci:04d}_{k}.parquet')
+    except BaseException:
+        traceback.print_exc()
+        sys.stdout.flush()
+        sys.stderr.flush()
+        sys.exit(1)
+
+
 def run_preprocessing_pipeline_all_vertices_chunked(
     r=None,
     event_name: str="ttbar_pu200",
     chunk_size: int=3,
     output_dir: str="",
+    chunk_tmp_dir: str="",
 ):
     """
     Research pipeline: process ALL vertices (no primary-vertex filter),
@@ -1468,6 +1557,9 @@ def run_preprocessing_pipeline_all_vertices_chunked(
     import polars as pl
     import tqdm
     import gc
+    import time
+    import tempfile
+    import multiprocessing as mp
     from pathlib import Path
 
     fs = HfFileSystem()
@@ -1478,8 +1570,18 @@ def run_preprocessing_pipeline_all_vertices_chunked(
         number_of_files = range(number_of_hf_repo_files)
 
     if not output_dir:
-        output_dir = f"/storage/agrp/barakma/PileupODD/data/{event_name}_all_vertices_chunked"
+        output_dir = f"/storage/agrp/barakma/PileupODD/data/{event_name}_all_vertices_paper"
     Path(output_dir).mkdir(parents=True, exist_ok=True)
+
+    # Temp dir for per-chunk parquets written by spawn children. Default to the
+    # output dir's parent so they land on the same fast storage.
+    if not chunk_tmp_dir:
+        chunk_tmp_dir = str(Path(output_dir).parent)
+    Path(chunk_tmp_dir).mkdir(parents=True, exist_ok=True)
+
+    # `spawn` (not fork): polars' Rayon thread pool deadlocks after fork because
+    # the child inherits the pool's mutex state but not its worker threads.
+    ctx = mp.get_context('spawn')
 
     for i in tqdm.tqdm(number_of_files):
         file_path = f"datasets/CERN/ColliderML-Release-1/data/{event_name}_particles/train-{i:05d}-of-{number_of_hf_repo_files:05d}.parquet"
@@ -1487,39 +1589,36 @@ def run_preprocessing_pipeline_all_vertices_chunked(
         if not fs.exists(file_path):
             raise FileNotFoundError(f"File not found: {file_path}")
 
-        with fs.open(file_path, "rb") as f:
-            particles = pl.read_parquet(f, columns=[
-                'event_id',
-                'particle_id',
-                'vertex_primary',
-                'pdg_id',
-                'energy',
-                'px',
-                'py',
-                'pz',
-                'vx',
-                'vy',
-                'vz',
-                'parent_id',
-            ])
+        particles = _read_parquet_with_retry(fs, file_path, columns=[
+            'event_id',
+            'particle_id',
+            'vertex_primary',
+            'pdg_id',
+            'energy',
+            'px',
+            'py',
+            'pz',
+            'vx',
+            'vy',
+            'vz',
+            'parent_id',
+        ])
 
         file_path = f"datasets/CERN/ColliderML-Release-1/data/{event_name}_calo_hits/train-{i:05d}-of-{number_of_hf_repo_files:05d}.parquet"
-        with fs.open(file_path, "rb") as f:
-            calo_hits = pl.read_parquet(f, columns=[
-                'event_id',
-                'detector',
-                'total_energy',
-                'x',
-                'y',
-                'z',
-                'contrib_particle_ids',
-                'contrib_energies',
-                'contrib_times',
-            ])
+        calo_hits = _read_parquet_with_retry(fs, file_path, columns=[
+            'event_id',
+            'detector',
+            'total_energy',
+            'x',
+            'y',
+            'z',
+            'contrib_particle_ids',
+            'contrib_energies',
+            'contrib_times',
+        ])
 
         file_path = f"datasets/CERN/ColliderML-Release-1/data/{event_name}_tracks/train-{i:05d}-of-{number_of_hf_repo_files:05d}.parquet"
-        with fs.open(file_path, "rb") as f:
-            tracks = pl.read_parquet(f)
+        tracks = _read_parquet_with_retry(fs, file_path)
 
         event_ids = particles.get_column("event_id").unique().to_list()
         event_ids.sort()
@@ -1549,49 +1648,61 @@ def run_preprocessing_pipeline_all_vertices_chunked(
             del particles_chunk, tracks_chunk, calo_hits_chunk, preprocessed_data
             gc.collect()
         else:
-            chunk_paths: Dict[str, list] = {}
-            for offset in tqdm.tqdm(
-                range(0, len(event_ids), chunk_size),
-                desc=f"chunks file {i:05d}",
-                total=total_chunks,
-            ):
-                chunk_ids = event_ids[offset:offset + chunk_size]
-                if not chunk_ids:
-                    continue
+            # Chunked pass: run each chunk in a `spawn`-context child so the OS
+            # reclaims polars/mimalloc arenas per chunk (RAM released between
+            # chunks instead of accumulating in one long-lived process).
+            keys = ['target_particles', 'calo_clusters', 'tracks', 'target_particles_deps']
+            with tempfile.TemporaryDirectory(prefix='research_chunks_', dir=chunk_tmp_dir) as tmpdir:
+                tmp = Path(tmpdir)
+                for offset in tqdm.tqdm(
+                    range(0, len(event_ids), chunk_size),
+                    desc=f"chunks file {i:05d}",
+                    total=total_chunks,
+                ):
+                    chunk_ids = event_ids[offset:offset + chunk_size]
+                    if not chunk_ids:
+                        continue
 
-                chunk_idx = offset // chunk_size
-                particles_chunk = particles.filter(pl.col("event_id").is_in(chunk_ids))
-                tracks_chunk = tracks.filter(pl.col("event_id").is_in(chunk_ids))
-                calo_hits_chunk = calo_hits.filter(pl.col("event_id").is_in(chunk_ids))
+                    chunk_idx = offset // chunk_size
+                    # Slice the chunk's frames in the parent so the child only
+                    # receives its own (small) slice.
+                    particles_chunk = particles.filter(pl.col("event_id").is_in(chunk_ids))
+                    tracks_chunk = tracks.filter(pl.col("event_id").is_in(chunk_ids))
+                    calo_hits_chunk = calo_hits.filter(pl.col("event_id").is_in(chunk_ids))
 
-                preprocessed_data = preprocess_for_model(
-                    particles=particles_chunk,
-                    tracks=tracks_chunk,
-                    calo_hits=calo_hits_chunk,
-                    num_of_events=-1,
-                    truth_pt_cut=1,
-                    truth_eta_cut=3.0,
-                    target_pt_cut=0.3,
-                    clusters_cutoff=0.15,
-                )
+                    t0 = time.perf_counter()
+                    p = ctx.Process(
+                        target=_research_chunk_worker_process,
+                        args=(chunk_idx, particles_chunk, tracks_chunk, calo_hits_chunk, str(tmp)),
+                    )
+                    p.start()
+                    # Drop the parent's reference once the child is started so we
+                    # don't double-hold the chunk while the child works.
+                    del particles_chunk, tracks_chunk, calo_hits_chunk
+                    gc.collect()
+                    p.join()
+                    dt = time.perf_counter() - t0
+                    if p.exitcode != 0:
+                        raise RuntimeError(
+                            f"file {i:05d} chunk {chunk_idx} child (pid {p.pid}) failed "
+                            f"with exit code {p.exitcode} after {dt:.1f}s"
+                        )
 
-                suffix = f"{i:05d}-chunk{chunk_idx:03d}"
-                for key, df in preprocessed_data.items():
-                    chunk_path = f"{output_dir}/{key}-{suffix}.parquet"
-                    df.write_parquet(chunk_path)
-                    if key not in chunk_paths:
-                        chunk_paths[key] = []
-                    chunk_paths[key].append(chunk_path)
-
-                del particles_chunk, tracks_chunk, calo_hits_chunk, preprocessed_data
+                # All chunks processed: free the file-level frames BEFORE
+                # reading chunks back.
+                del particles, tracks, calo_hits
                 gc.collect()
 
-            for key, paths in chunk_paths.items():
-                merged_path = f"{output_dir}/{key}-{i:05d}.parquet"
-                merged = pl.scan_parquet(paths).collect(streaming=True)
-                merged.write_parquet(merged_path)
-                for chunk_path in paths:
-                    Path(chunk_path).unlink()
+                # Read chunks per-key, concat, then delete files to release disk early.
+                for key in keys:
+                    parts = sorted(tmp.glob(f'chunk_*_{key}.parquet'))
+                    merged = pl.concat([pl.read_parquet(p) for p in parts])
+                    merged.write_parquet(f"{output_dir}/{key}-{i:05d}.parquet")
+                    del merged
+                    for part in parts:
+                        part.unlink()
+                    gc.collect()
+            continue
 
         del particles, tracks, calo_hits
         gc.collect()

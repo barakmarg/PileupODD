@@ -43,6 +43,7 @@ from inspect_hbb_top_bottoms import (  # noqa: E402
     DR_MATCH,
     cluster_jets_event, match_b_to_jets, _delta_r, _wrap_phi,
     find_higgs_family, top2_b_hadrons_in_family,
+    get_neutrinos_vp1, sum_neutrinos_in_cone,
 )
 
 DEFAULT_H5 = ("/storage/agrp/barakma/hepattn/src/hepattn/experiments/"
@@ -140,12 +141,18 @@ def analyze_event(eid: int, raw_row: dict, h5_event: dict) -> dict | None:
     result: dict = {"event_id": eid, "strategy": family["strategy"],
                     "family_mass": family["mass"]}
 
+    # Pull truth neutrinos (vp=1, |pdg|∈{12,14,16}) once per event. The same
+    # truth-ν 4-momenta are added to both pred and truth jets — that's the
+    # "ideal MET-allocated-to-jets" correction for both paths.
+    nus = get_neutrinos_vp1(raw_row)
+
     for label in ("pred", "truth"):
         pt, eta, phi = h5_event[label]
         # Initialise per-ΔR result keys to None so downstream code can rely
         # on every key existing even if this pass skips.
         for dr in DR_MATCH_VALUES:
-            result[f"{label}_mjj_dr{dr}"] = None
+            result[f"{label}_mjj_dr{dr}"]    = None
+            result[f"{label}_mjj_nu_dr{dr}"] = None
         if len(pt) < MIN_CONSTITUENTS:
             print(f"    [{label:5s}] < {MIN_CONSTITUENTS} particles → "
                   f"no jets, skipping")
@@ -155,13 +162,17 @@ def analyze_event(eid: int, raw_row: dict, h5_event: dict) -> dict | None:
             j["phi"] = _wrap_phi(j["phi"])
         print(f"    [{label:5s}] {len(pt)} H5 particles → {len(jets)} jets")
         # One match + dijet mass per ΔR cut. Jets are clustered ONCE; only
-        # the ghost-match radius changes.
-        mass_str = []
+        # the ghost-match radius changes. We also compute a ν-corrected
+        # variant: add in-cone (ΔR < JET_R) truth neutrinos to each
+        # matched jet's 4-momentum before computing M(jj).
+        mass_str    = []
+        mass_str_nu = []
         for dr_cut in DR_MATCH_VALUES:
             matches = match_b_to_jets(bhads, jets, dr_cut=dr_cut)
             if (len(matches) == 2 and all(m is not None for m in matches)
                     and matches[0] != matches[1]):
                 j1, j2 = jets[matches[0]], jets[matches[1]]
+                # visible dijet mass
                 E_s  = j1["E"]  + j2["E"]
                 px_s = j1["px"] + j2["px"]
                 py_s = j1["py"] + j2["py"]
@@ -171,9 +182,25 @@ def analyze_event(eid: int, raw_row: dict, h5_event: dict) -> dict | None:
                 )))
                 result[f"{label}_mjj_dr{dr_cut}"] = mjj
                 mass_str.append(f"@ΔR<{dr_cut}: {mjj:7.2f}")
+
+                # ν-corrected: add the in-cone (ΔR<JET_R) ν 4-momentum
+                # of each matched jet's axis to that jet.
+                nu1 = sum_neutrinos_in_cone(nus, j1["eta"], j1["phi"], dR=JET_R)
+                nu2 = sum_neutrinos_in_cone(nus, j2["eta"], j2["phi"], dR=JET_R)
+                E_c  = E_s  + nu1["E"]  + nu2["E"]
+                px_c = px_s + nu1["px"] + nu2["px"]
+                py_c = py_s + nu1["py"] + nu2["py"]
+                pz_c = pz_s + nu1["pz"] + nu2["pz"]
+                mjj_nu = float(math.sqrt(max(
+                    E_c * E_c - (px_c * px_c + py_c * py_c + pz_c * pz_c), 0.0
+                )))
+                result[f"{label}_mjj_nu_dr{dr_cut}"] = mjj_nu
+                mass_str_nu.append(f"@ΔR<{dr_cut}: {mjj_nu:7.2f}")
             else:
                 mass_str.append(f"@ΔR<{dr_cut}:    ---")
-        print(f"       → dijet M(bj,b̄j) per ΔR:  " + "   ".join(mass_str))
+                mass_str_nu.append(f"@ΔR<{dr_cut}:    ---")
+        print(f"       → dijet M(bj,b̄j) per ΔR:        " + "   ".join(mass_str))
+        print(f"       → dijet M+ν per ΔR (truth ν):   " + "   ".join(mass_str_nu))
     return result
 
 
@@ -226,9 +253,16 @@ def print_summary(results: list[dict]) -> None:
                   f"{s['in_20']}/{n} ({s['in_20']/n:.0%})")
 
 
-def plot_dijet_histograms(results: list[dict], out_path: Path) -> None:
+def plot_dijet_histograms(results: list[dict], out_path: Path,
+                          mass_key_fmt: str = "{source}_mjj_dr{dr}",
+                          title_suffix: str = "") -> None:
     """Two-panel figure (pred top, truth bottom) with one overlaid step
-    histogram per ΔR cut, plus a vertical line at MH = 125 GeV."""
+    histogram per ΔR cut, plus a vertical line at MH = 125 GeV.
+
+    `mass_key_fmt` selects which per-event mass to plot. Defaults to the
+    visible dijet mass. Pass "{source}_mjj_nu_dr{dr}" for the ν-corrected
+    variant.
+    """
     import matplotlib
     matplotlib.use("Agg")
     import matplotlib.pyplot as plt
@@ -242,8 +276,8 @@ def plot_dijet_histograms(results: list[dict], out_path: Path) -> None:
     for ax, source in zip(axes, ("pred", "truth")):
         any_data = False
         for dr, color in zip(DR_MATCH_VALUES, colors):
-            arr = np.array([r[f"{source}_mjj_dr{dr}"] for r in results
-                            if r.get(f"{source}_mjj_dr{dr}") is not None])
+            key = mass_key_fmt.format(source=source, dr=dr)
+            arr = np.array([r[key] for r in results if r.get(key) is not None])
             if arr.size == 0:
                 continue
             any_data = True
@@ -254,8 +288,11 @@ def plot_dijet_histograms(results: list[dict], out_path: Path) -> None:
         ax.axvline(HIGGS_MASS, color="crimson", linestyle="--", linewidth=1.4,
                    label=f"M_H = {HIGGS_MASS:.1f} GeV")
         ax.set_ylabel("events")
-        ax.set_title(f"{'PFLOW (pred)' if source == 'pred' else 'truth target'} "
-                     f"jets — H→bb̄ dijet mass per ΔR")
+        title = (f"{'PFLOW (pred)' if source == 'pred' else 'truth target'} "
+                 f"jets — H→bb̄ dijet mass per ΔR")
+        if title_suffix:
+            title += f"  {title_suffix}"
+        ax.set_title(title)
         ax.legend(loc="upper right", fontsize=9)
         ax.grid(True, alpha=0.3)
         if not any_data:
@@ -315,7 +352,16 @@ def main():
                 all_results.append(res)
 
     print_summary(all_results)
-    plot_dijet_histograms(all_results, Path(args.plot_out))
+    plot_out = Path(args.plot_out)
+    # Visible-only plot (existing behaviour)
+    plot_dijet_histograms(all_results, plot_out,
+                          mass_key_fmt="{source}_mjj_dr{dr}")
+    # ν-corrected plot: same layout, but each jet has its in-cone truth
+    # neutrinos added back to its 4-momentum before computing M(jj).
+    nu_path = plot_out.with_name(plot_out.stem + "_nu" + plot_out.suffix)
+    plot_dijet_histograms(all_results, nu_path,
+                          mass_key_fmt="{source}_mjj_nu_dr{dr}",
+                          title_suffix="(+ in-cone truth ν)")
 
 
 if __name__ == "__main__":
