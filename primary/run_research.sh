@@ -14,8 +14,9 @@ export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
 #
 # START..END are positions into FILE_INDICES (END exclusive). Override via args:
 #   ./run_research.sh 0 6   -> process FILE_INDICES[0], [1], ..., [5]
-START=${1:-2}
+START=${1:-0}
 END=${2:-100}
+#qsub -o output.log -e error.log -q N -N ggf-allvert -l walltime=72:00:00,mem=40gb,ncpus=16,ngpus=1,io=0.1,gputype=A6000 run_research.sh
 
 for ((idx=START; idx<END; idx++)); do
     echo "=== [run_research.sh] Processing FILE_INDICES position ${idx} ==="

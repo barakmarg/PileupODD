@@ -559,27 +559,51 @@ def filter_orphans_and_reindex(
                                         ).collect(streaming=True)
     
     # 7. Update tracks : change particle id to particle idx
+    # `particle_id` is event-local and reused across source events; after overlay
+    # HS+PU tracks share the HS event_id, so a pileup track whose majority_particle_id
+    # collides with an HS target particle's id would join to a valid HS particle_idx
+    # and get spuriously wired to a hard-scatter particle (~45% of incidence links).
+    # When `source_pileup_event_id` is present (overlay output, non-null on pileup
+    # tracks), force those tracks to the -1 pileup sentinel so particle_idx >= 0
+    # becomes a clean HS-track flag. Guarded so the function still works for any
+    # non-overlay caller lacking the column.
+    has_pu_src = 'source_pileup_event_id' in tracks.columns
+    mapping_cols = ['event_id', 'majority_particle_id']
+    explode_cols = ['majority_particle_id', 'local_order']
+    if has_pu_src:
+        mapping_cols.append('source_pileup_event_id')
+        explode_cols.append('source_pileup_event_id')
+
+    if has_pu_src:
+        particle_idx_expr = (
+            pl.when(pl.col('source_pileup_event_id').is_not_null())
+            .then(pl.lit(-1))
+            .otherwise(pl.col('particle_idx').fill_null(-1))
+            .alias('particle_idx')
+        )
+    else:
+        # Mark tracks that lost their particle mapping (orphans) with -1.
+        particle_idx_expr = pl.col('particle_idx').fill_null(-1)
+
     tracks_mappings = (
         tracks.lazy()
-        .select(['event_id', 'majority_particle_id'])
+        .select(mapping_cols)
         .with_columns(
             # FIX: Use 'int_ranges' (plural) to generate a range for every row
             local_order=pl.int_ranges(
                 start=0,
-                end=pl.col('majority_particle_id').list.len(), 
+                end=pl.col('majority_particle_id').list.len(),
                 dtype=pl.UInt32
             )
         )
-        .explode(['majority_particle_id', 'local_order'])
+        .explode(explode_cols)
         .rename({'majority_particle_id': 'particle_id'})
         .join(
             particle_mapping,
             on=['event_id', 'particle_id'],
             how='left'
         )
-        .with_columns(
-            pl.col('particle_idx').fill_null(-1) # Mark tracks that lost their particle mapping (orphans) with -1
-        )
+        .with_columns(particle_idx_expr)
         .group_by('event_id', maintain_order=True)
         .agg([
             pl.col('particle_idx').sort_by('local_order'),
