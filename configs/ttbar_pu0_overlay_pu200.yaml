@@ -1,0 +1,58 @@
+# Synthetic PU200: ttbar at PU0 with Poisson(200) pileup events overlaid.
+#
+# Decouples the hard-scatter process from the pileup level, so the same events
+# can be studied at several pileup levels and the pileup content of every
+# cluster is exactly known. Reproduces data/ttbar_pu0_overlay_pu200 on master.
+#
+# Note the vertex policy: overlay is hard_scatter plus an overlay stage, so its
+# hard-scatter side keeps only vertex_primary == 1 (a no-op on PU0 input, where
+# every particle already sits on the single primary vertex).
+mode: overlay
+
+dataset:
+  repo: CERN/ColliderML-Release-1
+  shards_total: 1000
+  event_name: ttbar_pu0
+  file_indices: {range: [0, 100]}
+  max_events_per_file: null
+
+overlay:
+  pu_event_name: pileup_only_pu0
+  # Shared sampling pool. Every hard-scatter shard in the run draws from these
+  # same shards, which mixes pileup across shards instead of pairing them 1:1.
+  pu_file_indices: [0, 1, 2]
+  pu_max_events: null
+  pileup_level: 200
+  # Per-shard seed is seed + shard_index, and each chunk hashes that with its
+  # chunk index, so a run is reproducible from this one number.
+  seed: 42
+  # Fraction of pileup draws contributing nothing, modelling diffractive
+  # events that miss the detector. 0.19 is the measured value; 0.0 keeps the
+  # original behaviour.
+  invisible_pu_prob: 0.0
+  tof:
+    # Read-out time window applied to pileup hits only. Without it, overlaying
+    # simulated PU0 events (all at t=0) inflates pileup energy by ~8%.
+    enabled: true
+    sigma_ns: 0.185
+    window_ns: [-1.0, 10.0]
+
+cuts:
+  truth_pt: 1.0          # GeV
+  truth_eta: 3.0
+  target_pt: 0.3         # GeV
+  cluster_energy: 0.15   # GeV
+
+clustering:
+  backend: gpu cuda
+  dc: 75.88106168184893
+  rhoc: 104.34315216716726
+  dm: 87.0967630118376
+  ppbin: 16
+
+runtime:
+  # Overlaid events are far heavier than raw ones (each carries ~200 pileup
+  # events' worth of hits), so chunks are smaller here.
+  chunk_size: 50
+  output_dir: data/${dataset.event_name}_overlay_pu${overlay.pileup_level}
+  tmp_dir: data/tmp

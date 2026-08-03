@@ -1,0 +1,53 @@
+# Minimal end-to-end run, for checking that the pipeline works.
+#
+# Four events from one shard on a CPU backend: seconds, not hours, and no GPU.
+# Predicate pushdown means only those four events are fetched, so this costs a
+# few MB of network rather than the multi-gigabyte shard.
+#
+# Run each mode with an override:
+#   python -m colliderml_pflow preprocess --config configs/smoke.yaml --set mode=hard_scatter
+#   python -m colliderml_pflow preprocess --config configs/smoke.yaml --set mode=all_vertices
+#   python -m colliderml_pflow preprocess --config configs/smoke.yaml --set mode=overlay \
+#          --set dataset.event_name=ttbar_pu0
+#
+# Overlay needs a PU0 hard-scatter input, hence the event_name override above.
+mode: all_vertices
+
+dataset:
+  repo: CERN/ColliderML-Release-1
+  shards_total: 1000
+  event_name: ttbar_pu200
+  file_indices: [0]
+  max_events_per_file: 4
+
+overlay:
+  pu_event_name: pileup_only_pu0
+  pu_file_indices: [0]
+  # Small pool and a low pileup level keep the smoke run fast; the sampler
+  # caps draws at the pool size anyway.
+  pu_max_events: 60
+  pileup_level: 20
+  seed: 42
+  invisible_pu_prob: 0.0
+  tof:
+    enabled: true
+    sigma_ns: 0.185
+    window_ns: [-1.0, 10.0]
+
+cuts:
+  truth_pt: 1.0
+  truth_eta: 3.0
+  target_pt: 0.3
+  cluster_energy: 0.15
+
+clustering:
+  backend: gpu cuda
+  dc: 75.88106168184893
+  rhoc: 104.34315216716726
+  dm: 87.0967630118376
+  ppbin: 16
+
+runtime:
+  chunk_size: 2
+  output_dir: data/smoke_${mode}
+  tmp_dir: data/tmp

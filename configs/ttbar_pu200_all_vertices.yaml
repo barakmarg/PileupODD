@@ -1,0 +1,31 @@
+# ttbar + 200 pileup, targets from ALL vertices.
+#
+# The main paper dataset: pileup particles are reconstruction targets too, so
+# the model must separate hard-scatter from pileup rather than being handed
+# the distinction. Reproduces data/ttbar_pu200_all_vertices_paper on master.
+mode: all_vertices
+
+dataset:
+  repo: CERN/ColliderML-Release-1
+  shards_total: 1000
+  event_name: ttbar_pu200
+  file_indices: {range: [0, 100]}
+  max_events_per_file: null
+
+cuts:
+  truth_pt: 1.0          # GeV
+  truth_eta: 3.0
+  target_pt: 0.3         # GeV
+  cluster_energy: 0.15   # GeV
+
+clustering:
+  backend: gpu cuda
+  dc: 75.88106168184893
+  rhoc: 104.34315216716726
+  dm: 87.0967630118376
+  ppbin: 16
+
+runtime:
+  chunk_size: 100
+  output_dir: data/${dataset.event_name}_${mode}
+  tmp_dir: data/tmp

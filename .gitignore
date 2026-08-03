@@ -1,0 +1,13 @@
+# Produced datasets and run artefacts — never committed.
+data/
+logs/
+*.parquet
+*.log
+
+__pycache__/
+*.py[cod]
+.pytest_cache/
+*.egg-info/
+build/
+dist/
+.venv/
