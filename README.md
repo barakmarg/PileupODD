@@ -24,6 +24,7 @@ definitions and thresholds, see [docs/METHODS.md](docs/METHODS.md).
 - [Running at scale](#running-at-scale)
 - [Reproducibility and determinism](#reproducibility-and-determinism)
 - [Testing](#testing)
+- [Verification against the existing datasets](#verification-against-the-existing-datasets)
 - [How this relates to the `master` branch](#how-this-relates-to-the-master-branch)
 - [Package layout](#package-layout)
 
@@ -357,6 +358,9 @@ pytest tests/ -q -m "not slow"      # fast unit tests only (<1 s)
 | `test_smoke.py` | all three subcommands end to end, output schema | network, GPU |
 | `test_equivalence.py` | agreement with the `master` scripts, per mode | network, GPU |
 
+Separately, `tools/compare_to_reference.py` checks output against the datasets already on
+disk -- see [Verification against the existing datasets](#verification-against-the-existing-datasets).
+
 `test_equivalence.py` is the correctness gate. For each mode it runs the original
 implementation and this one in separate subprocesses over identical cached input, then:
 
@@ -370,6 +374,129 @@ implementation and this one in separate subprocesses over identical cached input
 
 The first run downloads a small fixture to `tests/fixtures/` and caches it; later runs
 need no network. Delete the directory to refetch.
+
+## Verification against the existing datasets
+
+Two independent checks. `tests/test_equivalence.py` compares **code against code** --
+master's implementation and this one, run in the same session on identical cached input.
+That isolates the port, but says nothing about the datasets already on disk.
+`tools/compare_to_reference.py` closes that gap: it regenerates events with this branch and
+compares them **value by value against the stored datasets**.
+
+```bash
+python tools/compare_to_reference.py \
+    --reference /storage/agrp/barakma/PileupODD/data/dihiggs_pu200_all_vertices_paper \
+    --mode all_vertices --event-name dihiggs_pu200 --shard 0 --n-events 3
+```
+
+### Why a few events is enough
+
+Every stage is per-event: clustering runs per event, the masks and target selection are
+per-event expressions, and `particle_idx` / `cluster_idx` are dense indices *within* an
+event. Regenerating 3 events of a shard therefore yields exactly what a full-shard run
+yields for those 3 events -- so a genuine value-level comparison costs minutes, not hours.
+
+### What is compared, and how it is keyed
+
+Never by row position. Row order and the per-event index columns are not stable across
+runs, so everything is joined on stable physical identifiers:
+
+| table | key | comparison |
+|---|---|---|
+| `target_particles` | `(event_id, particle_id)` | every physics column, **exact** |
+| `tracks` | `(event_id, track_id)` | every column, **exact** |
+| `target_particles_deps` | `(event_id, particle_id)`, after resolving `particle_idx` back through `target_particles` | particle set exact; summed deposit energy per particle |
+| `calo_clusters` | -- | label-invariant aggregates only |
+
+`cluster_id` and `cluster_idx` are labels handed out in CLUE's discovery order. They mean
+nothing across runs, so nothing can be joined on them -- hence the aggregate treatment of
+the two cluster-dependent tables (cluster count, total and HCal energy, hit count, and
+energy per physical `vertex_primary`).
+
+### Results
+
+| reference dataset | mode | verdict |
+|---|---|---|
+| `data/dihiggs_pu200_all_vertices_paper` | `all_vertices` | **MATCH** |
+| `data/ttbar_pu200` | `hard_scatter` | **MATCH** |
+| `data/ttbar_pu0_overlay_pu200` | `overlay` | **MATCH** on the comparable entries -- see below |
+
+On 3 events of `dihiggs_pu200_all_vertices_paper`:
+
+- `target_particles` -- 8452 particles, identical set, **0 mismatches** across `pdg_id`,
+  `energy`, `eta`, `phi`, `px`, `py`, `pz`, `pt`, `has_track`, `vertex_primary`, `vx`,
+  `vy`, `vz` (worst relative difference exactly `0.0`);
+- `tracks` -- 2619 tracks, identical set, **0 mismatches** across all 17 columns;
+- `target_particles_deps` -- identical particle set; 9 of 8413 summed energies differ;
+- `calo_clusters` -- worst aggregate deviation **0.026%**.
+
+On 3 events of `ttbar_pu200`: 474 target particles and 2084 tracks, **0 mismatches** on
+every column; 1 of 474 deposit energies differs; worst cluster aggregate **0.027%**.
+
+### Calibrating what "match" means
+
+A stored dataset is one stochastic draw, not the answer, so the deposit differences need a
+baseline. Re-running **master's own code** on the same 3 dihiggs events and comparing it
+against master's own stored output:
+
+| comparison | particles differing >0.5% | worst rel |
+|---|---|---|
+| stored reference vs **master re-run** | **9** / 8413 | 9.25e-02 |
+| stored reference vs **this branch** | **7** / 8413 | 9.25e-02 |
+| master re-run vs this branch | 6 / 8413 | 4.67e-02 |
+
+Master differs from its own stored output by *more* than this branch does, and the worst
+case is the same particle in both -- it is the stored draw that is the outlier there. The
+mechanism is the cluster energy cutoff: a cluster sitting near the 0.15 GeV threshold is
+kept in one run and dropped in the next, moving that whole cluster's energy off the
+particles that fed it. `--max-differing-frac` (default 0.5%) bounds how many particles may
+be affected.
+
+### Overlay: comparing only the entries that can be compared
+
+Two things in `data/ttbar_pu0_overlay_pu200` are not reproducible, so the comparison filters
+them out rather than pretending otherwise.
+
+**The pileup draw.** Master's sampler walked an order-unstable pool, so its exact pileup
+content cannot be recovered by any code (see
+[Reproducibility and determinism](#reproducibility-and-determinism)). Every pileup track,
+and every quantity summed over pileup, therefore differs by construction.
+
+**One contaminated column.** That dataset was written 29 May - 7 Jun;
+`filter_orphans_and_reindex` was fixed afterwards (commit `c3b2171`, 25 Jun) so that pileup
+tracks whose event-local `majority_particle_id` collided with a hard-scatter target's are
+marked `-1` instead of being wired to that target. Master's comment puts the effect at
+**~45% of incidence links**; measured on 20 events of the stored dataset, **964 of 16139
+pileup tracks (6.0%) carry a spurious `particle_idx >= 0`**. This branch produces 0.
+
+The fix is narrowly scoped, which is what makes a meaningful comparison still possible. It
+rewrote only the `tracks_mappings` expression, so `tracks.particle_idx` is the **only**
+contaminated column — and only on pileup rows, since the fix's `otherwise` branch is the
+original expression. `valid_ids` is built from `majority_particle_id`, which the fix did not
+touch, so the surviving target-particle set and `target_particles_deps` are unaffected by
+the bug.
+
+So the overlay comparison keeps:
+
+| table | compared | excluded |
+|---|---|---|
+| `target_particles` | all physics columns, exact | — |
+| `tracks` | hard-scatter rows, **all** columns incl. `particle_idx` | pileup rows |
+| `calo_clusters` | hard-scatter vertex energy | totals (pileup-dependent) |
+| `target_particles_deps` | particle set; energies reported, not gated | — |
+
+Result on 2 events of shard 6:
+
+- `target_particles` — identical set, **0 mismatches** on all 13 physics columns;
+- `tracks` — 98 hard-scatter tracks, identical set, **0 mismatches** on all 18 columns,
+  `particle_idx` included: the contaminated column agrees exactly where the fix is a no-op;
+- `calo_clusters` — hard-scatter vertex energy agrees to **8.7e-04** relative;
+- `target_particles_deps` — identical particle set (315 both sides); 48 of 315 summed
+  energies differ, as expected from a different pileup draw landing on the same clusters.
+
+The stored overlay dataset should still be **regenerated** rather than kept, because of the
+incidence bug. The comparison above establishes that this branch reproduces everything about
+it that was correct.
 
 ## How this relates to the `master` branch
 
@@ -443,6 +570,7 @@ colliderml_pflow/
   normalization.py   streaming KLL-sketch input statistics
   submit.py          PBS job splitting and submission
 configs/             one preset per paper dataset, plus smoke.yaml
+tools/               compare_to_reference.py -- value-level check against stored datasets
 docs/METHODS.md      physics definitions, selections, thresholds
 tests/               see Testing
 ```
