@@ -1,12 +1,15 @@
 """Command-line entry point.
 
-Four subcommands covering the path from raw HuggingFace shards to a
+Three subcommands covering the path from raw HuggingFace shards to a
 model-ready dataset::
 
     python -m colliderml_pflow preprocess --config configs/ttbar_pu200_all_vertices.yaml
     python -m colliderml_pflow norm-stats --config configs/ttbar_pu200_all_vertices.yaml
-    python -m colliderml_pflow split      --config configs/ttbar_pu200_all_vertices.yaml
     python -m colliderml_pflow submit     --config configs/ttbar_pu200_all_vertices.yaml --dry-run
+
+Train/validation/test splitting is deliberately absent: the dataset is written
+as one flat set of shards, and the training dataloader does the splitting itself
+by shuffling shard files at load time.
 
 Any configuration value can be overridden without editing the YAML::
 
@@ -58,17 +61,6 @@ def build_parser() -> argparse.ArgumentParser:
     p_norm.add_argument("--kll-k", type=int, default=200,
                         help="KLL sketch accuracy parameter (default: 200).")
 
-    p_split = sub.add_parser("split", help="Split a dataset into train/val/test by event.")
-    _add_common(p_split)
-    p_split.add_argument("--data-dir", type=Path, default=None,
-                         help="Dataset directory. Defaults to the config's output_dir.")
-    p_split.add_argument("--output-dir", type=Path, default=None,
-                         help="Where to write train/val/test. Defaults to --data-dir.")
-    p_split.add_argument("--train-frac", type=float, default=0.7)
-    p_split.add_argument("--val-frac", type=float, default=0.15)
-    p_split.add_argument("--test-frac", type=float, default=0.15)
-    p_split.add_argument("--seed", type=int, default=42)
-
     p_sub = sub.add_parser("submit", help="Split the shard range into batch jobs.")
     _add_common(p_sub)
     p_sub.add_argument("--group-size", type=int, default=None,
@@ -105,19 +97,6 @@ def _cmd_norm_stats(args) -> int:
     data_dir = args.data_dir or cfg.resolved_output_dir()
     write_normalization_stats(data_dir, args.output,
                               max_files=args.max_files, kll_k=args.kll_k)
-    return 0
-
-
-def _cmd_split(args) -> int:
-    from colliderml_pflow.splits import split_dataset_dir
-
-    cfg = load_config(args.config, args.overrides)
-    data_dir = args.data_dir or cfg.resolved_output_dir()
-    split_dataset_dir(
-        data_dir, args.output_dir,
-        train_frac=args.train_frac, val_frac=args.val_frac,
-        test_frac=args.test_frac, seed=args.seed,
-    )
     return 0
 
 
@@ -158,7 +137,6 @@ def _cmd_submit(args) -> int:
 _COMMANDS = {
     "preprocess": _cmd_preprocess,
     "norm-stats": _cmd_norm_stats,
-    "split": _cmd_split,
     "submit": _cmd_submit,
 }
 

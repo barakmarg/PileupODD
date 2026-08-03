@@ -525,7 +525,6 @@ and min/max.
 | Track merge | `overlay_tracks()` | `overlay.py` |
 | Shard reads (predicate pushdown) | `scan_events()`, `load_triplet()`, `load_pileup_pool()` | `hf_io.py` |
 | Normalization statistics | `generate_normalization_stats()` | `normalization.py` |
-| Train/val/test split | `split_train_val_test()`, `split_dataset_dir()` | `splits.py` |
 | Batch job splitting | `group_shards()`, `qsub_commands()` | `submit.py` |
 
 ---

@@ -18,6 +18,7 @@ definitions and thresholds, see [docs/METHODS.md](docs/METHODS.md).
 - [Install](#install)
 - [Quick start](#quick-start)
 - [Output tables](#output-tables)
+- [Dataset layout and splitting](#dataset-layout-and-splitting)
 - [Configuration reference](#configuration-reference)
 - [Reproducing the paper datasets](#reproducing-the-paper-datasets)
 - [Running at scale](#running-at-scale)
@@ -90,7 +91,9 @@ and downloads a few MB, because predicate pushdown fetches only the events reque
 python -m colliderml_pflow preprocess --config configs/smoke.yaml --set mode=all_vertices
 ```
 
-Then the full path from raw shards to a model-ready dataset:
+Then the full path from raw shards to a model-ready dataset — two steps, because
+train/validation/test splitting happens in the training dataloader, not here (see
+[Dataset layout and splitting](#dataset-layout-and-splitting)):
 
 ```bash
 # 1. Build the dataset.
@@ -98,9 +101,6 @@ python -m colliderml_pflow preprocess --config configs/ttbar_pu200_all_vertices.
 
 # 2. Compute input normalization statistics over the written shards.
 python -m colliderml_pflow norm-stats  --config configs/ttbar_pu200_all_vertices.yaml
-
-# 3. Split into train/val/test by event.
-python -m colliderml_pflow split       --config configs/ttbar_pu200_all_vertices.yaml
 ```
 
 Inspect a resolved configuration without running anything:
@@ -161,6 +161,43 @@ energy in which clusters. This is the assignment the network learns.
 
 > **`cluster_time` is not produced.** See
 > [How this relates to the `master` branch](#how-this-relates-to-the-master-branch).
+
+## Dataset layout and splitting
+
+A dataset is **one flat directory of shards** — no `train/`, `val/` or `test/`
+subdirectories:
+
+```
+data/ttbar_pu200_all_vertices/
+  target_particles-00000.parquet   calo_clusters-00000.parquet
+  tracks-00000.parquet             target_particles_deps-00000.parquet
+  target_particles-00001.parquet   ...
+  normalization_stats.yaml
+```
+
+**This package does not split the data, by design.** The training dataloader
+(`hepattn`'s `pflow_data.py`) does it at load time: it globs
+`target_particles-*.parquet` from a single directory, shuffles the shard list
+deterministically from its `seed`, and slices it by `train_split` / `val_split` /
+`test_split`. So the split is **by whole shard file**, chosen at training time.
+
+Writing splits here would be wrong in three ways: it splits at the wrong granularity
+(per event, not per shard), produces a directory layout nothing reads, and triples the
+dataset on disk. Configure the split on the dataloader instead:
+
+```yaml
+data:
+  unify_path: /path/to/data/ttbar_pu200_all_vertices
+  enable_split: true
+  train_split: 0.8
+  val_split: 0.1
+  test_split: 0.1
+  seed: 42
+```
+
+One consequence for this package: every table in a shard must cover exactly the same
+events, or a shard-level split would tear an event apart. That is asserted in
+`tests/test_smoke.py`.
 
 ## Configuration reference
 
@@ -259,7 +296,8 @@ python -m colliderml_pflow submit --config configs/ttbar_pu200_all_vertices.yaml
 ```
 
 Each job re-reads the YAML and receives its own `dataset.file_indices`, so jobs are
-independent and safely re-runnable. Overlay defaults to `--group-size 3`, matching the
+independent and safely re-runnable. Because shards are independent, a failed job can be
+re-run on its own range without touching the rest. Overlay defaults to `--group-size 3`, matching the
 pileup pool's 3-shard blocks so the pool is loaded once per group.
 
 ## Reproducibility and determinism
@@ -316,7 +354,7 @@ pytest tests/ -q -m "not slow"      # fast unit tests only (<1 s)
 |---|---|---|
 | `test_config.py` | config validation, mode→vertex-policy contract, presets | — |
 | `test_reproducibility.py` | pileup sampling is seed-reproducible and order-invariant | — |
-| `test_smoke.py` | all four subcommands end to end, output schema | network, GPU |
+| `test_smoke.py` | all three subcommands end to end, output schema | network, GPU |
 | `test_equivalence.py` | agreement with the `master` scripts, per mode | network, GPU |
 
 `test_equivalence.py` is the correctness gate. For each mode it runs the original
@@ -381,8 +419,11 @@ giving one uniform schema.
   `fastjet`, `awkward` and `sklearn.cluster` dependencies with it. Function bodies are
   otherwise unmodified.
 - **Not carried over:** the `add/update_*_vertex_info` backfill helpers (superseded by
-  the pipeline, which writes vertex info directly) and the `create_pileup_pool_from_pu200.py`
-  overlay variant that built its pool from real PU200 vertices. Both remain on `master`.
+  the pipeline, which writes vertex info directly), the `create_pileup_pool_from_pu200.py`
+  overlay variant that built its pool from real PU200 vertices, and
+  `split_train_val_test()` — splitting belongs to the dataloader, see
+  [Dataset layout and splitting](#dataset-layout-and-splitting). All remain on `master`.
+  Dropping the splitter also removed the `scikit-learn` dependency.
 
 ## Package layout
 
@@ -400,7 +441,6 @@ colliderml_pflow/
   pdg.py             PDG-id tables
   runner.py          shard orchestration, chunked spawn workers
   normalization.py   streaming KLL-sketch input statistics
-  splits.py          train/val/test splitting by event
   submit.py          PBS job splitting and submission
 configs/             one preset per paper dataset, plus smoke.yaml
 docs/METHODS.md      physics definitions, selections, thresholds

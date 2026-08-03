@@ -1,8 +1,8 @@
 """End-to-end runs of the real CLI, one per mode.
 
 Exercises the whole path -- HuggingFace read, chunked spawn workers, clustering,
-aggregation, parquet write, then the normalization and split subcommands -- on
-four events, which takes seconds rather than hours.
+aggregation, parquet write, then the normalization subcommand -- on four events,
+which takes seconds rather than hours.
 
 These are integration tests: they check the pipeline runs and produces the
 expected schema. Whether the *numbers* are right is what ``test_equivalence.py``
@@ -95,7 +95,11 @@ def test_preprocess_writes_all_tables(mode, tmp_path):
 @pytest.mark.network
 @pytest.mark.gpu
 def test_event_counts_are_consistent_across_tables(tmp_path):
-    """Every table must cover the same events, so downstream joins line up."""
+    """Every table must cover the same events, so downstream joins line up.
+
+    This also matters for the dataloader, which splits train/val/test by whole
+    shard file -- a shard whose tables disagreed on events would corrupt a split.
+    """
     out_dir = tmp_path / "out"
     _cli(
         "preprocess", "--config", str(SMOKE_CONFIG),
@@ -120,8 +124,8 @@ def test_event_counts_are_consistent_across_tables(tmp_path):
 
 @pytest.mark.network
 @pytest.mark.gpu
-def test_norm_stats_and_split(tmp_path):
-    """The two post-processing subcommands must run on a written dataset."""
+def test_norm_stats(tmp_path):
+    """Normalization statistics must be computable from a written dataset."""
     out_dir = tmp_path / "out"
     common = [
         "--config", str(SMOKE_CONFIG),
@@ -139,14 +143,6 @@ def test_norm_stats_and_split(tmp_path):
     for feature in ("eta", "rho", "e", "pt", "number_of_hits"):
         assert feature in stats, f"normalization stats missing {feature}"
         assert {"type", "mean", "std", "min", "max"} <= set(stats[feature])
-
-    _cli("split", *common, cwd=tmp_path)
-    total = 0
-    for split in ("train", "val", "test"):
-        path = out_dir / split / "target_particles-00000.parquet"
-        assert path.exists(), f"{split} split not written"
-        total += pl.read_parquet(path).height
-    assert total == 4, f"splits cover {total} events, expected the original 4"
 
 
 def test_submit_dry_run_splits_the_shard_range(tmp_path):
