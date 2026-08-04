@@ -33,7 +33,7 @@ def _add_common(parser: argparse.ArgumentParser) -> None:
                         help="YAML config file. Omit to use built-in defaults.")
     parser.add_argument("--set", dest="overrides", action="append", default=[],
                         metavar="KEY=VALUE",
-                        help="Override a config value, e.g. --set clustering.backend='cpu serial'. "
+                        help="Override a config value, e.g. --set runtime.chunk_size=25. "
                              "Repeatable.")
 
 

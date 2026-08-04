@@ -146,9 +146,11 @@ def clue_clustering(
         rhoc: minimum local density for a point to seed a cluster.
         dm: maximum distance over which a point may be assigned to a seed.
         ppbin: target points per spatial bin in CLUE's internal tiling.
-        backend: CLUEstering backend -- ``'gpu cuda'``, ``'cpu serial'``,
-            ``'cpu tbb'``, or ``'cpu omp'``. Only ``'cpu omp'`` uses the
-            multiprocessing path below; the rest reuse one clusterer serially.
+        backend: use ``'gpu cuda'``. The CPU backends (``'cpu serial'``,
+            ``'cpu tbb'``, ``'cpu omp'``) are **known bad** -- see the warning
+            below -- and are kept only for debugging. Of them, only
+            ``'cpu omp'`` uses the multiprocessing path; the rest reuse one
+            clusterer serially.
         deterministic: pin the order in which points reach CLUE, so repeated
             runs over the same input give the same clusters.
 
@@ -156,6 +158,13 @@ def clue_clustering(
         ``calo_hits`` with four extra list columns aligned to the original
         hits: ``cluster_id`` (-1 for unclustered noise) and the cluster
         centroid ``cluster_cx`` / ``cluster_cy`` / ``cluster_cz``.
+
+    Warning:
+        Only the ``'gpu cuda'`` backend is usable. CLUEstering's CPU backends
+        produce infinite coordinate and energy values and collapse most hits
+        into a single cluster, so any dataset built with them is invalid. They
+        are accepted here so code paths independent of cluster content can be
+        exercised without a GPU, and selecting one warns.
 
     Note:
         CLUE's output depends on the order its input points arrive in: cluster

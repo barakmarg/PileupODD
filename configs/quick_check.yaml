@@ -1,0 +1,42 @@
+# Smallest possible end-to-end run: ONE event, for checking the installation.
+#
+# Purpose is plumbing, not physics -- it proves the HuggingFace read, the spawned
+# worker, CUDA clustering, the aggregation and the parquet write all function.
+# Use configs/smoke.yaml (4 events, all three modes) for a fuller check.
+#
+#   python -m colliderml_pflow preprocess --config configs/quick_check.yaml
+#
+# Runs in under a minute. Almost all of that is fetching the event over the
+# network, so the exact time depends on how HuggingFace is feeling.
+mode: hard_scatter
+
+dataset:
+  repo: CERN/ColliderML-Release-1
+  shards_total: 1000
+  # ttbar_pu0 is the lightest sample: no pileup, so one event is a small read.
+  # Every particle in it sits on the single primary vertex, which means
+  # hard_scatter and all_vertices would give the same answer here.
+  event_name: ttbar_pu0
+  # Pinning the event id rather than using max_events_per_file skips the
+  # event-id discovery scan, which is a second pass over the particles shard
+  # and costs several seconds on its own.
+  file_indices: {map: {0: [0]}}
+
+cuts:
+  truth_pt: 1.0
+  truth_eta: 3.0
+  target_pt: 0.3
+  cluster_energy: 0.15
+
+clustering:
+  # gpu cuda is the only usable backend; the cpu ones are broken (see README).
+  backend: gpu cuda
+  dc: 75.88106168184893
+  rhoc: 104.34315216716726
+  dm: 87.0967630118376
+  ppbin: 16
+
+runtime:
+  chunk_size: 1
+  output_dir: data/quick_check
+  tmp_dir: data/tmp

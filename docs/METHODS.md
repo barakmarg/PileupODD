@@ -297,8 +297,12 @@ as are all cells of any cluster whose total calibrated energy is at or below
 **A note on determinism.** CLUE assigns cluster ids in discovery order and its CUDA backend
 reduces nondeterministically, so cluster *labels* are not reproducible between runs even on
 identical input. Cluster *counts* and total energies are stable to a few parts in 10⁵. The point
-order reaching CLUE is pinned (`clustering.deterministic`, default on); with a CPU backend that
-makes clustering bit-reproducible. See the README for measured figures.
+order reaching CLUE is pinned (`clustering.deterministic`, default on), which removes one source
+of variation, though the CUDA backend remains nondeterministic internally. See the README for
+measured figures.
+
+Only the `gpu cuda` backend is usable: CLUEstering's CPU backends emit infinite values and
+collapse most hits into one cluster, so they must not be used to build a dataset.
 
 ---
 

@@ -10,6 +10,13 @@ tables per shard, in three modes.
 This is the dataset-construction code for the accompanying paper. For the physics
 definitions and thresholds, see [docs/METHODS.md](docs/METHODS.md).
 
+> [!IMPORTANT]
+> **A CUDA GPU is required. Only `clustering.backend: gpu cuda` produces usable data.**
+> CLUEstering's CPU backends are broken: they emit infinite coordinate and energy values,
+> and they suffer mode collapse, lumping most hits into a single cluster. Any dataset built
+> with a `cpu *` backend is invalid. Selecting one emits a `RuntimeWarning`; they are kept
+> selectable only for exercising code paths that do not depend on cluster content.
+
 ---
 
 ## Contents
@@ -62,8 +69,25 @@ knob, so a run cannot silently drift from the published datasets.
 
 ## Install
 
-Two parts: the ordinary Python dependencies, and **CLUEstering**, which is a C++/CUDA
-extension that has to be compiled. There is no wheel for it — expect to build it once.
+### Weizmann cluster: one script
+
+```bash
+git clone <this repo> && cd <this repo>
+./setup_cluster.sh --smoke
+```
+
+That activates the shared conda environment, installs any missing Python dependency,
+builds and installs CLUEstering with its CUDA backend, and then runs a one-event
+end-to-end check. Total time is under a minute when CLUEstering is already built, plus a
+few minutes for the compile the first time.
+
+It is safe to re-run — every step checks whether it is already satisfied. `--force`
+rebuilds CLUEstering anyway; omit `--smoke` to skip the check and just print the command.
+The script fails loudly rather than falling back if the CUDA backend cannot be built,
+since a CPU-only install cannot produce a valid dataset.
+
+The rest of this section is what the script does, for anyone setting up by hand or working
+off-cluster.
 
 ### 1. Python environment
 
@@ -96,7 +120,7 @@ print(sorted(p.name.split('.')[0] for p in lib.glob('*.so')))
 ```
 
 You need `CLUE_GPU_CUDA` in that list. If the import fails, or only the `CLUE_CPU_*`
-backends are listed, build it.
+backends are listed, build it — a CPU-only install cannot produce a valid dataset.
 
 **Build requirements**
 
@@ -146,14 +170,19 @@ pip install --user .
 CLUEstering pulls in `scikit-learn`, `matplotlib` and `pandas` as its own dependencies.
 This package does not use them.
 
-### 3. Run
+### 3. Verify
+
+One event, end to end, in under a minute — proves the HuggingFace read, the spawned
+worker, CUDA clustering, the aggregation and the parquet write all work:
 
 ```bash
-cd /path/to/this/repo
-python -m colliderml_pflow --help
+python -m colliderml_pflow preprocess --config configs/quick_check.yaml
 ```
 
-Or install it as a package to get the `colliderml-pflow` entry point on your `PATH`:
+It should end with `[ALL SHARDS DONE]` and leave four parquet files in `data/quick_check/`.
+For a fuller check across all three modes, use `configs/smoke.yaml` (4 events).
+
+Optionally install the package to get the `colliderml-pflow` entry point on your `PATH`:
 
 ```bash
 pip install -e .
@@ -163,8 +192,14 @@ No HuggingFace credentials are needed — the dataset is public.
 
 ## Quick start
 
-A four-event run to confirm everything works end to end. It takes a couple of minutes
-and downloads a few MB, because predicate pushdown fetches only the events requested:
+The fastest end-to-end check is one event, in under a minute — predicate pushdown fetches
+only the event requested, not the shard:
+
+```bash
+python -m colliderml_pflow preprocess --config configs/quick_check.yaml
+```
+
+A fuller four-event check, which you can point at any of the three modes:
 
 ```bash
 python -m colliderml_pflow preprocess --config configs/smoke.yaml --set mode=all_vertices
@@ -309,7 +344,7 @@ cuts:
   cluster_energy: 0.15        # GeV — min calibrated cluster energy
 
 clustering:
-  backend: gpu cuda           # cpu serial | cpu tbb | cpu omp
+  backend: gpu cuda           # the only usable backend; cpu * are broken, see above
   dc: 75.88106168184893       # CLUE critical distance
   rhoc: 104.34315216716726    # CLUE seeding density
   dm: 87.0967630118376        # CLUE max assignment distance
@@ -401,9 +436,11 @@ This branch pins three ordering-dependent steps that `master` left unpinned, eac
 which was an avoidable source of variation:
 
 1. **The point order CLUE sees** (`clustering.deterministic`, default `true`). Polars'
-   `group_by` and `sort` are order-unstable by default; with them pinned, the CPU
-   backends become bit-reproducible. The CUDA backend remains nondeterministic
-   internally — for bit-exact output, use `--set clustering.backend='cpu serial'`.
+   `group_by` and `sort` are order-unstable by default, so the order in which points
+   reached CLUE — and hence the labels it assigned — varied between runs. Pinning it
+   removes that source of variation. The CUDA backend is still nondeterministic
+   internally, so cluster labels continue to vary; bit-exact output is not achievable on
+   GPU, and the CPU backends are not a usable alternative (see the notice at the top).
 2. **The pileup sampling pool order.** `master` fed `numpy`'s sampler a pool whose order
    came from an order-unstable `unique()`, so **the overlay drew a different pileup
    sample on every run despite taking a `seed`**. Both id arrays are now sorted before
@@ -430,7 +467,8 @@ pytest tests/ -q -m "not slow"      # fast unit tests only (<1 s), no GPU needed
 ```
 
 The GPU-marked tests need a CLUEstering build with the CUDA backend — see
-[Install](#install).
+[Install](#install). There is no CPU fallback: the fast tests avoid clustering entirely
+rather than clustering on a CPU backend, because CPU results are not meaningful.
 
 | file | what it covers | needs |
 |---|---|---|
@@ -650,7 +688,8 @@ colliderml_pflow/
   runner.py          shard orchestration, chunked spawn workers
   normalization.py   streaming KLL-sketch input statistics
   submit.py          PBS job splitting and submission
-configs/             one preset per paper dataset, plus smoke.yaml
+setup_cluster.sh     cluster setup: conda env + CLUEstering build + end-to-end check
+configs/             one preset per paper dataset, plus smoke.yaml and quick_check.yaml
 tools/               compare_to_reference.py -- value-level check against stored datasets
 docs/METHODS.md      physics definitions, selections, thresholds
 tests/               see Testing

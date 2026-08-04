@@ -27,6 +27,7 @@ labels overlaid clusters by originating vertex.
 from __future__ import annotations
 
 import re
+import warnings
 from dataclasses import dataclass, field, fields, is_dataclass
 from pathlib import Path
 from typing import Any, Dict, List, Optional
@@ -35,7 +36,16 @@ import yaml
 
 MODES = ("hard_scatter", "all_vertices", "overlay")
 
-CLUE_BACKENDS = ("gpu cuda", "cpu serial", "cpu tbb", "cpu omp")
+#: The only backend that produces usable clusters. See :data:`CPU_BACKENDS`.
+GPU_BACKEND = "gpu cuda"
+
+#: CLUEstering's CPU backends are accepted but **must not be used for data**:
+#: they emit infinite coordinate/energy values and collapse most hits into a
+#: single cluster (mode collapse). They remain selectable only for debugging
+#: code paths that do not depend on the cluster content.
+CPU_BACKENDS = ("cpu serial", "cpu tbb", "cpu omp")
+
+CLUE_BACKENDS = (GPU_BACKEND, *CPU_BACKENDS)
 
 #: Output tables written per shard, in a stable order.
 OUTPUT_KEYS = ("target_particles", "calo_clusters", "tracks", "target_particles_deps")
@@ -65,9 +75,10 @@ class ClusteringConfig:
     """CLUE parameters and execution backend.
 
     Args:
-        backend: one of ``gpu cuda``, ``cpu serial``, ``cpu tbb``, ``cpu omp``.
-            Results are backend-dependent, so comparisons between runs must
-            hold this fixed.
+        backend: use ``gpu cuda``. The ``cpu *`` backends are accepted but
+            produce unusable output -- infinite values and mode collapse -- and
+            selecting one emits a warning. Results are backend-dependent, so
+            comparisons between runs must hold this fixed.
         dc: critical distance defining the local-density neighbourhood.
         rhoc: minimum local density required to seed a cluster.
         dm: maximum distance over which a point may attach to a seed.
@@ -89,6 +100,14 @@ class ClusteringConfig:
         if self.backend not in CLUE_BACKENDS:
             raise ValueError(
                 f"clustering.backend must be one of {CLUE_BACKENDS}, got {self.backend!r}"
+            )
+        if self.backend in CPU_BACKENDS:
+            warnings.warn(
+                f"clustering.backend={self.backend!r} produces UNUSABLE clusters: "
+                "CLUEstering's CPU backends emit infinite values and suffer mode "
+                f"collapse. Use {GPU_BACKEND!r} for any dataset you intend to keep.",
+                RuntimeWarning,
+                stacklevel=3,
             )
 
 
@@ -368,7 +387,7 @@ def load_config(path: str | Path | None = None, overrides: Optional[List[str]] =
 
     Args:
         path: YAML file. If ``None``, start from the dataclass defaults.
-        overrides: ``["clustering.backend=cpu serial", "runtime.chunk_size=2"]``.
+        overrides: ``["runtime.chunk_size=2", "cuts.target_pt=0.5"]``.
             Values are parsed as YAML, so ``null``, ``true``, ``[0,1]`` all work.
 
     Returns:

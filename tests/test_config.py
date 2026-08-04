@@ -13,7 +13,9 @@ from pathlib import Path
 
 import pytest
 
-from colliderml_pflow.config import Config, DatasetConfig, load_config
+from colliderml_pflow.config import (
+    CPU_BACKENDS, GPU_BACKEND, ClusteringConfig, Config, DatasetConfig, load_config,
+)
 
 CONFIG_DIR = Path(__file__).resolve().parent.parent / "configs"
 PRESETS = sorted(CONFIG_DIR.glob("*.yaml"))
@@ -36,6 +38,37 @@ def test_vertex_policy_follows_mode(mode, expected):
 def test_unknown_mode_is_rejected():
     with pytest.raises(ValueError, match="mode must be one of"):
         Config(mode="all_verticies")
+
+
+@pytest.mark.parametrize("backend", CPU_BACKENDS)
+def test_cpu_backends_warn_loudly(backend):
+    """Selecting a CPU backend must warn: those backends produce invalid data.
+
+    CLUEstering's CPU implementations emit infinite coordinate and energy values
+    and collapse most hits into one cluster, so a dataset built with them is
+    unusable. They stay selectable for debugging, but never silently.
+    """
+    with pytest.warns(RuntimeWarning, match="UNUSABLE"):
+        ClusteringConfig(backend=backend)
+
+
+def test_gpu_backend_does_not_warn(recwarn):
+    ClusteringConfig(backend=GPU_BACKEND)
+    assert not [w for w in recwarn if w.category is RuntimeWarning]
+
+
+def test_default_backend_is_the_gpu_one():
+    assert ClusteringConfig().backend == GPU_BACKEND
+    assert Config().clustering.backend == GPU_BACKEND
+
+
+@pytest.mark.parametrize("preset", PRESETS, ids=lambda p: p.stem)
+def test_presets_use_the_gpu_backend(preset):
+    """No shipped config may select a backend that yields invalid clusters."""
+    cfg = load_config(preset)
+    assert cfg.clustering.backend == GPU_BACKEND, (
+        f"{preset.name} selects {cfg.clustering.backend!r}, which produces unusable clusters"
+    )
 
 
 def test_unknown_backend_is_rejected():

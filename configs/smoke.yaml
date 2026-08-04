@@ -1,6 +1,7 @@
 # Minimal end-to-end run, for checking that the pipeline works.
 #
-# Four events from one shard on a CPU backend: seconds, not hours, and no GPU.
+# Four events from one shard: seconds, not hours. Needs a GPU, like every real
+# run -- the CPU backends do not produce usable clusters (see the README).
 # Predicate pushdown means only those four events are fetched, so this costs a
 # few MB of network rather than the multi-gigabyte shard.
 #
@@ -41,6 +42,7 @@ cuts:
   cluster_energy: 0.15
 
 clustering:
+  # gpu cuda is the only usable backend; the cpu ones are buggy (see README).
   backend: gpu cuda
   dc: 75.88106168184893
   rhoc: 104.34315216716726
