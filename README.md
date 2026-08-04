@@ -62,9 +62,13 @@ knob, so a run cannot silently drift from the published datasets.
 
 ## Install
 
-The pipeline needs `polars`, `numpy`, `CLUEstering`, and a CUDA device for clustering.
+Two parts: the ordinary Python dependencies, and **CLUEstering**, which is a C++/CUDA
+extension that has to be compiled. There is no wheel for it — expect to build it once.
 
-On the Weizmann cluster, everything is already present in the shared `common` environment:
+### 1. Python environment
+
+On the Weizmann cluster, the shared `common` environment already provides polars, numpy,
+pyarrow, PyYAML, tqdm, datasketches and psutil:
 
 ```bash
 source /usr/wipp/conda/24.5.0u/bin/activate /usr/wipp/conda/24.5.0u/envs/common
@@ -74,12 +78,86 @@ Elsewhere:
 
 ```bash
 pip install -r requirements.txt
-# or, as an installed package:
-pip install -e '.[clustering,test]'
 ```
 
-Then run from the repository root (or `pip install -e .` to get the
-`colliderml-pflow` entry point on your `PATH`).
+### 2. CLUEstering (must be compiled)
+
+The shared `common` environment does **not** include CLUEstering — it is a user-site
+install. Check whether you already have it, and crucially whether it has the **CUDA**
+backend:
+
+```bash
+python -c "
+import CLUEstering, pathlib
+lib = pathlib.Path(CLUEstering.__file__).parent / 'lib'
+print(CLUEstering.__file__)
+print(sorted(p.name.split('.')[0] for p in lib.glob('*.so')))
+"
+```
+
+You need `CLUE_GPU_CUDA` in that list. If the import fails, or only the `CLUE_CPU_*`
+backends are listed, build it.
+
+**Build requirements**
+
+| requirement | note |
+|---|---|
+| CMake ≥ 3.16 | 3.26.5 in the `common` env |
+| C++20 compiler | g++ 11.4.1 works |
+| CUDA toolkit (`nvcc`) | **required for the `gpu cuda` backend**; `/usr/local/cuda/bin/nvcc` on the cluster |
+| network access | alpaka 2.1.0 is downloaded at configure time via CMake `FetchContent` |
+| git submodules | `extern/pybind11` must be checked out |
+
+**Build and install**
+
+A checkout already exists on the cluster at `/storage/agrp/barakma/CLUEstering`
+(upstream: `https://gitlab.cern.ch/kalos/CLUEstering.git`, built at tag 2.9.0). Copy it
+somewhere writable rather than building in place:
+
+```bash
+source /usr/wipp/conda/24.5.0u/bin/activate /usr/wipp/conda/24.5.0u/envs/common
+
+# Get the source. Either copy the existing checkout ...
+cp -r /storage/agrp/barakma/CLUEstering ~/CLUEstering
+cd ~/CLUEstering
+# ... or clone it fresh:
+#   git clone https://gitlab.cern.ch/kalos/CLUEstering.git ~/CLUEstering
+#   cd ~/CLUEstering && git checkout 2.9.0
+
+# pybind11 is a submodule and the build fails without it.
+git submodule update --init --recursive
+
+# nvcc MUST be visible now: CMake probes for it with check_language(CUDA) and
+# silently omits the CUDA backend if it is absent. See the warning below.
+export PATH=/usr/local/cuda/bin:$PATH
+nvcc --version    # confirm before continuing
+
+# setup.py drives CMake itself (cmake -B build -DBUILD_PYTHON=ON, then --build).
+# This compiles four backends and takes several minutes.
+pip install --user .
+```
+
+> **The most common failure is silent.** `CLUEstering/BindingModules/CMakeLists.txt` calls
+> `check_language(CUDA)` and only adds the CUDA target if a compiler is found. Build
+> without `nvcc` on `PATH` and everything succeeds, but you get CPU backends only — and
+> then every run configured with `backend: gpu cuda` fails at clustering time. Re-run the
+> check above after installing and confirm `CLUE_GPU_CUDA` is present.
+
+CLUEstering pulls in `scikit-learn`, `matplotlib` and `pandas` as its own dependencies.
+This package does not use them.
+
+### 3. Run
+
+```bash
+cd /path/to/this/repo
+python -m colliderml_pflow --help
+```
+
+Or install it as a package to get the `colliderml-pflow` entry point on your `PATH`:
+
+```bash
+pip install -e .
+```
 
 No HuggingFace credentials are needed — the dataset is public.
 
@@ -348,8 +426,11 @@ since the sample map is drawn per chunk. Comparing two overlay runs requires the
 source /usr/wipp/conda/24.5.0u/bin/activate /usr/wipp/conda/24.5.0u/envs/common
 
 pytest tests/ -q                    # everything (~8 min; needs network + GPU)
-pytest tests/ -q -m "not slow"      # fast unit tests only (<1 s)
+pytest tests/ -q -m "not slow"      # fast unit tests only (<1 s), no GPU needed
 ```
+
+The GPU-marked tests need a CLUEstering build with the CUDA backend — see
+[Install](#install).
 
 | file | what it covers | needs |
 |---|---|---|

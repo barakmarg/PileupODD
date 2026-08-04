@@ -19,9 +19,9 @@ dependencies = [
 ]
 
 [project.optional-dependencies]
-# CLUEstering ships prebuilt wheels only for some platforms; keep it optional
-# so the package installs even where it must be built from source.
-clustering = ["CLUEstering>=2.9"]
+# CLUEstering is intentionally not declared as a dependency: its CUDA backend is
+# only built when nvcc is present at configure time, so resolving it implicitly
+# risks a silent CPU-only install. Build it from source -- see the README.
 test = ["pytest>=8.0"]
 
 [project.scripts]

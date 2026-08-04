@@ -11,4 +11,9 @@ PyYAML>=6.0
 tqdm>=4.66
 datasketches>=5.0        # KLL sketches for normalization quantiles
 psutil>=5.9              # RAM reporting in progress output
-CLUEstering>=2.9         # calorimeter clustering
+
+# CLUEstering is deliberately NOT listed here. It is a C++/CUDA extension whose
+# GPU backend is only compiled if nvcc is visible at configure time, so
+# installing it implicitly from an index can silently leave you with CPU-only
+# backends -- and every `backend: gpu cuda` run then fails at clustering time.
+# Build it from source and verify the backend list: see "Install" in the README.
