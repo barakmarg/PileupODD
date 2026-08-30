@@ -17,7 +17,6 @@ All fast: no network, no GPU, no HuggingFace access.
 from __future__ import annotations
 
 import numpy as np
-import pytest
 
 from colliderml_pflow.config import ClusteringConfig, Config
 from colliderml_pflow.overlay import build_sample_map
@@ -79,19 +78,6 @@ def test_draws_are_capped_by_the_pool_size():
     for _, ids in _draws(frame).items():
         assert len(ids) <= len(small_pool)
         assert len(ids) == len(set(ids))
-
-
-def test_invisible_probability_thins_the_sample():
-    """A non-zero invisible fraction must reduce the number of drawn events."""
-    full = _draws(build_sample_map(HS, POOL, LEVEL, SEED, invisible_pu_prob=0.0))
-    thinned = _draws(build_sample_map(HS, POOL, LEVEL, SEED, invisible_pu_prob=0.5))
-    assert sum(len(v) for v in thinned.values()) < sum(len(v) for v in full.values())
-
-
-@pytest.mark.parametrize("bad", [-0.1, 1.0, 1.5])
-def test_invalid_invisible_probability_is_rejected(bad):
-    with pytest.raises(ValueError, match="invisible_pu_prob"):
-        build_sample_map(HS, POOL, LEVEL, SEED, invisible_pu_prob=bad)
 
 
 def test_mean_draw_count_tracks_the_pileup_level():

@@ -143,9 +143,13 @@ too and the network must separate hard scatter from pileup rather than being han
 distinction.
 
 `overlay` is `hard_scatter` **plus** stage B, not a third vertex policy: its hard-scatter side
-applies the same `vertex_primary == 1` filter. On `ttbar_pu0` input that filter is a no-op — every
-particle already belongs to the single primary vertex — but it is applied, and the particle→vertex
-snapshot it feeds is what allows overlaid clusters to be decomposed by originating vertex.
+applies the same `vertex_primary == 1` filter. Both overlay inputs are single-vertex samples —
+every particle of `ttbar_pu0` and of the `pileup_only_pu0` pool carries `vertex_primary == 1` — so
+the filter is a no-op and the overlaid event is uniformly vertex 1. It is applied anyway, and the
+particle→vertex snapshot it feeds is what lets overlaid clusters be decomposed by originating
+vertex. Hard scatter and pileup are separated instead by construction: pileup truth contributions
+are never merged ([§9](#9-synthetic-pileup-overlay) step 3) and pileup tracks carry
+`source_pileup_event_id` ([§8](#8-particle-energy-deposits-incidence) step 4).
 
 The policy is derived from `mode` (`config.Config.keep_all_vertices`) rather than configured
 independently, so a run cannot silently diverge from the published datasets.
@@ -330,10 +334,12 @@ information from which the model builds its column-normalised particle↔node in
 **Step 3 — Per-cluster hard-scatter vs pileup split** (`cluster_vertex_primary_deps()`). The same
 calibrated contribution energies are summed by `vertex_primary` instead of by particle, producing
 for every cluster the parallel lists `vertex_primary_indices` / `vertex_primary_energies`. The
-entry for vertex 1 is the cluster's **hard-scatter energy**; the remainder is pileup. Downstream
-this gives each cluster's HS energy and HS energy fraction, used as the calorimeter HS/pileup
-classification target. This step depends on the pre-filter snapshot from
-[§4](#4-hard-scatter-vs-pileup-labelling).
+entry for vertex 1 is the cluster's **hard-scatter energy**. In `hard_scatter` / `all_vertices` the
+remaining entries are the individual pileup vertices; in `overlay` there are none, since pileup
+contributions were never merged — the overlaid pileup energy sits in `total_cluster_energy` and is
+recovered as `total_cluster_energy − E(vertex 1)`. Downstream this gives each cluster's HS energy
+and HS energy fraction, used as the calorimeter HS/pileup classification target. This step depends
+on the pre-filter snapshot from [§4](#4-hard-scatter-vs-pileup-labelling).
 
 **Step 4 — Orphan removal** (`filter_orphans_and_reindex()`,
 [`aggregate.py`](../colliderml_pflow/aggregate.py)). Target particles ending up with *neither* a
@@ -364,12 +370,7 @@ hundred events suffices. The pool is enumerated from the pileup **particles**, n
 hits, so vertices that deposited no energy are still sampled at their Poisson rate and correctly
 contribute nothing.
 
-**Step 2 — Invisible vertices.** A fraction of real interactions are diffractive and leave no
-detector signature. `invisible_pu_prob` thins the draw as `K ~ Binomial(N, 1 − p)` — applied as a
-thinning rather than by sampling and discarding, so no work is wasted. The measured value is 0.19;
-the shipped preset uses 0.0.
-
-**Step 3 — Time-of-flight cut** (`overlay_calo_hits()`). In a real bunch crossing, pileup
+**Step 2 — Time-of-flight cut** (`overlay_calo_hits()`). In a real bunch crossing, pileup
 interactions are spread in time, so hits arriving outside the read-out window are never recorded.
 Every simulated PU0 event instead sits at `t = 0`, so naive overlay inflates pileup energy by
 roughly 8%. Each sampled pileup vertex is therefore given a Gaussian time offset
@@ -384,7 +385,7 @@ where `t_hit` is the hit's energy-weighted mean contribution time (precomputed b
 applied to the **pileup side only**: hard-scatter hits are at `t = 0` in simulation and were
 already windowed there.
 
-**Step 4 — Energy merge** (`overlay_calo_hits()`). Cells are matched on
+**Step 3 — Energy merge** (`overlay_calo_hits()`). Cells are matched on
 `(event_id, detector, x, y, z)` with coordinates rounded to 3 decimals and merged with a full
 outer join, so pileup-only cells survive as new hits. Truth contributions are deliberately **not**
 carried over from pileup — only its energy is added. Hard-scatter `contrib_particle_ids` /
@@ -392,7 +393,7 @@ carried over from pileup — only its energy is added. Hard-scatter `contrib_par
 keeps downstream truth attribution pointing only at hard-scatter particles while the pileup appears
 as unattributed energy: precisely the reconstruction problem the model must solve.
 
-**Step 5 — Track merge** (`overlay_tracks()`). Sampled pileup tracks are appended to each
+**Step 4 — Track merge** (`overlay_tracks()`). Sampled pileup tracks are appended to each
 hard-scatter event's track list, hard-scatter tracks first, with a `source_pileup_event_id` column
 that is null on hard-scatter rows. See [§8](#8-particle-energy-deposits-incidence) step 4 for how
 that column prevents mis-attribution.
@@ -429,8 +430,10 @@ calorimeter-face geometry `R_cal = 1080` mm, `Z_cal = 3030` mm.
 
 `qop` is clamped away from zero in the curvature and momentum formulas to avoid division blow-ups.
 
-Each track additionally carries its originating particle's production vertex `vx, vy, vz` and true
-`particle_pt`, joined on in stage A.
+Each track additionally carries its originating particle's production vertex `vx, vy, vz`, true
+`particle_pt`, and `vertex_primary`, joined on in stage A; overlay output adds
+`source_pileup_event_id` (null on hard-scatter rows) and `particle_idx` (`−1` on pileup tracks),
+which is how hard-scatter tracks are identified there.
 
 ### 10.2 Cluster variables
 
@@ -488,7 +491,6 @@ and min/max.
 | calibration factors | 37.5 / 38.7 / 45.0 / 46.9 | ECal barrel / ECal endcap / HCal barrel / HCal endcap | `CALIBRATION` |
 | HS vertex id | `vertex_primary == 1` | hard-scatter label | `prepare_source()` |
 | `overlay.pileup_level` | 200 | Poisson mean for synthetic pileup | `build_sample_map()` |
-| `overlay.invisible_pu_prob` | 0.0 (0.19 measured) | diffractive fraction contributing nothing | `build_sample_map()` |
 | `overlay.tof.sigma_ns` | 0.185 ns | per-vertex bunch-crossing time spread | `overlay_calo_hits()` |
 | `overlay.tof.window_ns` | [−1.0, 10.0] ns | read-out acceptance window | `overlay_calo_hits()` |
 | speed of light | 299.792458 mm/ns | flight-time correction | `overlay.TOF_C_MM_NS` |

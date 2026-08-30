@@ -12,8 +12,7 @@ Detector into four flat, ML-ready Parquet tables per shard, in three modes:
 
 ``overlay``
     Synthetic pileup: PU0 hard-scatter events with ``Poisson(mu)`` pileup-only
-    events overlaid, including a time-of-flight read-out cut and a diffractive
-    "invisible vertex" fraction.
+    events overlaid, including a time-of-flight read-out cut.
 
 Typical use is through the CLI (``python -m colliderml_pflow preprocess
 --config ...``); see the README. The library entry points are

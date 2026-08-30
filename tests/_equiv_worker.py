@@ -144,8 +144,7 @@ def run_new(mode: str, fixture_dir: Path) -> dict:
             cuts=cuts,
             clustering=clustering,
             keep_all_vertices=False,
-            overlay_cfg=OverlayConfig(pileup_level=PILEUP_LEVEL, seed=SEED,
-                                      invisible_pu_prob=0.0),
+            overlay_cfg=OverlayConfig(pileup_level=PILEUP_LEVEL, seed=SEED),
             seed=SEED,
         )
 

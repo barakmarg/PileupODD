@@ -9,18 +9,12 @@ Why this is worth doing: it decouples the hard-scatter process from the pileup
 level, so the same hard-scatter events can be studied at several pileup levels,
 and it makes the pileup content of every cluster exactly known.
 
-Two corrections keep the result physical:
-
-*Time of flight.* Real pileup interactions are spread in time, so hits landing
-outside the read-out window are never recorded. Simulated PU0 events all sit at
-t=0, so naive overlay inflates pileup energy. Each sampled pileup vertex is
-given a Gaussian time offset, the flight time to the hit is subtracted, and
-hits outside the window are dropped. Hard-scatter hits are untouched -- they
-were already windowed in simulation.
-
-*Invisible vertices.* A fraction of real interactions are diffractive and leave
-no detector signature. ``invisible_pu_prob`` thins the Poisson draw so those
-contribute nothing.
+*Time of flight* keeps the result physical: real pileup interactions are spread
+in time, so hits landing outside the read-out window are never recorded.
+Simulated PU0 events all sit at t=0, so naive overlay inflates pileup energy.
+Each sampled pileup vertex is given a Gaussian time offset, the flight time to
+the hit is subtracted, and hits outside the window are dropped. Hard-scatter
+hits are untouched -- they were already windowed in simulation.
 
 Ported from ``create_training_dataset_pileup_overlay.py`` on ``master``, with
 the time constants moved into :class:`colliderml_pflow.config.ToFConfig`.
@@ -43,7 +37,6 @@ def build_sample_map(
     pu_event_ids: np.ndarray,
     pileup_level: int,
     seed: int,
-    invisible_pu_prob: float = 0.0,
 ) -> pl.DataFrame:
     """Decide which pileup events are overlaid on each hard-scatter event.
 
@@ -59,15 +52,9 @@ def build_sample_map(
         pu_event_ids: the pileup pool. Sorted here, for the same reason.
         pileup_level: Poisson mean.
         seed: RNG seed; the caller varies it per shard.
-        invisible_pu_prob: probability that a draw contributes nothing.
-            Applied as ``K ~ Binomial(N, 1 - p)`` rather than by sampling and
-            discarding, so no work is wasted on rolls that would be thrown away.
 
     Returns:
         Columns ``hs_event_id`` and ``pu_event_id`` (a list per row).
-
-    Raises:
-        ValueError: if ``invisible_pu_prob`` is outside ``[0, 1)``.
 
     Note:
         Both id arrays are sorted before sampling, which is what makes ``seed``
@@ -79,15 +66,11 @@ def build_sample_map(
         same seed produced a *different* pileup sample every time. Sorting makes
         the output a function of the seed and the pool contents alone.
     """
-    if not 0.0 <= invisible_pu_prob < 1.0:
-        raise ValueError(f"invisible_pu_prob must be in [0, 1), got {invisible_pu_prob}")
     rng = np.random.default_rng(seed=seed)
     hs_event_ids = np.sort(np.asarray(hs_event_ids))
     pool = np.sort(np.asarray(pu_event_ids))
     pool_size = len(pool)
     ns = rng.poisson(pileup_level, size=len(hs_event_ids))
-    if invisible_pu_prob > 0.0:
-        ns = rng.binomial(ns, 1.0 - invisible_pu_prob)
     ns = np.minimum(ns, pool_size).astype(np.int64)
     pu_per_hs = [rng.choice(pool, size=int(n), replace=False).astype(pool.dtype) for n in ns]
     return pl.DataFrame({
@@ -299,9 +282,7 @@ def run_overlay(
         pu_event_ids = pileup['calo_hits']['event_id'].unique(maintain_order=True).to_numpy()
 
     sample_map = build_sample_map(
-        hs_event_ids, pu_event_ids,
-        overlay_cfg.pileup_level, seed,
-        invisible_pu_prob=overlay_cfg.invisible_pu_prob,
+        hs_event_ids, pu_event_ids, overlay_cfg.pileup_level, seed,
     )
     sample_map_flat = sample_map.explode('pu_event_id')
     del sample_map

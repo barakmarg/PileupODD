@@ -29,7 +29,6 @@ overlay:
   pu_max_events: 60
   pileup_level: 20
   seed: 42
-  invisible_pu_prob: 0.0
   tof:
     enabled: true
     sigma_ns: 0.185

@@ -331,7 +331,6 @@ overlay:                      # read only when mode == overlay
   pu_max_events: null         # cap the pool size
   pileup_level: 200           # Poisson mean
   seed: 42                    # shard i uses seed + i
-  invisible_pu_prob: 0.0      # diffractive fraction contributing nothing (0.19 measured)
   tof:                        # read-out time window, pileup hits only
     enabled: true
     sigma_ns: 0.185           # per-vertex Gaussian time spread

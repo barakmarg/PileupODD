@@ -26,10 +26,6 @@ overlay:
   # Per-shard seed is seed + shard_index, and each chunk hashes that with its
   # chunk index, so a run is reproducible from this one number.
   seed: 42
-  # Fraction of pileup draws contributing nothing, modelling diffractive
-  # events that miss the detector. 0.19 is the measured value; 0.0 keeps the
-  # original behaviour.
-  invisible_pu_prob: 0.0
   tof:
     # Read-out time window applied to pileup hits only. Without it, overlaying
     # simulated PU0 events (all at t=0) inflates pileup energy by ~8%.

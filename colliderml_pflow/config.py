@@ -155,10 +155,6 @@ class OverlayConfig:
             overlaid per hard-scatter event.
         seed: base RNG seed. The seed actually used for shard ``i`` is
             ``seed + i``, so each shard samples differently but reproducibly.
-        invisible_pu_prob: probability that a given pileup draw contributes
-            nothing, modelling diffractive events that miss the detector.
-            Drawn via a Binomial thinning rather than by sampling and
-            discarding.
         tof: time-of-flight window settings.
     """
 
@@ -167,14 +163,9 @@ class OverlayConfig:
     pu_max_events: Optional[int] = None
     pileup_level: int = 200
     seed: int = 42
-    invisible_pu_prob: float = 0.0
     tof: ToFConfig = field(default_factory=ToFConfig)
 
     def __post_init__(self) -> None:
-        if not 0.0 <= self.invisible_pu_prob < 1.0:
-            raise ValueError(
-                f"overlay.invisible_pu_prob must be in [0, 1), got {self.invisible_pu_prob}"
-            )
         if self.pileup_level < 0:
             raise ValueError(f"overlay.pileup_level must be >= 0, got {self.pileup_level}")
         self.pu_file_indices = [int(i) for i in self.pu_file_indices]
@@ -293,7 +284,6 @@ class Config:
             lines += [
                 f"overlay           : mu={self.overlay.pileup_level}  seed={self.overlay.seed}",
                 f"  pu dataset      : {self.overlay.pu_event_name} shards {self.overlay.pu_file_indices}",
-                f"  invisible prob  : {self.overlay.invisible_pu_prob}",
                 f"  tof             : {tof_desc}",
             ]
         lines += [
